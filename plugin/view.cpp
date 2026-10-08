@@ -4,8 +4,10 @@
 #include "graphs.hpp"
 #include "view_state.hpp"
 #include "transport.hpp"
+#include "resource_tooltips.hpp"
 #include <algorithm>
 #include <set>
+#include <utility>
 #include <windowsx.h>
 
 namespace wsl::ui
@@ -83,13 +85,13 @@ Json snapshotRequest(const View &v)
         fields.insert("exe");
     if (needs({ProcessDirectory}))
         fields.insert("cwd");
-    if (needs({ProcessCgroup}) || enabled(L"UseColorServiceProcesses"))
+    if (needs({ProcessCgroup}) || enabled(L"UseColorServiceProcesses") || enabled(L"EnableTooltipSupport"))
         fields.insert("cgroup");
     if (needs({ProcessUid, ProcessEuid, ProcessGid, ProcessEgid, ProcessTracer, ProcessSwap,
                ProcessVoluntarySwitches, ProcessInvoluntarySwitches, ProcessSeccomp,
                ProcessNoNewPrivileges}) ||
         enabled(L"UseColorDebuggedProcesses") || enabled(L"UseColorOwnProcesses") ||
-        enabled(L"UseColorSystemProcesses"))
+        enabled(L"UseColorSystemProcesses") || enabled(L"HideOtherUserProcesses"))
         fields.insert("status");
     if (enabled(L"UseColorElevatedProcesses"))
         fields.insert("sudo");
@@ -108,6 +110,21 @@ Json snapshotRequest(const View &v)
     return request;
 }
 } // namespace
+namespace
+{
+bool queueVisibleServices(View &v)
+{
+    if (!contentVisible(v) || v.page != 2)
+        return false;
+    const bool metadata = std::exchange(v.refreshServiceMetadata, false);
+    queue(v,
+          {{"op", "services"},
+           {"refresh_metadata", metadata},
+           {"include_pids", v.services.isColumnVisible(6) || v.services.sortColumn == 6}},
+          ServicesTag);
+    return true;
+}
+} // namespace
 void refresh(View &v)
 {
     if ((v.paused && !v.forceRefresh) || v.pending || v.failed)
@@ -122,7 +139,7 @@ void refresh(View &v)
     // expensive process metadata is requested only for visible columns/colors.
     v.forceRefresh = false;
     v.collectConnections = v.page == 1 || v.sockets.is_object();
-    v.collectServices = v.page == 2 || v.units.is_object();
+    v.collectServices = contentVisible(v) && v.page == 2;
     queue(v, snapshotRequest(v), SnapshotTag);
 }
 namespace
@@ -204,6 +221,8 @@ void switchPage(View &v)
 {
     const int tab = TabCtrl_GetCurSel(v.tabs);
     v.page = tab == 1 ? 2 : tab == 2 ? 1 : 0;
+    if (v.page == 2)
+        v.refreshServiceMetadata = true;
     ShowWindow(v.processes.window, v.page == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.connections.window, v.page == 1 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.services.window, v.page == 2 ? SW_SHOW : SW_HIDE);
@@ -227,6 +246,7 @@ void manualRefresh(View &v)
         disconnect(v.selectedDistro);
     v.failed = false;
     v.forceRefresh = true;
+    v.refreshServiceMetadata = true;
     queue(v, {{"op", "discover"}}, DiscoverTag);
     status(v, L"Discovering running WSL2 distributions…");
 }
@@ -320,14 +340,17 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         v->processes.kind = Table::Kind::Processes;
         v->connections.kind = Table::Kind::Network;
         v->services.kind = Table::Kind::Services;
+        v->processes.infoTip = processTooltip;
+        v->services.infoTip = serviceTooltip;
+        v->connections.infoTip = networkTooltip;
         v->processes.create(window, ProcessTable,
                             {{L"Process", 180},
                              {L"PID", 70, true},
                              {L"User", 90},
                              {L"CPU %", 80, true},
-                             {L"RSS MB", 90, true},
-                             {L"Read kB/s", 95, true},
-                             {L"Write kB/s", 95, true},
+                             {L"RSS", 90, true},
+                             {L"Read rate", 95, true},
+                             {L"Write rate", 95, true},
                              {L"State", 60},
                              {L"Threads", 65, true},
                              {L"PPID", 65, true},
@@ -340,7 +363,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                              {L"Nice", 70, true, false},
                              {L"Priority", 75, true, false},
                              {L"Relative start time", 135, true, false},
-                             {L"Virtual size MB", 115, true, false},
+                             {L"Virtual size", 115, true, false},
                              {L"Session ID", 90, true, false},
                              {L"Process group", 105, true, false},
                              {L"Last CPU", 80, true, false},
@@ -350,11 +373,11 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                              {L"Working directory", 300, false, false},
                              {L"Control group", 360, false, false},
                              {L"Tracer PID", 90, true, false},
-                             {L"Swap MB", 95, true, false},
-                             {L"Read total MB", 115, true, false},
-                             {L"Write total MB", 115, true, false},
-                             {L"Read characters MB", 140, true, false},
-                             {L"Write characters MB", 140, true, false},
+                             {L"Swap", 95, true, false},
+                             {L"Read total", 115, true, false},
+                             {L"Write total", 115, true, false},
+                             {L"Read characters", 140, true, false},
+                             {L"Write characters", 140, true, false},
                              {L"Read calls", 100, true, false},
                              {L"Write calls", 100, true, false},
                              {L"Voluntary switches", 140, true, false},
@@ -376,14 +399,16 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                                {L"State", 120},
                                {L"PID", 70, true},
                                {L"Process", 150},
-                               {L"Socket inode", 110, true}});
+                               {L"Socket inode", 110, true},
+                               {L"Remote hostname", 220}});
         v->services.create(window, ServiceTable,
                            {{L"Service", 255},
                             {L"Active", 95},
                             {L"Substate", 105},
                             {L"Startup", 100},
                             {L"Load", 100},
-                            {L"Description", 500}});
+                            {L"Description", 500},
+                            {L"PID", 75, true}});
         v->exportButton = control(window, L"BUTTON", L"Export view...", WS_TABSTOP, ExportButton);
         v->findHandles = control(window, L"BUTTON", L"Find handles...", WS_TABSTOP, FindHandlesButton);
         v->installNotice =
@@ -450,6 +475,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             v->foreground = foreground;
             if (foreground)
             {
+                v->refreshServiceMetadata = true;
                 v->forceRefresh = true;
                 v->refreshAfterPending = v->pending;
                 refresh(*v);
@@ -544,14 +570,20 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             switchPage(*v);
             return 0;
         }
-        if (hdr->hwndFrom == v->processes.window && hdr->code == LVN_COLUMNCLICK)
+        if (hdr->hwndFrom == v->processes.window && hdr->code == LVN_COLUMNCLICK &&
+            !WslHostIntegerSetting(L"SortChildProcesses"))
             SendMessageW(v->tree, BM_SETCHECK, BST_UNCHECKED, 0);
         for (auto table : {&v->processes, &v->connections, &v->services})
         {
             if (hdr->hwndFrom == table->window && hdr->code == NM_CUSTOMDRAW)
                 return table->customDraw(reinterpret_cast<NMLVCUSTOMDRAW *>(hdr));
             if (table->notify(hdr))
+            {
+                if (hdr->hwndFrom == v->processes.window && hdr->code == LVN_COLUMNCLICK &&
+                    SendMessageW(v->tree, BM_GETCHECK, 0, 0) == BST_CHECKED)
+                    render(*v);
                 return 0;
+            }
         }
         if (hdr->hwndFrom == v->table().window)
         {
@@ -602,7 +634,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                                              : L"Component not installed in " + v->selectedDistro + L".");
                 return 0;
             }
-            if (tag == ActionTag || tag == ExecutableTag)
+            if (tag == ActionTag || tag == ExecutableTag || tag == ServiceProcessTag)
             {
                 // A refused signal or service action does not necessarily mean
                 // the observer disconnected. Do not retry the action; refresh
@@ -619,6 +651,21 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         }
         try
         {
+            if (tag == ServiceProcessTag)
+            {
+                const auto name = std::exchange(v->pendingService, {});
+                bool found = false;
+                for (const auto &service : reply->data.value("services", Json::array()))
+                    if (service.value("name", "") == name)
+                    {
+                        goToProcess(*v, service);
+                        found = true;
+                        break;
+                    }
+                if (!found)
+                    errorBox(window, L"The service is no longer available.");
+                return 0;
+            }
             if (tag == ExecutableTag)
             {
                 bool found = false;
@@ -693,6 +740,17 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                 }
                 updateSnapshot(*v, reply->data);
                 render(*v);
+                if (contentVisible(*v) && v->page == 0 && !v->newProcess.empty() &&
+                    WslHostIntegerSetting(L"ScrollToNewProcesses"))
+                {
+                    const auto &rows = v->processes.rows;
+                    auto added = std::find_if(rows.begin(), rows.end(), [&](const Row &row) {
+                        return row.key == v->newProcess && !row.removed;
+                    });
+                    if (added != rows.end())
+                        ListView_EnsureVisible(v->processes.window, static_cast<int>(added - rows.begin()),
+                                               FALSE);
+                }
                 if (v->page == 0 && !v->pendingSelection.empty())
                 {
                     v->processes.selectKey(v->pendingSelection);
@@ -706,27 +764,24 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                 if (v->collectConnections)
                 {
                     queue(*v,
-                          {{"op", "connections"}, {"identities_only", !contentVisible(*v) || v->page != 1}},
+                          {{"op", "connections"},
+                           {"identities_only", !contentVisible(*v) || v->page != 1},
+                           {"resolve_names",
+                            contentVisible(*v) && v->page == 1 &&
+                                WslHostIntegerSetting(L"EnableNetworkResolve") &&
+                                v->connections.isColumnVisible(9)}},
                           ConnectionsTag);
                     return 0;
                 }
-                if (v->collectServices)
-                {
-                    queue(*v, {{"op", "services"}, {"identities_only", !contentVisible(*v) || v->page != 2}},
-                          ServicesTag);
+                if (v->collectServices && queueVisibleServices(*v))
                     return 0;
-                }
             }
             else if (tag == ConnectionsTag)
             {
                 v->sockets = mergeIdentitySnapshot(v->sockets, reply->data, "connections");
                 render(*v);
-                if (v->collectServices)
-                {
-                    queue(*v, {{"op", "services"}, {"identities_only", !contentVisible(*v) || v->page != 2}},
-                          ServicesTag);
+                if (v->collectServices && queueVisibleServices(*v))
                     return 0;
-                }
             }
             else if (tag == ServicesTag)
             {
@@ -838,6 +893,7 @@ extern "C" void WslSetActive(BOOL active)
         v.failed = false;
         v.paused = !WslHostRefreshAutomatically();
         v.forceRefresh = true;
+        v.refreshServiceMetadata = true;
         v.refreshAfterPending = v.pending;
         render(v);
         if (v.paused && !v.forceRefresh)
@@ -904,4 +960,20 @@ extern "C" void WslHostRefresh(void)
     using namespace wsl::ui;
     if (mainView && mainView->active)
         manualRefresh(*mainView);
+}
+
+// View-menu settings do not emit the host Options callback. The bridge calls
+// this after the host has applied a command, including while updates are paused.
+extern "C" void WslHostViewSettingsChanged(void)
+{
+    using namespace wsl::ui;
+    if (!mainView)
+        return;
+    render(*mainView);
+    if (contentVisible(*mainView))
+    {
+        mainView->forceRefresh = true;
+        mainView->refreshAfterPending = mainView->pending;
+        refresh(*mainView);
+    }
 }

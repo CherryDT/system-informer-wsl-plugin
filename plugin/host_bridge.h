@@ -1,6 +1,8 @@
 #pragma once
 #include <windows.h>
 
+#define WSL_VIEW_SETTINGS_CHANGED (WM_APP + 86)
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -13,9 +15,8 @@ extern "C"
     DWORD WslHostIntegerSetting(PCWSTR name);
     void WslOpenHostOptions(HWND owner);
     void WslPositionDialog(HWND window, HWND owner);
-    typedef void (CALLBACK *WSL_SEARCH_CALLBACK)(ULONG_PTR match, void *context);
-    void WslCreateSearch(HWND parent, HWND edit, PCWSTR banner,
-                         WSL_SEARCH_CALLBACK callback, void *context);
+    typedef void(CALLBACK *WSL_SEARCH_CALLBACK)(ULONG_PTR match, void *context);
+    void WslCreateSearch(HWND parent, HWND edit, PCWSTR banner, WSL_SEARCH_CALLBACK callback, void *context);
     BOOL WslSearchMatches(ULONG_PTR match, PCWSTR text);
 
 #ifdef __cplusplus

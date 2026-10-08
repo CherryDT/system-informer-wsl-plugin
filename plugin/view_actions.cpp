@@ -14,31 +14,35 @@ void inspect(View &v)
         openServiceDetails(v.window, v.selectedDistro, row->data.value("name", ""));
     else
     {
-        int pid = row->data.value("pid", 0);
-        if (!pid)
-        {
-            errorBox(v.window, L"No owner was visible for this socket. It may have closed or belong to "
-                               L"another PID namespace.");
-            return;
-        }
-        if (!row->data.contains("start_ticks") || row->data["start_ticks"].is_null())
-        {
-            errorBox(v.window, L"The socket owner's identity is unavailable. Refresh the connections view.");
-            return;
-        }
-        v.pendingSelection = std::to_string(pid) + ":" + row->data["start_ticks"].dump();
-        WslClearGlobalSearch();
-        SetWindowTextW(v.search, L"");
-        selectPage(v, 0);
-        v.processes.selectKey(v.pendingSelection);
-        int index = ListView_GetNextItem(v.processes.window, -1, LVNI_SELECTED);
-        if (index >= 0)
-        {
-            ListView_EnsureVisible(v.processes.window, index, FALSE);
-            v.pendingSelection.clear();
-        }
-        SetFocus(v.processes.window);
+        goToProcess(v, row->data);
     }
+}
+void goToProcess(View &v, const Json &process)
+{
+    int pid = process.value("pid", 0);
+    if (!pid)
+    {
+        errorBox(v.window, L"No running process was identified. It may have exited or belong to "
+                           L"another PID namespace.");
+        return;
+    }
+    if (!process.contains("start_ticks") || process["start_ticks"].is_null())
+    {
+        errorBox(v.window, L"The process identity is unavailable. Refresh this view.");
+        return;
+    }
+    v.pendingSelection = std::to_string(pid) + ":" + process["start_ticks"].dump();
+    WslClearGlobalSearch();
+    SetWindowTextW(v.search, L"");
+    selectPage(v, 0);
+    v.processes.selectKey(v.pendingSelection);
+    int index = ListView_GetNextItem(v.processes.window, -1, LVNI_SELECTED);
+    if (index >= 0)
+    {
+        ListView_EnsureVisible(v.processes.window, index, FALSE);
+        v.pendingSelection.clear();
+    }
+    SetFocus(v.processes.window);
 }
 void action(View &v, int id)
 {
@@ -46,9 +50,25 @@ void action(View &v, int id)
     if (!selected)
         return;
     Row row = *selected;
-    if (id == Inspect || id == GoToProcess)
+    if (id == Inspect)
     {
         inspect(v);
+        return;
+    }
+    if (id == GoToProcess && !row.removed)
+    {
+        if (v.page != 2 || row.data.contains("pid"))
+            goToProcess(v, row.data);
+        else if (!v.pending && v.active && !v.failed)
+        {
+            // A hidden PID column avoids polling MainPID; fetch it on demand
+            // when the user explicitly asks to navigate to the service process.
+            v.pendingService = row.data.value("name", "");
+            queue(v, {{"op", "services"}, {"include_pids", true}}, ServiceProcessTag);
+            status(v, L"Resolving the service process…");
+        }
+        else
+            errorBox(v.window, L"Wait for the current refresh to finish, then try again.");
         return;
     }
     if (id == CopyRow)
@@ -215,6 +235,9 @@ void menu(View &v, POINT point)
     }
     else if (v.page == 2)
     {
+        const auto row = v.table().selectedActionable();
+        const bool canNavigate = row && (!row->data.contains("pid") || row->data.value("pid", 0) > 0);
+        AppendMenuW(popup, MF_STRING | (canNavigate ? 0 : MF_GRAYED), GoToProcess, L"Go to process");
         AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(popup, MF_STRING, StartService, L"Start");
         AppendMenuW(popup, MF_STRING, StopService, L"Stop");

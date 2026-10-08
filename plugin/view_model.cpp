@@ -2,6 +2,8 @@
 #include "settings.hpp"
 #include "view_state.hpp"
 #include "graphs.hpp"
+#include "host_bridge.h"
+#include <cmath>
 #include <algorithm>
 #include <set>
 
@@ -79,6 +81,9 @@ void clearDistro(View &v)
     v.collectConnections = false;
     v.collectServices = false;
     v.pendingExecutable.clear();
+    v.pendingService.clear();
+    v.refreshServiceMetadata = true;
+    v.newProcess.clear();
     status(v, L"Connecting to the selected distribution…");
     PostMessageW(v.graph, GraphSampleChanged, 0, 0);
     PostMessageW(v.memoryGraph, GraphSampleChanged, 0, 0);
@@ -98,55 +103,42 @@ void render(View &v)
     if (v.snapshot.contains("processes"))
     {
         auto items = v.snapshot["processes"].get<std::vector<Json>>();
-        std::map<int, int> depths;
         const bool tree = SendMessageW(v.tree, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        v.processes.setAncestryOrder(tree);
-        // Preserve ancestry order before filtering; a missing or exiting parent
-        // must not hide its surviving children. Table sorting is disabled here.
-        if (tree)
-        {
-            std::map<int, std::vector<Json>> children;
-            std::set<int> pids, visited;
-            for (auto &p : items)
-                pids.insert(p.value("pid", 0));
-            for (auto &p : items)
-                children[pids.count(p.value("ppid", 0)) ? p.value("ppid", 0) : 0].push_back(p);
-            items.clear();
-            std::function<void(int, int)> visit = [&](int parent, int depth) {
-                for (auto &p : children[parent])
-                {
-                    int pid = p.value("pid", 0);
-                    if (!visited.insert(pid).second)
-                        continue;
-                    depths[pid] = std::min(depth, 12);
-                    items.push_back(p);
-                    visit(pid, depth + 1);
-                }
-            };
-            visit(0, 0);
-            // A parent exiting mid-snapshot must not make a process disappear.
-            for (auto &p : v.snapshot["processes"])
-                if (!visited.count(p.value("pid", 0)))
-                    items.push_back(p);
-        }
+        const bool showSmallCpu = WslHostIntegerSetting(L"ShowCpuBelow001") != 0;
+        const auto precision = static_cast<int>(std::min(6ul, WslHostIntegerSetting(L"MaxPrecisionUnit")));
+        const double cpuThreshold = std::pow(10.0, -precision);
+        const bool ownOnly = WslHostIntegerSetting(L"HideOtherUserProcesses") != 0;
+        v.processes.setAncestryOrder(tree, tree && (WslHostIntegerSetting(L"SortChildProcesses") ||
+                                                    WslHostIntegerSetting(L"SortRootProcesses")));
         for (const auto &p : items)
         {
             const double hz = std::max(1.0, v.snapshot.value("clock_ticks", 100.0));
-            auto optionalNumber = [&](const char *key, double divisor = 1.0) {
-                return p.contains(key) ? number(p[key].get<double>() / divisor, divisor == 1.0 ? 0 : 2) : L"";
-            };
             auto cpuTime = [&](const char *key) {
                 return p.contains(key) ? number(p[key].get<double>() / hz) + L" s" : L"";
             };
             auto key = processKey(p);
-            std::wstring name = std::wstring(depths[p.value("pid", 0)] * 2, L' ') + text(p, "name");
+            const double cpu = v.cpu[key] / cpuDivisor;
+            // Match the host: exact zero is always blank; tiny nonzero CPU is
+            // optional and uses its below-precision indicator.
+            std::wstring cpuText;
+            if (cpu >= cpuThreshold)
+                cpuText = number(cpu, precision);
+            else if (cpu > 0 && showSmallCpu)
+                cpuText = L"< " + number(cpu, precision);
+            auto rate = [](double value) {
+                return value >= 1 ? bytes(static_cast<uint64_t>(value)) + L"/s" : L"";
+            };
+            auto optionalBytes = [&](const char *field) {
+                return p.contains(field) ? bytes(p[field].get<uint64_t>()) : L"";
+            };
+            std::wstring name = text(p, "name");
             Row row{{name,
                      text(p, "pid"),
                      text(p, "user"),
-                     number(v.cpu[key] / cpuDivisor),
-                     number(p.value("rss_bytes", 0ull) / 1048576.0),
-                     number(v.readRate[key] / 1024.0),
-                     number(v.writeRate[key] / 1024.0),
+                     cpuText,
+                     bytes(p.value("rss_bytes", 0ull)),
+                     rate(v.readRate[key]),
+                     rate(v.writeRate[key]),
                      text(p, "state"),
                      text(p, "threads"),
                      text(p, "ppid"),
@@ -161,7 +153,7 @@ void render(View &v)
                      number(std::max(0.0, v.snapshot.value("uptime_seconds", 0.0) -
                                               p.value("start_ticks", 0.0) / hz)) +
                          L" s",
-                     optionalNumber("virtual_bytes", 1048576.0),
+                     optionalBytes("virtual_bytes"),
                      text(p, "session"),
                      text(p, "pgrp"),
                      text(p, "processor"),
@@ -171,11 +163,11 @@ void render(View &v)
                      text(p, "cwd"),
                      text(p, "cgroup"),
                      text(p, "tracer_pid"),
-                     optionalNumber("swap_bytes", 1048576.0),
-                     optionalNumber("read_bytes", 1048576.0),
-                     optionalNumber("write_bytes", 1048576.0),
-                     optionalNumber("read_chars", 1048576.0),
-                     optionalNumber("write_chars", 1048576.0),
+                     optionalBytes("swap_bytes"),
+                     optionalBytes("read_bytes"),
+                     optionalBytes("write_bytes"),
+                     optionalBytes("read_chars"),
+                     optionalBytes("write_chars"),
                      text(p, "syscr"),
                      text(p, "syscw"),
                      text(p, "voluntary_switches"),
@@ -190,33 +182,92 @@ void render(View &v)
                      text(p, "policy")},
                     p,
                     key};
+            row.numeric = {{ProcessCpu, cpu},
+                           {ProcessRss, p.value("rss_bytes", 0.0)},
+                           {ProcessRead, v.readRate[key]},
+                           {ProcessWrite, v.writeRate[key]}};
+            for (const auto &field :
+                 std::initializer_list<std::pair<size_t, const char *>>{{ProcessVirtual, "virtual_bytes"},
+                                                                        {ProcessSwap, "swap_bytes"},
+                                                                        {ProcessReadTotal, "read_bytes"},
+                                                                        {ProcessWriteTotal, "write_bytes"},
+                                                                        {ProcessReadChars, "read_chars"},
+                                                                        {ProcessWriteChars, "write_chars"}})
+                row.numeric[field.first] = p.value(field.second, 0.0);
+            row.data["_cpu_percent"] = cpu;
+            row.data["_read_rate"] = v.readRate[key];
+            row.data["_write_rate"] = v.writeRate[key];
             rows.push_back(std::move(row));
         }
+        if (tree)
+        {
+            std::set<int> pids, visited;
+            std::map<int, std::vector<Row>> children;
+            for (const auto &row : rows)
+                pids.insert(row.data.value("pid", 0));
+            for (auto &row : rows)
+            {
+                const int parent = row.data.value("ppid", 0);
+                children[pids.count(parent) ? parent : 0].push_back(std::move(row));
+            }
+            const bool sortRoots = WslHostIntegerSetting(L"SortRootProcesses") != 0;
+            const bool sortChildren = WslHostIntegerSetting(L"SortChildProcesses") != 0;
+            for (auto &[parent, siblings] : children)
+                if (parent == 0 ? sortRoots : sortChildren)
+                    v.processes.sortRows(siblings);
+            rows.clear();
+            std::function<void(int, int)> visit = [&](int parent, int depth) {
+                for (auto &row : children[parent])
+                {
+                    const int pid = row.data.value("pid", 0);
+                    if (!visited.insert(pid).second)
+                        continue;
+                    row.cells[0].insert(0, std::min(depth, 12) * 2, L' ');
+                    rows.push_back(row);
+                    visit(pid, depth + 1);
+                }
+            };
+            visit(0, 0);
+            // Races or a PID namespace cycle must not hide surviving processes.
+            for (const auto &[parent, siblings] : children)
+                for (const auto &row : siblings)
+                    if (visited.insert(row.data.value("pid", 0)).second)
+                        rows.push_back(row);
+        }
         v.processes.replace(
-            std::move(rows), [query](const Row &row) { return matches(row, query); },
+            std::move(rows),
+            [query, ownOnly, uid = v.defaultUid](const Row &row) {
+                return (!ownOnly ||
+                        (uid && row.data.contains("euid") && row.data.value("euid", uint32_t(-1)) == *uid)) &&
+                       matches(row, query);
+            },
             !v.snapshot.value("processes_truncated", false));
     }
     if (v.sockets.contains("connections"))
     {
         rows.clear();
         bool onlyListeners = SendMessageW(v.listeners, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        const bool hideWaiting = WslHostIntegerSetting(L"HideWaitingConnections") != 0;
         for (const auto &c : v.sockets["connections"])
         {
             const auto protocol = text(c, "protocol"), state = text(c, "state");
             Row row{{protocol, text(c, "local_address"), text(c, "local_port"), text(c, "remote_address"),
-                     text(c, "remote_port"), state, text(c, "pid"), text(c, "process"), text(c, "inode")},
+                     text(c, "remote_port"), state, text(c, "pid"), text(c, "process"), text(c, "inode"),
+                     WslHostIntegerSetting(L"EnableNetworkResolve") ? text(c, "remote_hostname") : L""},
                     c,
                     connectionKey(c)};
             rows.push_back(std::move(row));
         }
         v.connections.replace(
             std::move(rows),
-            [query, onlyListeners](const Row &row) {
+            [query, onlyListeners, hideWaiting](const Row &row) {
                 const auto protocol = text(row.data, "protocol"), state = text(row.data, "state");
                 const bool listening =
                     state == L"LISTEN" || state == L"LISTENING" ||
                     (protocol.find(L"udp") != std::wstring::npos && row.data.value("remote_port", 0) == 0);
-                return (!onlyListeners || listening) && matches(row, query);
+                const bool waiting = row.data.value("pid", 0) == 0 ||
+                                     (protocol.rfind(L"tcp", 0) == 0 && state == L"CLOSE_WAIT");
+                return (!hideWaiting || !waiting) && (!onlyListeners || listening) && matches(row, query);
             },
             !v.sockets.value("connections_truncated", false) &&
                 v.sockets.value("inaccessible_processes", 0) == 0);
@@ -227,14 +278,14 @@ void render(View &v)
         for (const auto &s : v.units["services"])
         {
             Row row{{text(s, "name"), text(s, "active"), text(s, "sub"), text(s, "enabled"), text(s, "load"),
-                     text(s, "description")},
+                     text(s, "description"), s.value("pid", 0) > 0 ? text(s, "pid") : L""},
                     s,
                     s.value("name", "")};
             rows.push_back(std::move(row));
         }
         v.services.replace(
             std::move(rows), [query](const Row &row) { return matches(row, query); },
-            v.units.value("available", true));
+            v.units.value("available", true) && !v.units.value("services_truncated", false));
     }
     updateButtons(v);
 }
@@ -258,6 +309,7 @@ void updateSnapshot(View &v, const Json &data)
     GetSystemTimeAsFileTime(&graph.timestamp);
     graph.interval = elapsed;
     std::map<std::string, ProcessSample> samples;
+    v.newProcess.clear();
     v.cpu.clear();
     v.readRate.clear();
     v.writeRate.clear();
@@ -269,6 +321,8 @@ void updateSnapshot(View &v, const Json &data)
                              p.contains("read_bytes") && p.contains("write_bytes")};
         double usage = 0, read = 0, written = 0;
         auto previous = v.previous.find(key);
+        if (v.previousTime && previous == v.previous.end())
+            v.newProcess = key;
         if (elapsed > 0 && hz > 0 && previous != v.previous.end())
         {
             auto &old = previous->second;
@@ -336,7 +390,7 @@ void updateSnapshot(View &v, const Json &data)
             dropGroup("exe", {"exe", "runtime"});
             dropGroup("cwd", {"cwd"});
             dropGroup("command", {"command"});
-            dropGroup("cgroup", {"cgroup", "is_service"});
+            dropGroup("cgroup", {"cgroup", "is_service", "service_unit", "service_scope"});
             dropGroup("sudo", {"sudo_root"});
             dropGroup("suspension", {"is_suspended", "is_partially_suspended", "stopped_threads"});
             dropGroup("elf32", {"is_32bit"});

@@ -14,6 +14,7 @@ extern void WslFocusContent(BOOL select);
 extern void WslSearchChanged(void);
 extern void WslHostRefreshChanged(BOOL automatic);
 extern void WslHostRefresh(void);
+extern void WslHostViewSettingsChanged(void);
 extern INT_PTR CALLBACK WslOptionsDialogProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
 
 static HINSTANCE PluginModule;
@@ -37,8 +38,7 @@ void WslOpenHostOptions(HWND owner)
 
 /* Keep native search and placement policy in the SDK adapter. Search match
  * handles belong to the control and are only valid until its next callback. */
-void WslCreateSearch(HWND parent, HWND edit, PCWSTR banner,
-                     WSL_SEARCH_CALLBACK callback, void *context)
+void WslCreateSearch(HWND parent, HWND edit, PCWSTR banner, WSL_SEARCH_CALLBACK callback, void *context)
 {
     PhCreateSearchControl(parent, edit, banner, callback, context);
 }
@@ -73,7 +73,10 @@ static BOOL CALLBACK InvalidateInspector(HWND window, LPARAM parameter)
     WCHAR name[64];
     UNREFERENCED_PARAMETER(parameter);
     if (GetClassNameW(window, name, RTL_NUMBER_OF(name)) && wcscmp(name, L"WslTools.Inspector") == 0)
+    {
+        PostMessageW(window, WSL_VIEW_SETTINGS_CHANGED, 0, 0);
         RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    }
     return TRUE;
 }
 
@@ -81,7 +84,9 @@ static VOID NTAPI HostSettingsUpdated(PVOID parameter, PVOID context)
 {
     UNREFERENCED_PARAMETER(parameter);
     UNREFERENCED_PARAMETER(context);
-    if (ViewWindow) RedrawWindow(ViewWindow, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    WslHostViewSettingsChanged();
+    if (ViewWindow)
+        RedrawWindow(ViewWindow, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
     EnumThreadWindows(GetCurrentThreadId(), InvalidateInspector, 0);
 }
 
@@ -117,7 +122,25 @@ static LRESULT CALLBACK HostWindowSubclass(HWND window, UINT message, WPARAM wpa
         RemoveWindowSubclass(window, HostWindowSubclass, subclassId);
         HostWindow = NULL;
     }
-    return DefSubclassProc(window, message, wparam, lparam);
+    const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+    if (message == WM_COMMAND && ViewWindow)
+    {
+        // Public resource IDs from the pinned host, read only after its handler
+        // writes the setting. These commands do not fire SettingsUpdated.
+        switch (LOWORD(wparam))
+        {
+        case 10232: /* Hide other users */
+        case 10246: /* CPU below 0.01 */
+        case 10262: /* Sort roots */
+        case 10272: /* Hide waiting connections */
+        case 10275: /* Scroll to new processes */
+        case 10276: /* Sort children */
+            WslHostViewSettingsChanged();
+            EnumThreadWindows(GetCurrentThreadId(), InvalidateInspector, 0);
+            break;
+        }
+    }
+    return result;
 }
 
 void WslApplyTheme(HWND window)
@@ -352,8 +375,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
         return FALSE;
     information->DisplayName = L"WSL Tools";
     information->Author = L"David Trapp";
-    information->Description =
-        L"Processes, connections, open files, modules and systemd services for WSL 2.";
+    information->Description = L"Processes, connections, open files, modules and systemd services for WSL 2.";
     information->HasOptions = TRUE;
 
     PhRegisterCallback(PhGetGeneralCallback(GeneralCallbackSettingsUpdated), HostSettingsUpdated, NULL,

@@ -871,7 +871,12 @@ void applyFilter(Inspector &state)
             continue;
         state.tables[i].replace(
             state.snapshots[i],
-            [match](const Row &row) {
+            [match, hideWaiting = i == ConnectionsTable &&
+                                  WslHostIntegerSetting(L"HideWaitingConnections")](const Row &row) {
+                if (hideWaiting && (row.data.value("pid", 0) == 0 ||
+                                    (row.data.value("protocol", std::string{}).rfind("tcp", 0) == 0 &&
+                                     row.data.value("state", std::string{}) == "CLOSE_WAIT")))
+                    return false;
                 if (!match)
                     return true;
                 for (const auto &value : row.cells)
@@ -2110,6 +2115,9 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
         return DefWindowProcW(window, message, wParam, lParam);
     switch (message)
     {
+    case WSL_VIEW_SETTINGS_CHANGED:
+        applyFilter(*state);
+        return 0;
     case WM_GETFONT:
         return reinterpret_cast<LRESULT>(state->uiFont ? state->uiFont : font);
     case WM_CTLCOLORSTATIC:

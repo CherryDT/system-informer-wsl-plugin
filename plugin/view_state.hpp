@@ -81,7 +81,9 @@ struct View
     std::optional<uint32_t> defaultUid;
     std::wstring statistics;
     std::string pendingSelection;
+    std::string newProcess;
     std::string pendingExecutable;
+    std::string pendingService;
     // Replies from earlier distro selections or disconnected sessions are ignored.
     unsigned epoch = 1;
     int page = 0;
@@ -89,6 +91,7 @@ struct View
     bool forceRefresh = false, refreshAfterPending = false;
     bool foreground = false;
     bool collectConnections = false, collectServices = false;
+    bool refreshServiceMetadata = true;
     ULONGLONG lastRefresh = 0;
     bool componentMissing = false, cpuPercentOfTotal = true;
     Table &table()
@@ -98,6 +101,7 @@ struct View
 };
 
 constexpr uintptr_t ExecutableTag = 7;
+constexpr uintptr_t ServiceProcessTag = 8;
 
 // Stable logical IDs: persisted column layouts must survive new optional columns.
 enum ProcessColumn
@@ -165,6 +169,7 @@ std::string connectionKey(const Json &connection);
 
 // Commands shared by toolbar buttons, keyboard shortcuts and context menus.
 void inspect(View &view);
+void goToProcess(View &view, const Json &process);
 void action(View &view, int id);
 void menu(View &view, POINT point);
 } // namespace wsl::ui
