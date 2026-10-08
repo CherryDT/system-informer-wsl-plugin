@@ -957,8 +957,8 @@ Json send_signal(const Json& request) {
         throw std::runtime_error("Invalid signal number");
     const int signal = requested_signal.get<int>();
     if (identity.pid <= 1 || identity.pid == getpid()) throw std::runtime_error("This process is protected");
-    if (signal != SIGTERM && signal != SIGKILL && signal != SIGSTOP && signal != SIGCONT && signal != SIGUSR1 && signal != SIGUSR2 && signal != SIGHUP && signal != SIGWINCH)
-        throw std::runtime_error("Unsupported signal; use TERM, KILL, STOP, CONT, USR1, USR2, HUP, or WINCH");
+    if (signal != SIGTERM && signal != SIGINT && signal != SIGKILL && signal != SIGSTOP && signal != SIGCONT && signal != SIGUSR1 && signal != SIGUSR2 && signal != SIGHUP && signal != SIGWINCH)
+        throw std::runtime_error("Unsupported signal; use TERM, INT, KILL, STOP, CONT, USR1, USR2, HUP, or WINCH");
 #if defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
     const int fd = static_cast<int>(syscall(SYS_pidfd_open, identity.pid, 0));
     if (fd < 0) throw std::runtime_error(std::string("Cannot open process identity: ") + std::strerror(errno));

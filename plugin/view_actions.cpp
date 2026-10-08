@@ -122,6 +122,10 @@ void action(View &v, int id)
             signal = 15;
             label = L"Send SIGTERM (graceful termination)";
             break;
+        case InterruptSignal:
+            signal = 2;
+            label = L"Send SIGINT (interrupt)";
+            break;
         case Kill:
             signal = 9;
             label = L"Send SIGKILL (force termination)";
@@ -155,13 +159,17 @@ void action(View &v, int id)
         }
         auto prompt = label + L" to " + text(row.data, "name") + L" (PID " + text(row.data, "pid") +
                       L") in " + v.selectedDistro + L"?\r\n\r\n";
-        prompt +=
-            signal == 1 || signal == 10 || signal == 12
-                ? L"The program defines this signal's behavior. Without a handler, it terminates the process."
-                : L"This action runs as Linux root. Termination may lose unsaved work.";
+        prompt += L"This action runs as Linux root.";
+        if (signal == 2 || signal == 9 || signal == 15)
+            prompt += L" Termination may lose unsaved work.";
+        else if (signal == 1 || signal == 10 || signal == 12)
+            prompt +=
+                L" The program defines this signal's behavior. Without a handler, it terminates the process.";
+        else if (signal == 19)
+            prompt += L" The process will pause until it is resumed.";
         const auto executable = text(row.data, "exe");
         const auto basename = executable.substr(executable.find_last_of(L'/') + 1);
-        if ((signal == 9 || signal == 15 || signal == 19) &&
+        if ((signal == 2 || signal == 9 || signal == 15 || signal == 19) &&
             (basename == L"wsl-observer" || text(row.data, "name") == L"wsl-observer"))
             prompt += L"\r\n\r\nThis is the WSL inspection component. Stopping it disconnects WSL "
                       L"monitoring and may interrupt another inspection. Use View > Refresh to reconnect.";
@@ -225,6 +233,7 @@ void menu(View &v, POINT point)
         AppendMenuW(popup, MF_STRING, OpenExecutable, L"Show executable in Explorer");
         AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(popup, MF_STRING, Terminate, L"Terminate — SIGTERM");
+        AppendMenuW(popup, MF_STRING, InterruptSignal, L"Interrupt — SIGINT");
         AppendMenuW(popup, MF_STRING, Kill, L"Force kill — SIGKILL");
         AppendMenuW(popup, MF_STRING, Suspend, L"Suspend — SIGSTOP");
         AppendMenuW(popup, MF_STRING, Resume, L"Resume — SIGCONT");
@@ -246,11 +255,12 @@ void menu(View &v, POINT point)
         AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(popup, MF_STRING, EnableService, L"Enable at boot");
         AppendMenuW(popup, MF_STRING, DisableService, L"Disable at boot");
+
     }
     if (!v.table().selectedActionable())
-        for (int id : {Inspect, OpenExecutable, Terminate, Kill, Suspend, Resume, Hangup, WindowChanged,
-                       User1, User2, StartService, StopService, RestartService, ReloadService, EnableService,
-                       DisableService, GoToProcess})
+        for (int id : {Inspect, OpenExecutable, Terminate, InterruptSignal, Kill, Suspend, Resume, Hangup,
+                       WindowChanged, User1, User2, StartService, StopService, RestartService, ReloadService,
+                       EnableService, DisableService, GoToProcess})
             EnableMenuItem(popup, id, MF_BYCOMMAND | MF_GRAYED);
     int chosen =
         TrackPopupMenu(popup, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, v.window, nullptr);

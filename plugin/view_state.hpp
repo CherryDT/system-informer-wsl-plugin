@@ -46,7 +46,8 @@ enum Id
     ReloadService,
     EnableService,
     DisableService,
-    GoToProcess
+    GoToProcess,
+    InterruptSignal
 };
 struct ProcessSample
 {
