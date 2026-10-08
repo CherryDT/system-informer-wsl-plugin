@@ -89,6 +89,7 @@ foreach ($Directory in @('phlib/include', 'phnt/include', 'kphlib/include')) {
 }
 [IO.File]::Copy("$Source/SystemInformer/sdk/phdk.h", "$Sdk/include/phdk.h", $true)
 [IO.File]::Copy("$Source/SystemInformer/include/phappres.h", "$Sdk/include/phappres.h", $true)
+[IO.File]::Copy("$Source/plugins/include/toolstatusintf.h", "$Sdk/include/toolstatusintf.h", $true)
 [IO.File]::Copy("$Source/LICENSE.txt", "$Sdk/LICENSE.txt", $true)
 
 if (-not $VisualStudio) {

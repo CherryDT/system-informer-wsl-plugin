@@ -24,14 +24,17 @@ New-Item -ItemType Directory -Force $Stage | Out-Null
 foreach ($Directory in @('plugin', 'vendor', '.deps/sdk')) {
     $Destination = Join-Path $Stage $Directory
     New-Item -ItemType Directory -Force $Destination | Out-Null
-    & robocopy.exe (Join-Path $Root $Directory) $Destination /MIR /NFL /NDL /NJH /NJS /NP
+    & robocopy.exe (Join-Path $Root $Directory) $Destination /MIR /IS /IT /NFL /NDL /NJH /NJS /NP
     if ($LASTEXITCODE -gt 7) { throw "Unable to stage $Directory" }
 }
 [IO.File]::Copy("$Root/CMakeLists.txt", "$Stage/CMakeLists.txt", $true)
 $Binary = Join-Path $BuildRoot 'native'
 & $CMake -S $Stage -B $Binary -G 'Visual Studio 17 2022' -A x64
 if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
-& $CMake --build $Binary --config $Configuration --parallel
+# Cross-filesystem timestamps and MSBuild's cached include dependencies can
+# otherwise leave translation units compiled against different header layouts.
+# Force copies above and clean native objects before every reproducible build.
+& $CMake --build $Binary --config $Configuration --clean-first --parallel
 if ($LASTEXITCODE -ne 0) { throw 'Native plugin compilation failed.' }
 $Dist = Join-Path $Root 'dist'
 New-Item -ItemType Directory -Force $Dist | Out-Null
