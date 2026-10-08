@@ -326,6 +326,8 @@ LRESULT CALLBACK searchProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
             break;
         if (header->code == NM_CUSTOMDRAW)
             return state->table.customDraw(reinterpret_cast<NMLVCUSTOMDRAW *>(header));
+        if (header->code == LVN_ODFINDITEMW)
+            return state->table.findItem(*reinterpret_cast<NMLVFINDITEMW *>(header));
         state->table.notify(header);
         if (header->code == NM_DBLCLK)
             command(*state, OpenProcess);

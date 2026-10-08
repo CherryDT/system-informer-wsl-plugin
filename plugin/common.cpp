@@ -1120,6 +1120,36 @@ void Table::sort(int column)
     saveLayout();
     InvalidateRect(window, nullptr, FALSE);
 }
+int Table::findItem(const NMLVFINDITEMW &request) const
+{
+    const auto &find = request.lvfi;
+    if (rows.empty() || (find.flags & (LVFI_PARAM | LVFI_NEARESTXY)) || !find.psz || !*find.psz)
+        return -1;
+
+    // The native ListView manages the typed prefix, its timeout, and repeated
+    // single-letter cycling. iStart already identifies the first row to check.
+    const size_t start = std::min(rows.size(), static_cast<size_t>(std::max(0, request.iStart)));
+    const size_t count = (find.flags & LVFI_WRAP) ? rows.size() : rows.size() - start;
+    const size_t length = wcslen(find.psz);
+    const bool prefix = (find.flags & (LVFI_PARTIAL | LVFI_SUBSTRING)) != 0;
+    for (size_t offset = 0; offset < count; ++offset)
+    {
+        const size_t index = (start + offset) % rows.size();
+        const auto &row = rows[index];
+        if (row.cells.empty())
+            continue;
+        // Tree indentation is presentation, not part of the process name.
+        const std::wstring name =
+            kind == Kind::Processes && ancestryOrder ? text(row.data, "name") : row.cells.front();
+        if (name.size() < length || (!prefix && name.size() != length))
+            continue;
+        if (CompareStringOrdinal(name.c_str(), static_cast<int>(length), find.psz, static_cast<int>(length),
+                                 TRUE) == CSTR_EQUAL)
+            return static_cast<int>(index);
+    }
+    return -1;
+}
+
 bool Table::notify(NMHDR *hdr)
 {
     if (hdr->hwndFrom != window)

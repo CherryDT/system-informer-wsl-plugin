@@ -2194,6 +2194,8 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
                 continue;
             if (hdr->code == NM_CUSTOMDRAW)
                 return table.customDraw(reinterpret_cast<NMLVCUSTOMDRAW *>(hdr));
+            if (hdr->code == LVN_ODFINDITEMW)
+                return table.findItem(*reinterpret_cast<NMLVFINDITEMW *>(hdr));
             table.notify(hdr);
             if (hdr->code == NM_DBLCLK && (state->page == 1 || state->page == 2 || state->page == MemoryPage))
                 command(*state, OpenLocation);

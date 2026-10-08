@@ -653,6 +653,8 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         {
             if (hdr->hwndFrom == table->window && hdr->code == NM_CUSTOMDRAW)
                 return table->customDraw(reinterpret_cast<NMLVCUSTOMDRAW *>(hdr));
+            if (hdr->hwndFrom == table->window && hdr->code == LVN_ODFINDITEMW)
+                return table->findItem(*reinterpret_cast<NMLVFINDITEMW *>(hdr));
             if (table->notify(hdr))
             {
                 if (hdr->hwndFrom == v->processes.window && hdr->code == LVN_COLUMNCLICK &&

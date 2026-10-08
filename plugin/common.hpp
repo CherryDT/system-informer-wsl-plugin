@@ -138,6 +138,7 @@ class Table
     void sort(int column);
     void sortRows(std::vector<Row> &items) const;
     bool notify(NMHDR *hdr);
+    int findItem(const NMLVFINDITEMW &request) const;
     LRESULT customDraw(NMLVCUSTOMDRAW *draw) const;
     const Row *selected() const;
     const Row *selectedActionable() const;
