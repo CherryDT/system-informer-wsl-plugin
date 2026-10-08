@@ -3,21 +3,60 @@
 #include <phdk.h>
 #include <settings.h>
 #include <toolstatusintf.h>
+#include "host_bridge.h"
 
 extern HWND WslCreateView(HWND parent, HINSTANCE instance);
 extern void WslSetActive(BOOL active);
 extern void WslShutdown(void);
 extern void WslFocusContent(BOOL select);
 extern void WslSearchChanged(void);
+extern void WslHostRefreshChanged(BOOL automatic);
+extern void WslHostRefresh(void);
 
 static HINSTANCE PluginModule;
 static PH_CALLBACK_REGISTRATION MainWindowRegistration;
 static PH_CALLBACK_REGISTRATION UnloadRegistration;
 static HWND ViewWindow;
+static HWND HostWindow;
 static PTOOLSTATUS_INTERFACE ToolStatus;
 static PH_CALLBACK_REGISTRATION SearchChangedRegistration;
 static BOOLEAN SearchCallbackRegistered;
 static PH_STRINGREF SearchBanner = PH_STRINGREF_INIT(L"Search WSL");
+
+DWORD WslHostIntegerSetting(PCWSTR name)
+{
+    return PhGetIntegerSetting(name);
+}
+
+DWORD WslHostRefreshInterval(void)
+{
+    DWORD interval = PhGetIntegerSetting(L"UpdateInterval");
+    return interval ? interval : 1000;
+}
+
+BOOL WslHostRefreshAutomatically(void)
+{
+    return SystemInformer_GetUpdateAutomatically();
+}
+
+/* The SDK notifies tabs about automatic updates, but has no tab refresh event.
+ * Observe the native View > Refresh command without consuming it, so both F5
+ * and the menu update WSL even while the host's automatic updates are paused. */
+static LRESULT CALLBACK HostWindowSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+                                           UINT_PTR subclassId, DWORD_PTR context)
+{
+    UNREFERENCED_PARAMETER(context);
+    /* ID_VIEW_REFRESH from the host's public command resources. */
+    const UINT refreshCommand = 10098;
+    if (message == WM_COMMAND && LOWORD(wparam) == refreshCommand && ViewWindow)
+        WslHostRefresh();
+    if (message == WM_NCDESTROY)
+    {
+        RemoveWindowSubclass(window, HostWindowSubclass, subclassId);
+        HostWindow = NULL;
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+}
 
 void WslApplyTheme(HWND window)
 {
@@ -118,17 +157,21 @@ void WslClearGlobalSearch(void)
 {
     HWND search, rebar;
     HWND mainWindow = ViewWindow ? GetAncestor(ViewWindow, GA_ROOT) : NULL;
-    if (!mainWindow) return;
-    if (!ToolStatus || !ToolStatus->GetSearchMatchHandle()) return;
+    if (!mainWindow)
+        return;
+    if (!ToolStatus || !ToolStatus->GetSearchMatchHandle())
+        return;
     // ToolStatus v2 exposes matching but no text setter. Its native search edit
     // is a direct child of the main window (or its rebar when reparented).
     search = FindWindowExW(mainWindow, NULL, WC_EDIT, NULL);
     if (!search)
     {
         rebar = FindWindowExW(mainWindow, NULL, REBARCLASSNAME, NULL);
-        if (rebar) search = FindWindowExW(rebar, NULL, WC_EDIT, NULL);
+        if (rebar)
+            search = FindWindowExW(rebar, NULL, WC_EDIT, NULL);
     }
-    if (search) SetWindowTextW(search, L"");
+    if (search)
+        SetWindowTextW(search, L"");
 }
 
 static VOID NTAPI SearchChanged(PVOID parameter, PVOID context)
@@ -165,6 +208,9 @@ static BOOLEAN TabCallback(PPH_MAIN_TAB_PAGE page, PH_MAIN_TAB_PAGE_MESSAGE mess
     case MainTabPageSelected:
         WslSetActive(parameter1 != NULL);
         return TRUE;
+    case MainTabPageUpdateAutomaticallyChanged:
+        WslHostRefreshChanged(parameter1 != NULL);
+        return TRUE;
     case MainTabPageFontChanged:
         if (ViewWindow)
             SendMessage(ViewWindow, WM_SETFONT, (WPARAM)parameter1, TRUE);
@@ -185,6 +231,9 @@ static VOID NTAPI MainWindowShowing(PVOID parameter, PVOID context)
     PTOOLSTATUS_TAB_INFO tabInfo;
     UNREFERENCED_PARAMETER(parameter);
     UNREFERENCED_PARAMETER(context);
+    HostWindow = SystemInformer_GetWindowHandle();
+    if (HostWindow)
+        SetWindowSubclass(HostWindow, HostWindowSubclass, (UINT_PTR)HostWindowSubclass, 0);
     ToolStatus = PhGetPluginInterfaceZ(TOOLSTATUS_INTERFACE_NAME, TOOLSTATUS_INTERFACE_VERSION);
     if (ToolStatus && (!ToolStatus->GetSearchMatchHandle || !ToolStatus->WordMatch ||
                        !ToolStatus->RegisterTabInfo || !ToolStatus->SearchChangedEvent))
@@ -218,6 +267,11 @@ static VOID NTAPI PluginUnloading(PVOID parameter, PVOID context)
         SearchCallbackRegistered = FALSE;
     }
     ToolStatus = NULL;
+    if (HostWindow)
+    {
+        RemoveWindowSubclass(HostWindow, HostWindowSubclass, (UINT_PTR)HostWindowSubclass);
+        HostWindow = NULL;
+    }
     /* Join workers here, never under the loader lock in DllMain. */
     WslShutdown();
 }

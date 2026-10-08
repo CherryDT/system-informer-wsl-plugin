@@ -78,9 +78,9 @@ void action(View &v, int id)
         errorBox(v.window, L"A request is still running. Wait for it to finish, then try the action again.");
         return;
     }
-    if (v.paused || !v.active || v.failed)
+    if (!v.active || v.failed)
     {
-        errorBox(v.window, L"Resume monitoring and refresh before changing a process or service.");
+        errorBox(v.window, L"Refresh before changing a process or service.");
         return;
     }
     if (v.page == 0)

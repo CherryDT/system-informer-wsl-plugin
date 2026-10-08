@@ -1,5 +1,6 @@
 #include "controller.hpp"
 #include "settings.hpp"
+#include "host_bridge.h"
 #include "view_state.hpp"
 #include <algorithm>
 #include <windowsx.h>
@@ -25,7 +26,7 @@ void queue(View &v, Json request, uintptr_t tag)
 }
 void refresh(View &v)
 {
-    if (!v.active || v.paused || v.pending || v.failed)
+    if (!v.active || (v.paused && !v.forceRefresh) || v.pending || v.failed)
         return;
     if (v.selectedDistro.empty())
     {
@@ -33,6 +34,7 @@ void refresh(View &v)
         return;
     }
     // Keep graphs live in every inner view, then refresh that view's rows.
+    v.forceRefresh = false;
     queue(v, {{"op", "snapshot"}}, SnapshotTag);
 }
 namespace
@@ -193,8 +195,7 @@ void manualRefresh(View &v)
     if (v.failed)
         disconnect(v.selectedDistro);
     v.failed = false;
-    v.paused = false;
-    SetWindowTextW(v.pause, L"Pause");
+    v.forceRefresh = true;
     queue(v, {{"op", "discover"}}, DiscoverTag);
     status(v, L"Discovering running WSL2 distributions…");
 }
@@ -266,10 +267,9 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
     switch (message)
     {
     case WM_CREATE: {
+        v->paused = !WslHostRefreshAutomatically();
         v->distro =
             control(window, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, DistroCombo);
-        v->refresh = control(window, L"BUTTON", L"Refresh", WS_TABSTOP, RefreshButton);
-        v->pause = control(window, L"BUTTON", L"Pause", WS_TABSTOP, PauseButton);
         v->settings = control(window, L"BUTTON", L"Settings...", WS_TABSTOP, SettingsButton);
         v->graph = control(window, L"WslTools.Graph", L"CPU history", 0, 0);
         SetWindowLongPtrW(v->graph, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(v));
@@ -336,7 +336,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                             L"Monitoring starts when this tab is selected. Stopped distros are not "
                             L"started intentionally.",
                             SS_LEFT, 0);
-        for (HWND child : {v->distro, v->refresh, v->pause, v->settings, v->tabs, v->search, v->listeners,
+        for (HWND child : {v->distro, v->settings, v->tabs, v->search, v->listeners,
                            v->tree, v->processes.window, v->connections.window, v->services.window,
                            v->inspect, v->actions, v->exportButton, v->installButton})
             SetWindowSubclass(child, childKeys, 1, reinterpret_cast<DWORD_PTR>(v));
@@ -351,12 +351,10 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             info.lpszText = const_cast<wchar_t *>(label);
             SendMessageW(v->tooltips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
         };
-        tip(v->refresh, L"Refresh and reconnect (F5)");
-        tip(v->pause, L"Pause or resume collection");
         tip(v->inspect, L"Inspect the selected resource, or go to the socket owner (Enter)");
         tip(v->actions, L"Actions for the selected resource (Delete offers SIGTERM for a process)");
         tip(v->exportButton, L"Export the visible rows and columns");
-        tip(v->settings, L"Refresh interval, CPU percentage convention and Explorer path mapping");
+        tip(v->settings, L"WSL options: CPU percentage, Inspector capture and Explorer path mapping");
         WslApplyTheme(window);
         switchPage(*v);
         layout(*v);
@@ -384,14 +382,14 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         layout(*v);
         return 0;
     case WM_TIMER: {
-        static ULONGLONG last = 0;
+
         if (v->cpuPercentOfTotal != (readSetting(L"CpuPercentOfTotal", 1) != 0))
             render(*v);
         auto now = GetTickCount64();
-        auto interval = std::clamp(readSetting(L"RefreshInterval", 2000), 500ul, 60000ul);
-        if (now - last >= interval)
+        auto interval = std::max(1ul, WslHostRefreshInterval());
+        if (now - v->lastRefresh >= interval)
         {
-            last = now;
+            v->lastRefresh = now;
             refresh(*v);
         }
         return 0;
@@ -405,6 +403,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             {
                 clearDistro(*v);
                 v->selectedDistro = chosen;
+                v->forceRefresh = true;
                 layout(*v);
                 refresh(*v);
             }
@@ -420,9 +419,8 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         case InstallButton:
             if (v->componentMissing && !v->pending)
             {
-                v->paused = false;
+                v->forceRefresh = true;
                 v->failed = false;
-                SetWindowTextW(v->pause, L"Pause");
                 queue(*v, {{"op", "install_component"}}, InstallTag);
                 EnableWindow(v->installButton, FALSE);
                 status(*v, L"Installing the WSL component as root…");
@@ -430,23 +428,6 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             break;
         case RefreshButton:
             manualRefresh(*v);
-            break;
-        case PauseButton:
-            v->paused = !v->paused;
-            SetWindowTextW(v->pause, v->paused ? L"Resume" : L"Pause");
-            if (v->paused)
-            {
-                disconnect(v->selectedDistro);
-                ++v->epoch;
-                v->pending = false;
-                status(*v, L"Paused · collector disconnected; displayed data is a snapshot.");
-            }
-            else
-            {
-                v->failed = false;
-                v->previousTime = 0;
-                refresh(*v);
-            }
             break;
         case SettingsButton:
             showSettings(window, v->selectedDistro);
@@ -545,7 +526,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                 return 0;
             }
             v->failed = true;
-            status(*v, L"Disconnected: " + wide(reply->error) + L"  ·  Press Refresh to reconnect.");
+            status(*v, L"Disconnected: " + wide(reply->error) + L"  ·  Use View > Refresh (F5) to reconnect.");
             return 0;
         }
         try
@@ -577,7 +558,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                     v->selectedDistro.clear();
                     layout(*v);
                     v->failed = true;
-                    status(*v, L"No running WSL2 distributions. Start a distro, then press Refresh.");
+                    status(*v, L"No running WSL2 distributions. Start a distro, then use View > Refresh (F5).");
 
                     updateButtons(*v);
                     return 0;
@@ -637,6 +618,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             else if (tag == ActionTag)
             {
                 status(*v, L"Action completed. Refreshing…");
+                v->forceRefresh = true;
                 refresh(*v);
                 return 0;
             }
@@ -731,6 +713,8 @@ extern "C" void WslSetActive(BOOL active)
     if (v.active)
     {
         v.failed = false;
+        v.paused = !WslHostRefreshAutomatically();
+        v.forceRefresh = !v.snapshot.is_object();
         v.previousTime = 0;
         refresh(v);
     }
@@ -769,4 +753,32 @@ extern "C" void WslSearchChanged(void)
         return;
     layout(*mainView);
     render(*mainView);
+}
+
+extern "C" void WslHostRefreshChanged(BOOL automatic)
+{
+    using namespace wsl;
+    using namespace wsl::ui;
+    if (!mainView) return;
+    auto &v = *mainView;
+    v.paused = !automatic;
+    if (v.paused)
+    {
+        disconnect(v.selectedDistro);
+        ++v.epoch;
+        v.pending = false;
+        v.forceRefresh = false;
+        status(v, L"Automatic refresh is off. Use View > Refresh (F5) to update.");
+    }
+    else
+    {
+        v.previousTime = 0;
+        v.lastRefresh = 0;
+        refresh(v);
+    }
+}
+extern "C" void WslHostRefresh(void)
+{
+    using namespace wsl::ui;
+    if (mainView && mainView->active) manualRefresh(*mainView);
 }

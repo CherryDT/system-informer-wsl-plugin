@@ -72,6 +72,8 @@ struct View
     unsigned epoch = 1;
     int page = 0;
     bool active = false, paused = false, pending = false, failed = false;
+    bool forceRefresh = false;
+    ULONGLONG lastRefresh = 0;
     bool componentMissing = false, cpuPercentOfTotal = true;
     Table &table()
     {
