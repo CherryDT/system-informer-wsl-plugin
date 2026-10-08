@@ -64,7 +64,7 @@ Every process includes `pid`, `ppid`, `start_ticks`, `name`, `state`, `threads`,
 | --- | --- |
 | `status` | `uid`, `euid`, `gid`, `egid`, `status_accessible`, `is_own`, `tracer_pid`, `voluntary_switches`, `involuntary_switches`, `swap_bytes`, `seccomp`, `no_new_privs`, `capabilities` |
 | `user` | Status fields and effective-user `user` name |
-| `sudo` | Status fields and `sudo_root` |
+| `sudo` | Status fields, `sudo_root`, and available `sudo_uid`, `sudo_gid`, `sudo_user`, `sudo_command` origin hints |
 | `command` | `command` |
 | `io` | `io_accessible`, `read_bytes`, `write_bytes`, `read_chars`, `write_chars`, `syscr`, `syscw`, `cancelled_write_bytes` |
 | `cgroup` | `cgroup`, `is_service`, `service_unit`, `service_scope` |
@@ -77,9 +77,15 @@ Every process includes `pid`, `ppid`, `start_ticks`, `name`, `state`, `threads`,
 
 Individual field aliases are accepted for several groups; clients should use the
 group names above. `runtime` is `"node"`, `"python"`, `"java"`, or empty when
-unrecognized. `is_own` compares effective UID with `default_uid`. `sudo_root`
-requires effective UID 0 and a nonzero numeric `SUDO_UID` from up to 256 KiB of
-the process environment. `is_service` recognizes `.service` cgroup path
+unrecognized. `is_own` compares effective UID with `default_uid`. The `sudo`
+group reads at most 256 KiB of `/proc/PID/environ` only for effective-UID-0
+processes. It parses complete NUL-terminated entries and ignores a partial final
+entry. `sudo_root` is true only when a valid numeric `SUDO_UID` is nonzero; the
+optional origin fields are returned only when `sudo_root` is true. `sudo_uid` and
+`sudo_gid` are included when their values are valid numeric IDs, `sudo_user` is
+capped at 256 bytes, and `sudo_command` at 16 KiB. These inherited environment
+values describe a possible sudo origin, not verified process ancestry.
+`is_service` recognizes `.service` cgroup path
 components, including user services. `service_unit` is the deepest `.service`
 component and `service_scope` is `"user"` below a `user@UID.service` manager,
 otherwise `"system"`; both are empty when no service is found. The manager itself
@@ -112,9 +118,15 @@ come from local `/etc/passwd`; other UIDs remain numeric, avoiding network name
 services. Command lines are capped at 16 KiB per process.
 
 The Windows view selects groups from visible or sorted columns and enabled
-highlighting, applicable filters, and service-unit tooltips. It keeps cheap identity/CPU/RSS samples while hidden or minimized
-for graph history and lifecycle tracking, then requests visible metadata on
-return. Unrequested metadata may be retained for the same PID/start-time identity;
+highlighting, applicable filters, and tooltip needs. Tooltip-only metadata is
+requested while the Processes view is visible and System Informer tooltips are
+enabled; command-line text in tooltips additionally follows the host's command-
+line-tooltip setting. The process tooltip adds user, service, executable, working
+directory, sudo-origin environment, terminal, scheduling, debugger, and security
+restriction context without repeating state, parent PID, CPU, or resident-memory
+columns. It does not read procfs on hover. The view keeps cheap identity/CPU/RSS
+samples while hidden or minimized for graph history and lifecycle tracking, then
+requests visible metadata on return. Unrequested metadata may be retained for the same PID/start-time identity;
 requested-but-unavailable metadata must clear the previous value. This avoids
 making a changed executable or credential appear current because of old cache
 contents. Sampling follows the host automatic-refresh setting. The Windows
