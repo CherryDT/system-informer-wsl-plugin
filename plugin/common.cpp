@@ -194,10 +194,22 @@ LRESULT CALLBACK tableHeaderProc(HWND header, UINT message, WPARAM wparam, LPARA
                                  DWORD_PTR context)
 {
     auto table = reinterpret_cast<Table *>(context);
+    if (message == WM_CONTEXTMENU && header == table->fixedHeader)
+    {
+        POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        if (point.x == -1 && point.y == -1)
+        {
+            RECT bounds{};
+            GetWindowRect(header, &bounds);
+            point = {bounds.left + 8, (bounds.top + bounds.bottom) / 2};
+        }
+        table->showHeaderMenu(point);
+        return 0;
+    }
     // Like TreeNew, track the header itself. Common controls do not reliably
     // supply CDIS_HOT once its header painting is replaced with custom drawing.
     if (message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)
-        table->trackHeaderHover({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
+        table->trackHeaderHover({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)}, header);
     else if (message == WM_MOUSELEAVE || message == WM_CANCELMODE)
         table->clearHeaderHover();
     else if (message == WM_NCDESTROY)
@@ -210,6 +222,7 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
     auto table = reinterpret_cast<Table *>(context);
     if (message == SaveTableLayout)
     {
+        table->updateColumnGeometry();
         table->saveLayout();
         return 0;
     }
@@ -219,9 +232,18 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
         return 0;
     }
     if (message == WM_MOUSEMOVE)
+    {
         table->trackHover({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
+        table->updateCellTooltip({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
+    }
     if (message == WM_MOUSELEAVE)
+    {
         table->clearHover();
+        SendMessageW(table->cellTooltip, TTM_POP, 0, 0);
+    }
+    if (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_KEYDOWN ||
+        message == WM_MOUSEWHEEL || message == WM_HSCROLL || message == WM_VSCROLL)
+        SendMessageW(table->cellTooltip, TTM_POP, 0, 0);
     if (message == WM_CONTEXTMENU)
     {
         const HWND header = ListView_GetHeader(window);
@@ -242,6 +264,13 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
     if (message == WM_NOTIFY)
     {
         auto header = reinterpret_cast<NMHDR *>(lparam);
+        if (header->hwndFrom == table->fixedHeader)
+            return table->fixedHeaderNotify(header);
+        if (header->hwndFrom == table->cellTooltip && header->code == TTN_GETDISPINFOW)
+        {
+            table->provideCellTooltip(reinterpret_cast<NMTTDISPINFOW *>(lparam));
+            return 0;
+        }
         if (header->hwndFrom == ListView_GetHeader(window))
         {
             if (header->code == NM_CUSTOMDRAW)
@@ -253,6 +282,9 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
                 return TRUE;
         }
         const auto result = DefSubclassProc(window, message, wparam, lparam);
+        if (header->hwndFrom == ListView_GetHeader(window) &&
+            (header->code == HDN_ITEMCHANGEDW || header->code == HDN_ITEMCHANGEDA))
+            table->updateColumnGeometry();
         if (header->hwndFrom == ListView_GetHeader(window) &&
             (header->code == HDN_ENDTRACKW || header->code == HDN_ENDTRACKA || header->code == HDN_ENDDRAG))
             // The native header applies its final order after notifying us.
@@ -267,7 +299,15 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
     }
     if (message == WM_NCDESTROY)
         RemoveWindowSubclass(window, tableLayoutProc, id);
-    return DefSubclassProc(window, message, wparam, lparam);
+    const auto result = DefSubclassProc(window, message, wparam, lparam);
+    if (message == WM_SIZE || message == WM_HSCROLL || message == WM_MOUSEHWHEEL || message == LVM_SCROLL ||
+        message == LVM_SETCOLUMNWIDTH || message == LVM_SETCOLUMNORDERARRAY || message == WM_SETFONT)
+    {
+        table->updateColumnGeometry();
+        if (message == WM_HSCROLL || message == WM_MOUSEHWHEEL || message == LVM_SCROLL)
+            InvalidateRect(window, nullptr, FALSE);
+    }
+    return result;
 }
 } // namespace
 
@@ -285,8 +325,8 @@ void Table::create(HWND parent, int id, std::vector<Column> definitions, int def
     window = control(parent, WC_LISTVIEWW, L"",
                      WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS | LVS_SINGLESEL, id);
     SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(WslGetHostFont()), TRUE);
-    ListView_SetExtendedListViewStyle(window, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER |
-                                                  LVS_EX_HEADERDRAGDROP | LVS_EX_LABELTIP | LVS_EX_INFOTIP);
+    ListView_SetExtendedListViewStyle(window,
+                                      LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP);
     if (HWND tooltip = ListView_GetToolTips(window))
     {
         // Match the native grids: ordinary tooltip font, generous reading time,
@@ -336,6 +376,228 @@ void Table::create(HWND parent, int id, std::vector<Column> definitions, int def
     SetWindowSubclass(window, tableLayoutProc, 1, reinterpret_cast<DWORD_PTR>(this));
     SetWindowSubclass(ListView_GetHeader(window), tableHeaderProc, 1, reinterpret_cast<DWORD_PTR>(this));
     WslApplyTheme(window);
+    // TreeNew also keeps its fixed header separate and does not make that
+    // header draggable. Choose columns can still choose a different first column.
+    fixedHeader = CreateWindowExW(
+        0, WC_HEADERW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | HDS_BUTTONS | HDS_HORZ | HDS_FULLDRAG,
+        0, 0, 0, 0, window, nullptr, instance, nullptr);
+    HDITEMW fixed{};
+    fixed.mask = HDI_TEXT | HDI_WIDTH | HDI_FORMAT;
+    fixed.pszText = const_cast<PWSTR>(L"");
+    fixed.fmt = HDF_STRING;
+    Header_InsertItem(fixedHeader, 0, &fixed);
+    SetWindowSubclass(fixedHeader, tableHeaderProc, 1, reinterpret_cast<DWORD_PTR>(this));
+    WslApplyTheme(fixedHeader);
+
+    // ListView's label tips use its scrolling column rectangles. Our tooltip
+    // follows the visible cell instead, including the fixed column after a scroll.
+    cellTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                  WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT, CW_USEDEFAULT,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, window, nullptr, instance, nullptr);
+    TOOLINFOW tool{sizeof(tool)};
+    // Relay input ourselves so crossing into another row restarts the native
+    // hover delay even though the tooltip tool covers the whole viewport.
+    tool.uFlags = 0;
+    tool.hwnd = window;
+    tool.uId = 1;
+    tool.lpszText = LPSTR_TEXTCALLBACKW;
+    SendMessageW(cellTooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+    SendMessageW(cellTooltip, TTM_SETMAXTIPWIDTH, 0, scale(window, 550));
+    SendMessageW(cellTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, MAXSHORT);
+    if (WslHostIntegerSetting(L"EnableInstantTooltips"))
+        SendMessageW(cellTooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 0);
+    updateColumnGeometry();
+}
+
+void Table::updateColumnGeometry()
+{
+    if (!fixedHeader || updatingGeometry || !IsWindow(window))
+        return;
+    updatingGeometry = true;
+    const int previousWidth = fixedWidth;
+    const int previousColumn = fixedColumn;
+    HWND header = ListView_GetHeader(window);
+    drawingColumns.clear();
+    for (const int column : visibleColumns())
+    {
+        RECT bounds{};
+        Header_GetItemRect(header, column, &bounds);
+        MapWindowPoints(header, window, reinterpret_cast<POINT *>(&bounds), 2);
+        drawingColumns.push_back({column, bounds});
+    }
+    fixedColumn = drawingColumns.empty() ? -1 : drawingColumns.front().index;
+    fixedWidth = fixedColumn >= 0 ? ListView_GetColumnWidth(window, fixedColumn) : 0;
+    RECT headerBounds{}, client{};
+    GetWindowRect(header, &headerBounds);
+    MapWindowPoints(nullptr, window, reinterpret_cast<POINT *>(&headerBounds), 2);
+    GetClientRect(window, &client);
+    const auto gridFont = SendMessageW(window, WM_GETFONT, 0, 0);
+    SendMessageW(fixedHeader, WM_SETFONT, gridFont, FALSE);
+    // TreeNew uses its grid font for content tips too. The replacement tooltip
+    // does not inherit it automatically because it is a separate popup window.
+    if (SendMessageW(cellTooltip, WM_GETFONT, 0, 0) != gridFont)
+        SendMessageW(cellTooltip, WM_SETFONT, gridFont, FALSE);
+    if (fixedColumn >= 0)
+    {
+        HDITEMW item{};
+        item.mask = HDI_TEXT | HDI_WIDTH | HDI_FORMAT;
+        item.pszText = columns[fixedColumn].title.data();
+        item.cxy = fixedWidth;
+        item.fmt = HDF_STRING | (columns[fixedColumn].numeric ? HDF_RIGHT : HDF_LEFT);
+        if ((!ancestryOrder || ancestrySortIndicator) && fixedColumn == sortColumn)
+            item.fmt |= descending ? HDF_SORTDOWN : HDF_SORTUP;
+        Header_SetItem(fixedHeader, 0, &item);
+    }
+    SetWindowPos(fixedHeader, HWND_TOP, 0, headerBounds.top,
+                 std::min(fixedWidth, static_cast<int>(client.right)), headerBounds.bottom - headerBounds.top,
+                 SWP_NOACTIVATE);
+    // Clip the scrolling header, rather than relying on overlapping sibling
+    // painting. The fixed divider must also own mouse input at the boundary.
+    RECT scrollingHeader{};
+    GetClientRect(header, &scrollingHeader);
+    scrollingHeader.left = std::max(0L, fixedWidth - headerBounds.left);
+    HRGN region = CreateRectRgnIndirect(&scrollingHeader);
+    if (!SetWindowRgn(header, region, TRUE))
+        DeleteObject(region);
+    ShowWindow(fixedHeader, fixedColumn >= 0 ? SW_SHOWNA : SW_HIDE);
+    TOOLINFOW tool{sizeof(tool)};
+    tool.hwnd = window;
+    tool.uId = 1;
+    tool.rect = client;
+    tool.rect.top = headerBounds.bottom;
+    SendMessageW(cellTooltip, TTM_NEWTOOLRECTW, 0, reinterpret_cast<LPARAM>(&tool));
+    updatingGeometry = false;
+    if (previousWidth != fixedWidth || previousColumn != fixedColumn)
+        InvalidateRect(window, nullptr, FALSE);
+}
+
+LRESULT Table::fixedHeaderNotify(NMHDR *notification)
+{
+    if (notification->code == NM_CUSTOMDRAW)
+    {
+        auto draw = *reinterpret_cast<NMCUSTOMDRAW *>(notification);
+        if (draw.dwDrawStage == CDDS_ITEMPREPAINT)
+            draw.dwItemSpec = fixedColumn;
+        return drawHeader(&draw);
+    }
+    if (updatingGeometry)
+        return 0;
+    const auto item = reinterpret_cast<NMHEADERW *>(notification);
+    if (notification->code == HDN_ITEMCLICKW || notification->code == HDN_ITEMCLICKA)
+    {
+        // Keep the parent on the same notification path as a scrolling header
+        // click (the process tree also updates its hierarchy/sort state there).
+        NMLISTVIEW click{};
+        click.hdr = {window, static_cast<UINT_PTR>(GetDlgCtrlID(window)), LVN_COLUMNCLICK};
+        click.iItem = -1;
+        click.iSubItem = fixedColumn;
+        SendMessageW(GetParent(window), WM_NOTIFY, click.hdr.idFrom, reinterpret_cast<LPARAM>(&click));
+    }
+    else if ((notification->code == HDN_ITEMCHANGINGW || notification->code == HDN_ITEMCHANGINGA) &&
+             item->pitem && (item->pitem->mask & HDI_WIDTH))
+    {
+        item->pitem->cxy = std::max(scale(window, 20), item->pitem->cxy);
+    }
+    else if ((notification->code == HDN_ITEMCHANGEDW || notification->code == HDN_ITEMCHANGEDA) &&
+             item->pitem && (item->pitem->mask & HDI_WIDTH))
+    {
+        ListView_SetColumnWidth(window, fixedColumn, item->pitem->cxy);
+    }
+    else if (notification->code == HDN_ENDTRACKW || notification->code == HDN_ENDTRACKA)
+        PostMessageW(window, SaveTableLayout, 0, 0);
+    else if (notification->code == HDN_DIVIDERDBLCLICKW || notification->code == HDN_DIVIDERDBLCLICKA)
+    {
+        const int column = fixedColumn;
+        HDC dc = GetDC(window);
+        const auto previousFont = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(window, WM_GETFONT, 0, 0)));
+        SIZE title{};
+        GetTextExtentPoint32W(dc, columns[column].title.c_str(),
+                              static_cast<int>(columns[column].title.size()), &title);
+        SelectObject(dc, previousFont);
+        ReleaseDC(window, dc);
+        // Autosizing an empty owner-data list returns zero: keep the header
+        // readable instead of accidentally hiding the pinned column.
+        ListView_SetColumnWidth(window, column, LVSCW_AUTOSIZE);
+        ListView_SetColumnWidth(window, column,
+                                std::max(ListView_GetColumnWidth(window, column),
+                                         static_cast<int>(title.cx) + scale(window, 20)));
+        PostMessageW(window, SaveTableLayout, 0, 0);
+    }
+    return 0;
+}
+
+void Table::updateCellTooltip(POINT point)
+{
+    LVHITTESTINFO hit{};
+    hit.pt = point;
+    const int row = ListView_HitTest(window, &hit);
+    int column = -1;
+    if (row >= 0)
+    {
+        if (point.x >= 0 && point.x < fixedWidth)
+            column = fixedColumn;
+        else
+            for (const auto &candidate : drawingColumns)
+                if (candidate.index != fixedColumn && point.x >= candidate.bounds.left &&
+                    point.x < candidate.bounds.right)
+                {
+                    column = candidate.index;
+                    break;
+                }
+    }
+    if (row != tooltipRow || column != tooltipColumn)
+    {
+        tooltipRow = row;
+        tooltipColumn = column;
+        SendMessageW(cellTooltip, TTM_ACTIVATE, FALSE, 0);
+        SendMessageW(cellTooltip, TTM_ACTIVATE, TRUE, 0);
+    }
+    MSG mouse{};
+    mouse.hwnd = window;
+    mouse.message = WM_MOUSEMOVE;
+    mouse.lParam = MAKELPARAM(point.x, point.y);
+    mouse.time = GetMessageTime();
+    mouse.pt = point;
+    ClientToScreen(window, &mouse.pt);
+    SendMessageW(cellTooltip, TTM_RELAYEVENT, 0, reinterpret_cast<LPARAM>(&mouse));
+}
+
+void Table::provideCellTooltip(NMTTDISPINFOW *tip)
+{
+    tooltipText.clear();
+    if (WslHostIntegerSetting(L"EnableTooltipSupport") && tooltipRow >= 0 && tooltipColumn >= 0 &&
+        static_cast<size_t>(tooltipRow) < rows.size())
+    {
+        const auto &row = rows[tooltipRow];
+        if (tooltipColumn == 0 && infoTip)
+            tooltipText = infoTip(row);
+        else if (static_cast<size_t>(tooltipColumn) < row.cells.size())
+        {
+            HDC dc = GetDC(window);
+            const auto old =
+                SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(window, WM_GETFONT, 0, 0)));
+            SIZE size{};
+            const auto &value = row.cells[tooltipColumn];
+            GetTextExtentPoint32W(dc, value.c_str(), static_cast<int>(value.size()), &size);
+            SelectObject(dc, old);
+            ReleaseDC(window, dc);
+            if (size.cx > ListView_GetColumnWidth(window, tooltipColumn) - scale(window, 12))
+                tooltipText = value;
+        }
+    }
+    tip->lpszText = tooltipText.data();
+}
+
+void Table::drawFixedDivider(HDC dc) const
+{
+    if (fixedColumn < 0 || !fixedWidth)
+        return;
+    RECT bounds{};
+    GetClientRect(window, &bounds);
+    bounds.left = fixedWidth - 1;
+    bounds.right = fixedWidth;
+    SetDCBrushColor(dc, WslIsDarkTheme() ? RGB(90, 90, 90) : RGB(215, 215, 215));
+    FillRect(dc, &bounds, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
 }
 
 void Table::saveLayout() const
@@ -522,7 +784,12 @@ void Table::showHeaderMenu(POINT point)
     HDHITTESTINFO hit{};
     hit.pt = point;
     ScreenToClient(header, &hit.pt);
-    const int column = static_cast<int>(SendMessageW(header, HDM_HITTEST, 0, reinterpret_cast<LPARAM>(&hit)));
+    RECT fixedBounds{};
+    GetWindowRect(fixedHeader, &fixedBounds);
+    const int column =
+        PtInRect(&fixedBounds, point)
+            ? fixedColumn
+            : static_cast<int>(SendMessageW(header, HDM_HITTEST, 0, reinterpret_cast<LPARAM>(&hit)));
     HMENU menu = CreatePopupMenu();
     const bool valid = column >= 0 && isColumnVisible(column);
     AppendMenuW(menu, MF_STRING | (valid ? 0 : MF_GRAYED), 1, L"Size column to fit");
@@ -604,6 +871,7 @@ void Table::showHeaderMenu(POINT point)
         }
         ListView_SetColumnOrderArray(window, static_cast<int>(order.size()), order.data());
     }
+    updateColumnGeometry();
     saveLayout();
     if (command == 3 || command == 5)
         PostMessageW(GetParent(window), ColumnsChangedMessage, 0, 0);
@@ -856,6 +1124,14 @@ bool Table::notify(NMHDR *hdr)
 {
     if (hdr->hwndFrom != window)
         return false;
+    if (hdr->code == LVN_ENDSCROLL)
+    {
+        updateColumnGeometry();
+        // The native control scrolls pixels horizontally. Repaint the fixed
+        // cell and the newly exposed scrolling cells from their current geometry.
+        InvalidateRect(window, nullptr, FALSE);
+        return false;
+    }
     if (hdr->code == LVN_GETDISPINFOW)
     {
         auto info = reinterpret_cast<NMLVDISPINFOW *>(hdr);
@@ -896,7 +1172,12 @@ bool Table::notify(NMHDR *hdr)
 LRESULT Table::customDraw(NMLVCUSTOMDRAW *draw) const
 {
     if (draw->nmcd.dwDrawStage == CDDS_PREPAINT)
-        return CDRF_NOTIFYITEMDRAW;
+        return CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT;
+    if (draw->nmcd.dwDrawStage == CDDS_POSTPAINT)
+    {
+        drawFixedDivider(draw->nmcd.hdc);
+        return CDRF_DODEFAULT;
+    }
     if (draw->nmcd.dwDrawStage != CDDS_ITEMPREPAINT || draw->nmcd.dwItemSpec >= rows.size())
         return CDRF_DODEFAULT;
 
@@ -998,6 +1279,10 @@ LRESULT Table::customDraw(NMLVCUSTOMDRAW *draw) const
     const int saved = SaveDC(dc);
     RECT bounds{};
     ListView_GetItemRect(window, index, &bounds, LVIR_BOUNDS);
+    bounds.left = 0;
+    RECT client{};
+    GetClientRect(window, &client);
+    bounds.right = std::max(bounds.right, client.right);
     SetDCBrushColor(dc, background);
     FillRect(dc, &bounds, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
     // TreeNew paints the TreeView themed item *over* its semantic background.
@@ -1040,13 +1325,23 @@ LRESULT Table::customDraw(NMLVCUSTOMDRAW *draw) const
         SelectObject(dc, normal);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, foreground);
-    for (const int column : visibleColumns())
+    // Clip the scrolling cells before drawing the fixed one. Cached header
+    // geometry avoids allocating a column list and querying HWNDs for every row.
+    for (const auto &definition : drawingColumns)
     {
+        const int column = definition.index;
         if (static_cast<size_t>(column) >= row.cells.size())
             continue;
-        RECT cell{};
-        Header_GetItemRect(ListView_GetHeader(window), column, &cell);
-        MapWindowPoints(ListView_GetHeader(window), window, reinterpret_cast<POINT *>(&cell), 2);
+        const int cellDc = SaveDC(dc);
+        RECT cell = definition.bounds;
+        if (column == fixedColumn)
+        {
+            cell.left = 0;
+            cell.right = fixedWidth;
+            IntersectClipRect(dc, 0, bounds.top, fixedWidth - 1, bounds.bottom);
+        }
+        else
+            IntersectClipRect(dc, fixedWidth, bounds.top, client.right, bounds.bottom);
         cell.top = bounds.top;
         cell.bottom = bounds.bottom;
         cell.left += scale(window, 6);
@@ -1054,6 +1349,7 @@ LRESULT Table::customDraw(NMLVCUSTOMDRAW *draw) const
         DrawTextW(dc, row.cells[column].c_str(), static_cast<int>(row.cells[column].size()), &cell,
                   DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX |
                       (columns[column].numeric ? DT_RIGHT : DT_LEFT));
+        RestoreDC(dc, cellDc);
     }
     RestoreDC(dc, saved);
     return CDRF_SKIPDEFAULT;
@@ -1061,6 +1357,9 @@ LRESULT Table::customDraw(NMLVCUSTOMDRAW *draw) const
 
 void Table::releaseDrawingResources()
 {
+    if (cellTooltip)
+        DestroyWindow(cellTooltip);
+    cellTooltip = nullptr;
     if (boldFont)
         DeleteObject(boldFont);
     boldFont = nullptr;
@@ -1089,17 +1388,17 @@ void Table::clearHover()
     if (old >= 0)
         ListView_RedrawItems(window, old, old);
 }
-void Table::trackHeaderHover(POINT point)
+void Table::trackHeaderHover(POINT point, HWND header)
 {
-    HWND header = ListView_GetHeader(window);
     RECT client{};
     GetClientRect(header, &client);
     HDHITTESTINFO hit{};
     hit.pt = point;
-    const int next =
-        PtInRect(&client, point)
-            ? static_cast<int>(SendMessageW(header, HDM_HITTEST, 0, reinterpret_cast<LPARAM>(&hit)))
-            : -1;
+    int next = PtInRect(&client, point)
+                   ? static_cast<int>(SendMessageW(header, HDM_HITTEST, 0, reinterpret_cast<LPARAM>(&hit)))
+                   : -1;
+    if (header == fixedHeader && next >= 0)
+        next = fixedColumn;
     if (next != hotHeaderColumn)
     {
         const int old = hotHeaderColumn;
@@ -1107,8 +1406,9 @@ void Table::trackHeaderHover(POINT point)
         for (const int column : {old, next})
         {
             RECT bounds{};
-            if (column >= 0 && Header_GetItemRect(header, column, &bounds))
-                InvalidateRect(header, &bounds, FALSE);
+            HWND changedHeader = column == fixedColumn ? fixedHeader : ListView_GetHeader(window);
+            if (column >= 0 && Header_GetItemRect(changedHeader, column == fixedColumn ? 0 : column, &bounds))
+                InvalidateRect(changedHeader, &bounds, FALSE);
         }
     }
     TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, header, 0};
@@ -1119,8 +1419,8 @@ void Table::clearHeaderHover()
     const int old = hotHeaderColumn;
     hotHeaderColumn = -1;
     RECT bounds{};
-    HWND header = ListView_GetHeader(window);
-    if (old >= 0 && Header_GetItemRect(header, old, &bounds))
+    HWND header = old == fixedColumn ? fixedHeader : ListView_GetHeader(window);
+    if (old >= 0 && Header_GetItemRect(header, old == fixedColumn ? 0 : old, &bounds))
         InvalidateRect(header, &bounds, FALSE);
 }
 LRESULT Table::drawHeader(NMCUSTOMDRAW *draw) const
@@ -1131,7 +1431,7 @@ LRESULT Table::drawHeader(NMCUSTOMDRAW *draw) const
         return CDRF_DODEFAULT;
     const int column = static_cast<int>(draw->dwItemSpec);
     const int saved = SaveDC(draw->hdc);
-    auto theme = OpenThemeData(ListView_GetHeader(window), L"Header");
+    auto theme = OpenThemeData(draw->hdr.hwndFrom, L"Header");
     if (WslIsDarkTheme())
     {
         SetDCBrushColor(draw->hdc, WslDialogBackground());
@@ -1166,6 +1466,13 @@ LRESULT Table::drawHeader(NMCUSTOMDRAW *draw) const
     }
     if (theme)
         CloseThemeData(theme);
+    if (draw->hdr.hwndFrom == fixedHeader)
+    {
+        RECT divider = draw->rc;
+        divider.left = divider.right - 1;
+        SetDCBrushColor(draw->hdc, WslIsDarkTheme() ? RGB(90, 90, 90) : RGB(215, 215, 215));
+        FillRect(draw->hdc, &divider, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    }
     RestoreDC(draw->hdc, saved);
     return CDRF_SKIPDEFAULT;
 }

@@ -115,9 +115,18 @@ class Table
     void showHeaderMenu(POINT point);
     void trackHover(POINT point);
     void clearHover();
-    void trackHeaderHover(POINT point);
+    void trackHeaderHover(POINT point, HWND header);
     void clearHeaderHover();
     LRESULT drawHeader(NMCUSTOMDRAW *draw) const;
+    // The fixed column uses a separate native header, as TreeNew does. Rows
+    // still belong to one ListView, so selection and keyboard navigation stay native.
+    HWND fixedHeader = nullptr;
+    HWND cellTooltip = nullptr;
+    void updateColumnGeometry();
+    LRESULT fixedHeaderNotify(NMHDR *notification);
+    void updateCellTooltip(POINT point);
+    void provideCellTooltip(NMTTDISPINFOW *tip);
+    void drawFixedDivider(HDC dc) const;
     void releaseDrawingResources();
     void setAncestryOrder(bool enabled, bool showSort = false);
     // Always pass the complete snapshot. Filtering must not look like removal.
@@ -146,6 +155,18 @@ class Table
     std::vector<int> hiddenWidths;
     mutable HFONT boldFont = nullptr;
     mutable HFONT boldSourceFont = nullptr;
+    struct VisibleColumn
+    {
+        int index;
+        RECT bounds;
+    };
+    std::vector<VisibleColumn> drawingColumns;
+    int fixedColumn = -1;
+    int fixedWidth = 0;
+    bool updatingGeometry = false;
+    int tooltipRow = -1;
+    int tooltipColumn = -1;
+    std::wstring tooltipText;
     bool initialized = false;
     std::vector<Row> source;
     std::function<bool(const Row &)> filter;
