@@ -35,7 +35,10 @@ std::string descriptor_type(const std::string &target)
 
 Json find_handles(const Json &request)
 {
-    const std::string query = folded(request.value("query", std::string{}));
+    const bool enumerate = request.value("enumerate", false);
+    const bool case_sensitive = request.value("case_sensitive", false);
+    const std::string query = case_sensitive ? request.value("query", std::string{})
+                                            : folded(request.value("query", std::string{}));
     if (query.empty() || query.size() > 1024)
         throw std::runtime_error("Enter a search string between 1 and 1024 UTF-8 bytes.");
 
@@ -68,8 +71,6 @@ Json find_handles(const Json &request)
         }
         ++scanned;
         const std::string base = "/proc/" + std::to_string(pid);
-        const bool process_match =
-            folded(before.name).find(query) != std::string::npos || std::to_string(pid) == query;
         Json process_rows = Json::array();
         auto consider = [&](const std::string &handle, const std::string &type, const std::string &path) {
             if (exhausted() || process_rows.size() + rows.size() >= 10000)
@@ -77,7 +78,17 @@ Json find_handles(const Json &request)
                 truncated = true;
                 return;
             }
-            if (path.empty() || (!process_match && folded(path).find(query) == std::string::npos))
+            if (path.empty())
+                return;
+            // The Windows search control supplies the final match semantics,
+            // including PCRE and Unicode case folding. Only discard candidates
+            // here when a literal byte comparison is known to be safe. A
+            // process name or PID must never cause all its handles to match.
+            const bool non_ascii = std::any_of(path.begin(), path.end(), [](unsigned char c) {
+                return c >= 0x80;
+            });
+            if (!enumerate && (case_sensitive || !non_ascii) &&
+                (case_sensitive ? path : folded(path)).find(query) == std::string::npos)
                 return;
             Json item = {{"pid", pid},
                          {"start_ticks", before.start_ticks},

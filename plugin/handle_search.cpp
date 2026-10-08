@@ -31,6 +31,10 @@ struct SearchWindow
     Table table;
     std::shared_ptr<Mailbox> mailbox = std::make_shared<Mailbox>();
     uintptr_t generation = 0;
+    ULONG_PTR match = 0;
+    std::wstring lastQuery;
+    bool caseSensitive = false, regex = false;
+    bool modesKnown = true;
     bool busy = false;
 };
 
@@ -68,10 +72,25 @@ void beginSearch(SearchWindow &state)
     std::wstring query(static_cast<size_t>(length) + 1, L'\0');
     GetWindowTextW(state.query, query.data(), static_cast<int>(query.size()));
     query.resize(length);
+    if (!state.match)
+    {
+        SetWindowTextW(state.status, L"Enter a valid search expression.");
+        SetFocus(state.query);
+        return;
+    }
     state.table.clear();
     setBusy(state, true);
     SetWindowTextW(state.status, L"Searching handles and mapped files...");
-    submit(state.distro, {{"op", "find_handles"}, {"query", utf8(query)}}, state.mailbox, ++state.generation);
+    const bool nonAscii = std::any_of(query.begin(), query.end(), [](wchar_t c) { return c >= 0x80; });
+    // Keep ordinary literal searches cheap. PCRE and Unicode-insensitive
+    // matching are performed by the host control, so those searches request
+    // candidates without an incompatible Linux-side regular expression engine.
+    submit(state.distro,
+           {{"op", "find_handles"},
+            {"query", utf8(query)},
+            {"case_sensitive", state.caseSensitive},
+            {"enumerate", !state.modesKnown || state.regex || (!state.caseSensitive && nonAscii)}},
+           state.mailbox, ++state.generation);
 }
 void cancelSearch(SearchWindow &state)
 {
@@ -86,6 +105,40 @@ void cancelSearch(SearchWindow &state)
     ++state.generation;
     setBusy(state, false);
     SetWindowTextW(state.status, L"Search canceled.");
+}
+void CALLBACK queryChanged(ULONG_PTR match, void *context)
+{
+    auto &state = *static_cast<SearchWindow *>(context);
+    // Match handles belong to the native edit control. Discard an outstanding
+    // scan before its query or options change; never apply a new expression to
+    // candidates collected with a different literal prefilter.
+    cancelSearch(state);
+    state.match = match;
+    const int length = GetWindowTextLengthW(state.query);
+    std::wstring query(static_cast<size_t>(length) + 1, L'\0');
+    GetWindowTextW(state.query, query.data(), static_cast<int>(query.size()));
+    query.resize(length);
+    const bool caseSensitive = WslHostIntegerSetting(L"SearchControlCaseSensitive") != 0;
+    const bool regex = WslHostIntegerSetting(L"SearchControlRegex") != 0;
+    if (query == state.lastQuery)
+    {
+        // A callback with unchanged text follows an option change in this
+        // control (or the host synchronizing its options). Typing alone must
+        // not import preferences changed by a different search box.
+        state.caseSensitive = caseSensitive;
+        state.regex = regex;
+        state.modesKnown = true;
+    }
+    else if (caseSensitive != state.caseSensitive || regex != state.regex)
+    {
+        // Host versions differ: some synchronize shared options while typing,
+        // others keep their local buttons. Without a public option accessor,
+        // neither interpretation can justify discarding Linux candidates.
+        state.modesKnown = false;
+    }
+    state.lastQuery = std::move(query);
+    if (state.status)
+        SetWindowTextW(state.status, L"Press \"Search\" to find handles and mapped files by name.");
 }
 void command(SearchWindow &state, int id)
 {
@@ -202,9 +255,11 @@ LRESULT CALLBACK searchProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     {
     case WM_CREATE:
         state->query = control(window, WC_EDITW, L"", WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, Query);
-        SendMessageW(state->query, EM_SETCUEBANNER, FALSE,
-                     reinterpret_cast<LPARAM>(L"Path substring, process name or PID"));
-        SendMessageW(state->query, EM_SETLIMITTEXT, 512, 0);
+        state->caseSensitive = WslHostIntegerSetting(L"SearchControlCaseSensitive") != 0;
+        state->regex = WslHostIntegerSetting(L"SearchControlRegex") != 0;
+        WslCreateSearch(window, state->query, L"Search handle and mapped file names", queryChanged, state);
+        // The native search control's expression buffer holds 255 characters.
+        SendMessageW(state->query, EM_SETLIMITTEXT, 255, 0);
         SetWindowSubclass(state->query, queryProc, 1, reinterpret_cast<DWORD_PTR>(window));
         state->search = control(window, WC_BUTTONW, L"Search", WS_TABSTOP | BS_DEFPUSHBUTTON, Search);
         state->cancel = control(window, WC_BUTTONW, L"Cancel", WS_TABSTOP, Cancel);
@@ -297,6 +352,8 @@ LRESULT CALLBACK searchProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         std::vector<Row> rows;
         for (const auto &item : reply->data.value("results", Json::array()))
         {
+            if (!state->match || !WslSearchMatches(state->match, text(item, "path").c_str()))
+                continue;
             const auto key = item.at("pid").dump() + ':' + item.at("start_ticks").dump() + ':' +
                              item.value("type", "") + ':' + item.value("handle", "") + ':' +
                              item.value("path", "");
@@ -311,7 +368,7 @@ LRESULT CALLBACK searchProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         if (reply->data.value("inaccessible_processes", 0))
             status += L"; " + text(reply->data, "inaccessible_processes") + L" inaccessible";
         if (reply->data.value("truncated", false))
-            status += L". Results limited; narrow your search.";
+            status += L". Search incomplete: time or candidate limit reached.";
         SetWindowTextW(state->status, status.c_str());
         return 0;
     }
