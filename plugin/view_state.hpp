@@ -52,8 +52,7 @@ struct ProcessSample
 };
 struct View
 {
-    HWND window{}, distro{}, refresh{}, pause{}, settings{}, search{}, tabs{}, listeners{}, tree{}, inspect{},
-        actions{}, exportButton{}, status{}, graph{}, memoryGraph{}, installNotice{}, installButton{},
+    HWND window{}, distro{}, settings{}, search{}, tabs{}, listeners{}, tree{}, exportButton{}, status{}, graph{}, memoryGraph{}, installNotice{}, installButton{},
         tooltips{};
     Table processes, connections, services;
     std::shared_ptr<Mailbox> mailbox = std::make_shared<Mailbox>();

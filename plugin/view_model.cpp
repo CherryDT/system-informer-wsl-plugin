@@ -72,10 +72,8 @@ void clearDistro(View &v)
 }
 void updateButtons(View &v)
 {
-    bool selected = v.table().selected() != nullptr;
-    EnableWindow(v.inspect, selected);
-    EnableWindow(v.actions, selected);
-    EnableWindow(v.settings, !v.selectedDistro.empty());
+    EnableWindow(v.settings, TRUE);
+    EnableWindow(v.exportButton, !v.table().rows.empty());
 }
 void render(View &v)
 {

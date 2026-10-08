@@ -48,23 +48,34 @@ void layout(View &v)
     GetClientRect(v.window, &rect);
     auto s = [&](int x) { return scale(v.window, x); };
     const int width = rect.right, height = rect.bottom, gap = s(4);
-    const int combo = std::max(s(130), std::min(s(300), width - s(300)));
+    auto checkWidth = [&](HWND check) {
+        HDC dc = GetDC(check);
+        HGDIOBJ previous = SelectObject(dc, font);
+        SIZE textSize{};
+        auto label = windowText(check);
+        GetTextExtentPoint32W(dc, label.c_str(), static_cast<int>(label.size()), &textSize);
+        SelectObject(dc, previous);
+        ReleaseDC(check, dc);
+        return textSize.cx + GetSystemMetricsForDpi(SM_CXMENUCHECK, GetDpiForWindow(check)) + s(6);
+    };
+    const int optionWidth = checkWidth(v.page == 1 ? v.listeners : v.tree);
+    const int combo = std::max(s(110), std::min(s(300), width - s(224) - optionWidth - gap));
     place(v.distro, 0, 0, combo, s(300));
     // A dropdown's requested height includes its popup. Measure the collapsed
     // control so adjacent buttons have exactly the same visual height.
     RECT comboRect{};
     GetWindowRect(v.distro, &comboRect);
     const int line = std::max(s(20), static_cast<int>(comboRect.bottom - comboRect.top));
-    place(v.refresh, combo + gap, 0, s(86), line);
-    place(v.pause, combo + gap + s(90), 0, s(86), line);
-    place(v.settings, combo + gap + s(180), 0, s(88), line);
+    place(v.settings, combo + gap, 0, s(88), line);
+    place(v.exportButton, combo + s(88) + 2 * gap, 0, s(114), line);
+    place(v.tree, width - checkWidth(v.tree), 0, checkWidth(v.tree), line);
+    place(v.listeners, width - checkWidth(v.listeners), 0, checkWidth(v.listeners), line);
     const int footerHeight = s(18);
     const int footerY = height - gap - footerHeight;
-    const int buttonsY = footerY - gap - line;
     place(v.status, s(2), footerY, width - s(4), footerHeight);
 
     const bool content = !v.componentMissing;
-    for (HWND child : {v.graph, v.memoryGraph, v.tabs, v.inspect, v.actions, v.exportButton})
+    for (HWND child : {v.graph, v.memoryGraph, v.tabs, v.exportButton})
         ShowWindow(child, content ? SW_SHOW : SW_HIDE);
     ShowWindow(v.processes.window, content && v.page == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.connections.window, content && v.page == 1 ? SW_SHOW : SW_HIDE);
@@ -74,7 +85,6 @@ void layout(View &v)
     ShowWindow(v.installNotice, content ? SW_HIDE : SW_SHOW);
     ShowWindow(v.installButton, content ? SW_HIDE : SW_SHOW);
     EnableWindow(v.installButton, !v.pending);
-    EnableWindow(v.pause, content);
     const bool globalSearch = WslHasGlobalSearch() != FALSE;
     ShowWindow(v.search, content && !globalSearch ? SW_SHOW : SW_HIDE);
     if (!content)
@@ -99,20 +109,12 @@ void layout(View &v)
         tableTop += gap + editHeight(v.window) + gap;
     }
     for (auto table : {&v.processes, &v.connections, &v.services})
-        place(table->window, 0, tableTop, width, std::max(0, buttonsY - gap - tableTop));
-    // Keep controls in the same places on all three pages, even when the
-    // page-specific checkbox is hidden.
-    place(v.tree, width - s(210), buttonsY, s(210), line);
-    place(v.listeners, width - s(230), buttonsY, s(230), line);
-    place(v.inspect, 0, buttonsY, s(112), line);
-    place(v.actions, s(116), buttonsY, s(104), line);
-    place(v.exportButton, s(224), buttonsY, s(114), line);
+        place(table->window, 0, tableTop, width, std::max(0, footerY - gap - tableTop));
 }
 void switchPage(View &v)
 {
     const int tab = TabCtrl_GetCurSel(v.tabs);
     v.page = tab == 1 ? 2 : tab == 2 ? 1 : 0;
-    SetWindowTextW(v.inspect, v.page == 1 ? L"Go to process" : L"Inspect...");
     ShowWindow(v.processes.window, v.page == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.connections.window, v.page == 1 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.services.window, v.page == 2 ? SW_SHOW : SW_HIDE);
@@ -320,8 +322,6 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                             {L"Startup", 100},
                             {L"Load", 100},
                             {L"Description", 500}});
-        v->inspect = control(window, L"BUTTON", L"Inspect...", WS_TABSTOP, InspectButton);
-        v->actions = control(window, L"BUTTON", L"Actions", WS_TABSTOP, ActionsButton);
         v->exportButton = control(window, L"BUTTON", L"Export view...", WS_TABSTOP, ExportButton);
         v->installNotice =
             control(window, L"STATIC",
@@ -338,7 +338,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                             SS_LEFT, 0);
         for (HWND child : {v->distro, v->settings, v->tabs, v->search, v->listeners,
                            v->tree, v->processes.window, v->connections.window, v->services.window,
-                           v->inspect, v->actions, v->exportButton, v->installButton})
+                           v->exportButton, v->installButton})
             SetWindowSubclass(child, childKeys, 1, reinterpret_cast<DWORD_PTR>(v));
         v->tooltips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
                                       WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -351,8 +351,6 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             info.lpszText = const_cast<wchar_t *>(label);
             SendMessageW(v->tooltips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
         };
-        tip(v->inspect, L"Inspect the selected resource, or go to the socket owner (Enter)");
-        tip(v->actions, L"Actions for the selected resource (Delete offers SIGTERM for a process)");
         tip(v->exportButton, L"Export the visible rows and columns");
         tip(v->settings, L"WSL options: CPU percentage, Inspector capture and Explorer path mapping");
         WslApplyTheme(window);
@@ -436,15 +434,6 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         case ListenerCheck:
             render(*v);
             break;
-        case InspectButton:
-            inspect(*v);
-            break;
-        case ActionsButton: {
-            RECT r{};
-            GetWindowRect(v->actions, &r);
-            menu(*v, {r.left, r.bottom});
-            break;
-        }
         case ExportButton:
             saveText(window, v->table().exportText(),
                      v->page == 0   ? L"wsl-processes.tsv"
