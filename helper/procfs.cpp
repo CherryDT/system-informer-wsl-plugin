@@ -895,6 +895,32 @@ Json process_stacks(const Json& request) {
         }
         return annotated;
     };
+    auto stack_first = [](const std::string& output) {
+        std::istringstream lines(output);
+        std::string line, frames, diagnostics;
+        bool found_frames = false;
+        while (std::getline(lines, line)) {
+            const bool frame = line.size() > 1 && line[0] == '#' &&
+                line[1] >= '0' && line[1] <= '9';
+            const bool thread = line.rfind("Thread ", 0) == 0 && line.size() > 7 &&
+                line[7] >= '0' && line[7] <= '9';
+            if (frame || thread) found_frames = true;
+            // These are attach/detach announcements, not capture failures.
+            if (line.rfind("[New LWP ", 0) == 0 ||
+                line.rfind("[Thread debugging using libthread_db enabled]", 0) == 0 ||
+                line.rfind("Using host libthread_db library ", 0) == 0 ||
+                (line.rfind("[Inferior ", 0) == 0 && line.find(" detached]") != std::string::npos))
+                continue;
+            if (found_frames) frames += line + "\n";
+            else if (!line.empty() && line.rfind("0x", 0) != 0)
+                diagnostics += line + "\n";
+        }
+        // Preserve a failed attach verbatim: never disguise diagnostics as an
+        // empty successful capture. Source/symbol warnings remain available.
+        if (!found_frames) return output;
+        if (!diagnostics.empty()) frames += "\nGDB diagnostics\n" + diagnostics;
+        return frames;
+    };
     auto capture = [&](bool minimal_symbols) {
         // --readnever skips DWARF while retaining ELF minimal symbols, including
         // exported functions. Shared-library loading stays enabled for libc and
@@ -912,6 +938,7 @@ Json process_stacks(const Json& request) {
             "-iex", "maintenance set internal-warning corefile no",
             "-iex", "set exec-file-mismatch off",
             "-ex", "set pagination off", "-ex", "set confirm off",
+            "-iex", "set print thread-events off", "-iex", "set print inferior-events off",
             "-ex", "set print frame-arguments none", "-ex", "set print entry-values no",
             "-ex", "attach " + std::to_string(identity.pid), "-ex", backtrace};
         arguments.insert(arguments.end(), options.begin(), options.end());
@@ -925,7 +952,7 @@ Json process_stacks(const Json& request) {
         require_identity(identity);
         const auto maps_after = read_text(proc_path(identity.pid, "maps"), 8 * 1024 * 1024);
         require_identity(identity);
-        result.output = annotate_frames(result.output, maps_before, maps_after);
+        result.output = stack_first(annotate_frames(result.output, maps_before, maps_after));
         return result;
     };
     auto primary = capture(false);

@@ -327,6 +327,10 @@ working directory. No caller-provided GDB commands are accepted. The batch ends
 with an explicit detach; on timeout the debugger process group is terminated,
 which releases ptrace ownership. It does not send SIGCONT to the target itself.
 
+Routine GDB thread/attach announcements are suppressed. When a backtrace is
+present, startup/source warnings follow it under `GDB diagnostics`; failed
+attachments without frames retain their diagnostic output.
+
 ### `script_stacks` (`pid`, `start_ticks`)
 
 Captures runtime-level stacks for a process identified by `pid` and `start_ticks`.
