@@ -551,8 +551,8 @@ valid `.service` unit identifiers, never shell syntax. Returns `{accepted:true,
 message}` after systemctl accepts the request. Start/stop jobs are queued with
 `--no-block`; refresh to inspect completion or failure. Enable/disable changes
 boot activation and does not imply an immediate start/stop.
-Bare templates reject start/stop/restart/reload: those require a named instance.
-Enable/disable remain allowed and follow systemd's template installation rules.
+Bare templates reject all of these actions, including enable/disable. Choose a
+named instance to change its runtime state or startup behavior.
 
 System tools run from trusted `/usr/bin` or `/bin` paths with explicit argv and
 a minimal environment. Caller PATH, bus-address, loader, and pager overrides are

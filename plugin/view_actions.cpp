@@ -210,6 +210,9 @@ void action(View &v, int id)
             return;
         }
         auto name = row.data.value("name", "");
+        // A bare template is inspectable, but actions need an explicit instance.
+        if (name.size() >= 9 && name.compare(name.size() - 9, 9, "@.service") == 0)
+            return;
         auto prompt = wide(verb) + L" " + wide(name) + L" in " + v.selectedDistro +
                       L"?\r\n\r\nThis changes a system service as Linux root.";
         if (MessageBoxW(v.window, prompt.c_str(), L"Confirm service action",
@@ -257,7 +260,8 @@ void menu(View &v, POINT point)
         AppendMenuW(popup, MF_STRING, DisableService, L"Disable at boot");
         const auto unit = row ? row->data.value("name", std::string{}) : std::string{};
         if (unit.size() >= 9 && unit.compare(unit.size() - 9, 9, "@.service") == 0)
-            for (int command : {StartService, StopService, RestartService, ReloadService})
+            for (int command : {StartService, StopService, RestartService, ReloadService,
+                                EnableService, DisableService})
                 EnableMenuItem(popup, command, MF_BYCOMMAND | MF_GRAYED);
     }
     if (!v.table().selectedActionable())

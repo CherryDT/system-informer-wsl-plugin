@@ -445,9 +445,8 @@ Json service_action(const Json& request) {
     const auto action = request.at("action").get<std::string>();
     const std::vector<std::string> allowed{"start", "stop", "restart", "reload", "enable", "disable"};
     if (std::find(allowed.begin(), allowed.end(), action) == allowed.end()) throw std::runtime_error("Unsupported service action");
-    if (name.size() >= 9 && name.compare(name.size() - 9, 9, "@.service") == 0 &&
-        action != "enable" && action != "disable")
-        throw std::runtime_error("Choose a named service instance; a template has no running process to control.");
+    if (name.size() >= 9 && name.compare(name.size() - 9, 9, "@.service") == 0)
+        throw std::runtime_error("Choose a named service instance to change its state or startup behavior.");
     if (!systemd_available()) throw std::runtime_error("systemd is not running in this distribution");
     // --no-block returns once a job is queued. The UI refresh reports its actual
     // state; a service with a long startup must not freeze the transport.
