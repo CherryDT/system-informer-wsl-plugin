@@ -71,7 +71,8 @@ std::string find_command(const std::string& name) {
 CommandResult run_command(const std::vector<std::string>& arguments, int timeout_ms, size_t output_limit,
     std::optional<CommandCredentials> credentials, const std::string& java_tool) {
     if (arguments.empty() || (arguments[0] != "systemctl" && arguments[0] != "journalctl" &&
-        arguments[0] != "gdb" && arguments[0] != "lldb" && arguments[0] != "py-spy" && arguments[0] != "jcmd" && arguments[0] != "python3"))
+        arguments[0] != "gdb" && arguments[0] != "lldb" && arguments[0] != "py-spy" && arguments[0] != "jcmd" &&
+        arguments[0] != "python3" && arguments[0] != "getent"))
         throw std::runtime_error("Unsupported system command");
     std::string executable;
     if (!java_tool.empty()) {
