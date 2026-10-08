@@ -34,6 +34,12 @@ std::string checked_output(const CommandResult& result) {
     return result.output;
 }
 bool systemd_available() { return access("/run/systemd/system", F_OK) == 0; }
+struct ServiceFileCache {
+    std::map<std::string, std::string> states;
+    std::chrono::steady_clock::time_point expires{};
+    bool complete = false;
+};
+ServiceFileCache service_file_cache;
 }
 
 std::string trusted_command_path(const std::string& path, uint32_t owner) {
@@ -189,81 +195,178 @@ CommandResult run_command(const std::vector<std::string>& arguments, int timeout
     return result;
 }
 Json services(const Json& request) {
+    const bool identities_only = request.value("identities_only", false);
+    const bool include_pids = !identities_only && request.value("include_pids", false);
     if (!systemd_available()) return {{"available", false}, {"services", Json::array()},
         {"message", "systemd is not running in this distribution"}};
+    auto complete_output = [](const CommandResult& result) {
+        return !result.timed_out && result.exit_code == 0 &&
+            result.output.find("[Output truncated]") == std::string::npos;
+    };
+    auto valid_name = [](const std::string& name) {
+        return name.size() > 8 && name.compare(name.size() - 8, 8, ".service") == 0;
+    };
     std::map<std::string, Json> units;
-    const auto result = run_command({"systemctl", "list-units", "--all", "--type=service", "--no-pager", "--plain", "--output=json"});
-    bool loaded_json = false;
-    if (!result.timed_out && result.exit_code == 0) {
-        const auto parsed = Json::parse(result.output, nullptr, false);
-        if (parsed.is_array()) {
-            loaded_json = true;
-            for (const auto& item : parsed) {
-                const auto name = item.value("unit", "");
-                units[name] = {{"name", name}, {"description", item.value("description", "")},
-                    {"load", item.value("load", "")}, {"active", item.value("active", "")},
-                    {"sub", item.value("sub", "")}, {"enabled", "unknown"}};
+    bool loaded = false, loaded_complete = true, pids_complete = false;
+    if (include_pids) {
+        // Retrieve state and MainPID together, rather than asking systemd for
+        // a list and then making a second request for the same loaded units.
+        // The literal glob is expanded by systemctl, never by a shell.
+        const auto properties = run_command({"systemctl", "show", "--all", "--no-pager",
+            "--property=Id,MainPID,Description,LoadState,ActiveState,SubState", "--", "*.service"});
+        if (complete_output(properties)) {
+            loaded = true;
+            pids_complete = true;
+            std::map<std::string, std::string> values;
+            auto merge_unit = [&] {
+                if (values.empty()) return;
+                const auto name = values["Id"];
+                if (!valid_name(name)) {
+                    loaded_complete = false;
+                    pids_complete = false;
+                    values.clear();
+                    return;
+                }
+                Json unit = {{"name", name}, {"description", values["Description"]},
+                    {"load", values["LoadState"]}, {"active", values["ActiveState"]},
+                    {"sub", values["SubState"]}, {"enabled", "unknown"},
+                    {"pid", 0}, {"start_ticks", 0}};
+                const auto& main_pid = values["MainPID"];
+                if (!main_pid.empty() && main_pid.find_first_not_of("0123456789") == std::string::npos) {
+                    try {
+                        const auto pid = std::stoi(main_pid);
+                        if (pid > 0) {
+                            const auto process = process_stat(pid);
+                            unit["pid"] = pid;
+                            unit["start_ticks"] = process.start_ticks;
+                        }
+                    } catch (const std::exception&) {
+                        // A service can exit between the D-Bus reply and /proc
+                        // read. Do not offer navigation without its identity.
+                    }
+                }
+                units[name] = std::move(unit);
+                values.clear();
+            };
+            std::istringstream lines(properties.output);
+            std::string line;
+            while (std::getline(lines, line)) {
+                if (line.empty()) merge_unit();
+                else {
+                    const auto separator = line.find('=');
+                    if (separator != std::string::npos)
+                        values[line.substr(0, separator)] = line.substr(separator + 1);
+                }
+            }
+            merge_unit();
+        }
+    }
+    if (!loaded) {
+        const auto result = run_command({"systemctl", "list-units", "--all", "--type=service",
+            "--no-pager", "--plain", "--output=json"});
+        if (complete_output(result)) {
+            const auto parsed = Json::parse(result.output, nullptr, false);
+            if (parsed.is_array()) {
+                loaded = true;
+                for (const auto& item : parsed) {
+                    const auto name = item.value("unit", "");
+                    if (!valid_name(name)) { loaded_complete = false; continue; }
+                    units[name] = {{"name", name}, {"description", item.value("description", "")},
+                        {"load", item.value("load", "")}, {"active", item.value("active", "")},
+                        {"sub", item.value("sub", "")}, {"enabled", "unknown"}};
+                }
             }
         }
     }
-    if (!loaded_json) {
+    if (!loaded) {
         // Older systemd releases do not support JSON for list-units. With C
         // locale and no legend, only the description can contain whitespace.
-        const auto fallback = run_command({"systemctl", "list-units", "--all", "--type=service", "--no-pager", "--plain", "--no-legend", "--full"});
+        const auto fallback = run_command({"systemctl", "list-units", "--all", "--type=service",
+            "--no-pager", "--plain", "--no-legend", "--full"});
         std::istringstream lines(checked_output(fallback));
+        loaded_complete = complete_output(fallback);
         std::string line;
         while (std::getline(lines, line)) {
             std::istringstream fields(line);
             std::string name, load, active, sub, description;
-            if (!(fields >> name >> load >> active >> sub)) continue;
+            if (!(fields >> name >> load >> active >> sub) || !valid_name(name)) continue;
             std::getline(fields >> std::ws, description);
             units[name] = {{"name", name}, {"description", description}, {"load", load},
                 {"active", active}, {"sub", sub}, {"enabled", "unknown"}};
         }
     }
-    auto merge_installed = [&units](const std::string& name, const std::string& enabled) {
-        auto found = units.find(name);
-        if (found == units.end()) {
-            units[name] = {{"name", name}, {"description", ""}, {"load", "not loaded"},
-                {"active", "inactive"}, {"sub", "dead"}, {"enabled", enabled}};
-        } else {
-            found->second["enabled"] = enabled;
+
+    // Installed unit files and startup policy rarely change on each tick.
+    // Explicit refresh and successful enable/disable actions bypass this cache.
+    const auto now = std::chrono::steady_clock::now();
+    if (request.value("refresh_metadata", false) || now >= service_file_cache.expires) {
+        std::map<std::string, std::string> states;
+        bool complete = false;
+        const auto installed = run_command({"systemctl", "list-unit-files", "--type=service",
+            "--no-pager", "--output=json"});
+        if (complete_output(installed)) {
+            const auto parsed = Json::parse(installed.output, nullptr, false);
+            if (parsed.is_array()) {
+                complete = true;
+                for (const auto& item : parsed) {
+                    const auto name = item.value("unit_file", "");
+                    if (valid_name(name)) states[name] = item.value("state", "unknown");
+                    else complete = false;
+                }
+            }
         }
-    };
-    const auto installed = run_command({"systemctl", "list-unit-files", "--type=service", "--no-pager", "--output=json"});
-    bool installed_json = false;
-    if (!installed.timed_out && installed.exit_code == 0) {
-        const auto parsed = Json::parse(installed.output, nullptr, false);
-        if (parsed.is_array()) {
-            installed_json = true;
-            for (const auto& item : parsed)
-                merge_installed(item.value("unit_file", ""), item.value("state", "unknown"));
+        if (!complete) {
+            states.clear();
+            const auto fallback = run_command({"systemctl", "list-unit-files", "--type=service",
+                "--no-pager", "--no-legend", "--full"});
+            if (complete_output(fallback)) {
+                complete = true;
+                std::istringstream lines(fallback.output);
+                std::string line;
+                while (std::getline(lines, line)) {
+                    std::istringstream fields(line);
+                    std::string name, enabled;
+                    if (fields >> name >> enabled && valid_name(name)) states[name] = enabled;
+                }
+            }
+        }
+        if (complete) service_file_cache.states = std::move(states);
+        // Retain old metadata on failure, but mark the response incomplete so
+        // missing rows are not treated as deleted. Retry failures after 5s.
+        service_file_cache.complete = complete;
+        service_file_cache.expires = std::chrono::steady_clock::now() +
+            std::chrono::seconds(complete ? 30 : 5);
+    }
+    for (const auto& entry : service_file_cache.states) {
+        const auto found = units.find(entry.first);
+        if (found == units.end()) {
+            units[entry.first] = {{"name", entry.first}, {"description", ""}, {"load", "not loaded"},
+                {"active", "inactive"}, {"sub", "dead"}, {"enabled", entry.second}};
+        } else {
+            found->second["enabled"] = entry.second;
         }
     }
     std::string warning;
-    if (!installed_json) {
-        const auto fallback = run_command({"systemctl", "list-unit-files", "--type=service", "--no-pager", "--no-legend", "--full"});
-        if (!fallback.timed_out && fallback.exit_code == 0) {
-            std::istringstream lines(fallback.output);
-            std::string line;
-            while (std::getline(lines, line)) {
-                std::istringstream fields(line);
-                std::string name, enabled;
-                if (fields >> name >> enabled) merge_installed(name, enabled);
-            }
-        } else {
-            warning = "Loaded units are shown; installed unit-file states are unavailable: " + fallback.output;
-        }
+    if (!service_file_cache.complete)
+        warning = "Installed unit-file states could not be refreshed; any previous metadata is retained.";
+    if (include_pids && !pids_complete) {
+        if (!warning.empty()) warning += "\n";
+        warning += "Service main process IDs are unavailable; refresh to retry.";
     }
     Json rows = Json::array();
-    const bool identities_only = request.value("identities_only", false);
-    // Both enumerations are required: loaded transient units and unloaded unit
-    // files have different lifetimes. Their normal output contains properties
-    // incidentally; background monitoring retains only the names it needs.
-    for (auto& entry : units)
-        rows.push_back(identities_only ? Json{{"name", entry.first}} : std::move(entry.second));
+    bool truncated = !loaded_complete || !service_file_cache.complete;
+    size_t response_budget = 12 * 1024 * 1024;
+    for (auto& entry : units) {
+        if (include_pids && !entry.second.contains("pid")) {
+            entry.second["pid"] = 0;
+            entry.second["start_ticks"] = 0;
+        }
+        auto row = identities_only ? Json{{"name", entry.first}} : std::move(entry.second);
+        if (!append_with_budget(rows, std::move(row), response_budget)) { truncated = true; break; }
+    }
     return {{"available", true}, {"services", rows}, {"message", warning},
-            {"identities_only", identities_only}};
+            {"identities_only", identities_only}, {"include_pids", include_pids},
+            {"pids_complete", pids_complete}, {"services_truncated", truncated}};
 }
 Json service_details(const Json& request) {
     const auto name = unit_name(request);
@@ -312,6 +415,8 @@ Json service_action(const Json& request) {
     // --no-block returns once a job is queued. The UI refresh reports its actual
     // state; a service with a long startup must not freeze the transport.
     const auto result = run_command({"systemctl", "--no-ask-password", "--no-pager", "--no-block", action, "--", name}, 10000);
-    return {{"accepted", true}, {"message", checked_output(result)}};
+    auto message = checked_output(result);
+    if (action == "enable" || action == "disable") service_file_cache.expires = {};
+    return {{"accepted", true}, {"message", std::move(message)}};
 }
 } // namespace observer
