@@ -50,9 +50,12 @@ Returns:
 
 - `processes`: objects with `pid`, `ppid`, `start_ticks`, `name`, `state`, `user`,
   `uid`, `threads`, `cpu_ticks`, `rss_bytes`, `virtual_bytes`, `read_bytes`,
-  `write_bytes`, `io_accessible`, `status_accessible`, `command`, `exe`, and
-  `runtime`. `runtime` is `"node"`, `"python"`, `"java"`, or an empty string
-  when the resolved executable is not a recognized runtime.
+  `write_bytes`, `io_accessible`, `status_accessible`, `tracer_pid`,
+  `is_service`, `command`, `exe`, and `runtime`. `tracer_pid` comes from
+  `/proc/PID/status`; `is_service` is true when the process cgroup is in
+  `/system.slice/` and contains a `.service` unit. `runtime` is `"node"`,
+  `"python"`, `"java"`, or an empty string when the resolved executable is not
+  a recognized runtime.
 - `processes_truncated`: true if the encoded process array reached its 12 MiB budget.
 - `monotonic_ms`: helper monotonic time, sampled at the end of collection.
 - `uptime_seconds`, `memory_total`, `memory_available`, `cpus`, `clock_ticks`, `boot_id`.
@@ -86,13 +89,23 @@ Returns:
   UIDs/GIDs, capability masks, seccomp state, and other kernel-provided fields.
 - `files`: `{fd,target,flags}`. `flags` is the original octal `/proc` flag string.
   Targets may be paths, sockets, pipes, anonymous handles, or deleted paths.
-- `modules`: `{path,start,end,permissions}` for named memory mappings. Start/end
-  are hexadecimal strings. A file may have several segments; bracketed kernel
-  labels such as `[heap]` are retained and are not filesystem paths.
+- `modules`: verified ELF executable/shared-object images that have an executable
+  mapping. One object is returned per device/inode identity, with `path`, `base`,
+  `end`, `size_bytes`/`mapped_bytes`, `device`, `inode`, `identity`, and `deleted`.
+  Addresses are hexadecimal strings. The mapped size sums the image's mapped
+  segments and excludes gaps; it is not the base-to-end address range.
+- `memory`: every parsed VMA from `/proc/PID/maps`, with `start`, `end`,
+  `size_bytes`, `permissions`, `offset`, `path`, `device`, `inode`, and `deleted`.
+  It includes anonymous/JIT mappings, bracketed kernel mappings such as `[heap]`
+  and `[vdso]`, and mapped files that are not verified ELF modules. Empty `path`
+  represents an anonymous mapping. Addresses and offsets are hexadecimal strings.
 - `environment`: `{name,value}` pairs. Ordering and duplicate names are retained.
 - `threads`: `{tid,name,state,wchan}` entries.
-- `files_accessible`, `modules_accessible`: availability indicators.
-- `files_truncated`, `modules_truncated`, `environment_truncated`,
+- `files_accessible`, `modules_accessible`, `memory_accessible`: availability
+  indicators. `modules_unverified` counts executable mapped files that could not
+  be checked as ELF images. `module_classification_note` explains what appears
+  under Modules versus Memory.
+- `files_truncated`, `modules_truncated`, `memory_truncated`, `environment_truncated`,
   `threads_truncated`, `summary_truncated`: display-limit indicators. A visible
   notice is also appended to `summary` when any part was truncated.
 
@@ -100,7 +113,7 @@ The environment can contain credentials and other secrets; the UI should expose
 it only through explicit inspection, without automatic logging. Inspection is a
 best-effort snapshot, not a frozen view of the process. Maps are capped at 8 MiB,
 environment at 4 MiB, and ordinary proc files at 1 MiB. Encoded files, modules,
-and environment arrays each have a 1 MiB budget; threads have 512 KiB. Summary
+memory, and environment arrays each have a 1 MiB budget; threads have 512 KiB. Summary
 text is capped at 256 KiB. These limits keep detail responses below the Windows
 transport limit even when paths contain characters requiring JSON escapes.
 A partial final environment value is omitted instead of presenting it as complete.
@@ -196,15 +209,25 @@ it records the user's explicit choice to activate an Inspector that is not
 already listening. With `auto`, a listener owned by the selected process is
 preferred. The helper verifies the socket inode belongs to that process and
 checks the Inspector endpoint's reported PID before capture. It captures the
-main JavaScript thread only, with up to 256 JavaScript frames; worker threads,
-native frames, and asynchronous promise/task history are not included.
+main JavaScript thread and up to 32 reported worker contexts, with up to 256
+JavaScript frames per context. Contexts are sampled sequentially, not as one
+simultaneous snapshot. Each context gets up to one second to reach a JavaScript
+pause point. Idle threads are skipped, and a pending pause is canceled so it
+cannot stop the process later. Native frames and asynchronous promise/task
+history are not included.
 
 When `backend` is `auto` or `inspector`, activation was not requested, and no
-Inspector listener was discovered, Node returns `choice_required:true` so the UI can offer **Enable
-Inspector**, **Use llnode**, or **Cancel**. This is a backend choice, not a
-capture confirmation. If Python 3 is missing, the helper also returns
+Inspector listener was discovered, Node returns `choice_required:true` so the UI
+can offer **Temporarily Enable Inspector**, **Use llnode**, or **Cancel**. This
+is a backend choice, not a capture confirmation. When Inspector activation is
+available, the choice includes a **Don't show again** checkbox; checking it and
+choosing temporary activation sets the per-user `UseNodeInspectorWithoutAsking`
+preference. If Python 3 is missing, the helper also returns
 `inspector_unavailable:true` with an installation explanation; the UI then
-offers **Use llnode** or **Cancel**, without the Inspector activation choice.
+offers **Use llnode** or **Cancel**, without the Inspector activation choice or
+remember-preference checkbox. This llnode-only choice remains available even if
+`UseNodeInspectorWithoutAsking` is set, because Inspector activation cannot run
+without the embedded Python client.
 An explicit `backend:"llnode"` request skips Inspector discovery and capture.
 Enabling Inspector uses SIGUSR1 through a pidfd after
 rechecking the selected Node executable and process identity. Before doing so,
@@ -217,15 +240,19 @@ port and the helper does not attach to the first process by mistake. Configure
 `--inspect-port=0` to let Node choose an available port for each process.
 
 The helper disconnects its own Inspector WebSocket client after capture. If this
-request enabled the listener, it resumes only its own pause, uses
-`Runtime.evaluate` to request `inspector.close()` when that API is available,
-disconnects, and verifies that the listener has disappeared. A pre-existing
-Inspector is left enabled, and a pause that existed before this connection is
-preserved. Cleanup is best-effort; the response `message` reports if Inspector
-closure could not be confirmed. If another client is detected on the temporary
-listener, it is left enabled. A new connection can still race this check; there
-is no atomic close-if-alone operation, so concurrent debuggers should be avoided. Inspector is
-a code-execution interface; keep listeners on loopback. Loopback limits remote
+request created the listener, it resumes only pauses it requested, detaches worker
+sessions, requests `inspector.close()` with feature detection, disconnects, and
+checks whether the listener disappeared. It records listener inodes before
+activation and never closes a pre-existing listener. If another client is
+detected during cleanup, the temporary listener is left enabled. A client can
+still race that check; Node does not provide atomic close-if-alone. Node's close
+operation can disconnect concurrent debugger clients, so avoid attaching another
+debugger during capture. If resume or closure cannot be confirmed, cleanup
+warnings remain at the start of `message` and `text`, and `fallback_safe:false`
+prevents a second debugger attach. Unsupported `inspector.close()` and an older
+ESM runtime or busy event loop can leave the listener enabled; the result says so.
+
+Inspector is a code-execution interface; keep listeners on loopback. Loopback limits remote
 exposure, but local programs in the distro can still connect. See Node's
 [Inspector API](https://nodejs.org/api/inspector.html), [Inspector options](https://nodejs.org/api/cli.html#--inspectporthostport),
 and [debugging security guidance](https://nodejs.org/learn/getting-started/debugging#security-implications).
@@ -239,6 +266,11 @@ can still request `backend:"llnode"` directly.
 The client allows a 12-second capture phase plus up to 2 seconds for cleanup,
 with a 20-second observer command timeout and a 35-second Windows request
 deadline. Captured text is limited to 512 KiB.
+
+If an Inspector attempt fails and cleanup is safe, the observer tries llnode
+automatically. That response sets `fallback:true`, includes the original failure
+as `inspector_error`, and retains both diagnostics in `text`. If Inspector
+cleanup is uncertain (`fallback_safe:false`), no second debugger is attached.
 
 The llnode backend uses LLDB and a compatible `llnode.so` plugin. Build llnode
 for the installed LLDB version as a normal user, then have an administrator place
@@ -261,23 +293,25 @@ thread dumps include locks but not every unmounted virtual thread. The full
 matching JDK is needed if a custom JRE does not include `jcmd`. See Oracle's
 [`jcmd` reference](https://docs.oracle.com/en/java/javase/21/docs/specs/man/jcmd.html).
 
-For Python, Java, native GDB, and Node captures using an existing Inspector, the
-UI performs the requested capture without an extra confirmation dialog. Capture
-buttons and Ctrl+R are explicit actions; stack tabs themselves are passive. A
-Java capture can pause threads at a JVM safepoint. Native GDB, py-spy, and llnode
-can briefly pause the target. Tools and runtime versions must be installed and
-compatible; the plugin does not install them. Ptrace restrictions, disabled JVM
-attachment, or missing debugging metadata can limit or prevent a capture.
+The stack pages are passive; their capture buttons and Ctrl+R start collection
+without a separate confirmation dialog. Node's method-choice dialog appears only
+when the automatic Inspector route has no verified listener. The page text
+explains the button, possible pause, and tool requirements. Java capture can
+pause threads at a JVM safepoint. Native GDB, py-spy, and llnode can briefly
+pause the target. Tools and runtime versions must be installed and compatible;
+the plugin does not install them. Ptrace restrictions, disabled JVM attachment,
+or missing debugging metadata can limit or prevent a capture.
 
 The operation's common response data includes `runtime`, `supported`, `success`,
-`text`, and `message`. `tool`, `timed_out`, `exit_code`, `choice_required`, and
-`inspector_unavailable` are conditional on the selected backend and outcome.
-`supported:false` means the requested/default backend cannot run; `choice_required`
-may still offer another backend. A present but incompatible debugger can instead
-return `supported:true`, `success:false`, and partial diagnostics. Node cleanup
-status is currently included in `message` rather than a separate metadata
-object. A tool timeout or output limit can leave a partial capture; the UI
-preserves any earlier successful capture and shows the latest warning.
+`text`, and `message`. `tool`, `timed_out`, `exit_code`, `choice_required`,
+`inspector_unavailable`, `fallback`, `fallback_safe`, and `inspector_error` are
+conditional on the backend and outcome. `supported:false` means the requested
+backend cannot run; `choice_required` may still offer another backend. A present
+but incompatible debugger can return `supported:true`, `success:false`, and
+partial diagnostics. Node cleanup warnings are included in `message` and, when
+cleanup is uncertain, prepended to `text`. Safe automatic llnode fallback keeps
+the Inspector failure in `inspector_error`. A timeout or output limit can leave
+partial text.
 
 ```json
 {"id":4,"op":"script_stacks","pid":123,"start_ticks":4567}
