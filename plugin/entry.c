@@ -2,6 +2,7 @@
  * bridge in C lets the UI and transport use ordinary C++ and Win32 headers. */
 #include <phdk.h>
 #include <settings.h>
+#include <searchbox.h>
 #include <toolstatusintf.h>
 #include "host_bridge.h"
 #include "options.h"
@@ -32,6 +33,25 @@ void WslOpenHostOptions(HWND owner)
 {
     UNREFERENCED_PARAMETER(owner);
     SystemInformer_ShowOptions(L"WSL");
+}
+
+/* Keep native search and placement policy in the SDK adapter. Search match
+ * handles belong to the control and are only valid until its next callback. */
+void WslCreateSearch(HWND parent, HWND edit, PCWSTR banner,
+                     WSL_SEARCH_CALLBACK callback, void *context)
+{
+    PhCreateSearchControl(parent, edit, banner, callback, context);
+}
+
+BOOL WslSearchMatches(ULONG_PTR match, PCWSTR text)
+{
+    return !match || PhSearchControlMatchZ(match, text);
+}
+
+void WslPositionDialog(HWND window, HWND owner)
+{
+    HWND parent = owner ? GetAncestor(owner, GA_ROOT) : HostWindow;
+    PhCenterWindow(window, parent);
 }
 
 static VOID NTAPI OptionsInitializing(PVOID parameter, PVOID context)
