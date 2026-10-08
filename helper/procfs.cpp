@@ -6,12 +6,16 @@
 #include <csignal>
 #include <cstring>
 #include <dirent.h>
+#include <elf.h>
+#include <fcntl.h>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 namespace observer {
@@ -64,6 +68,70 @@ uint64_t field_value(const std::string& text, const std::string& key) {
     std::istringstream(field_text(text, key)) >> number;
     return number;
 }
+struct MemoryMapping {
+    uint64_t start = 0, end = 0, offset = 0, inode = 0;
+    unsigned int device_major = 0, device_minor = 0;
+    std::string start_text, end_text, offset_text, permissions, device, path;
+};
+
+struct MappedImage {
+    MemoryMapping representative;
+    uint64_t base = 0, end = 0, mapped_bytes = 0;
+    bool executable = false, deleted = false;
+};
+
+enum class ImageKind { ElfImage, OtherFile, Unavailable };
+
+bool deleted_mapping(const std::string& path) {
+    constexpr const char* suffix = " (deleted)";
+    constexpr size_t suffix_length = 10;
+    return path.size() >= suffix_length && path.compare(path.size() - suffix_length, suffix_length, suffix) == 0;
+}
+
+ImageKind inspect_mapped_image(int pid, const MemoryMapping& mapping) {
+    const auto map_file = proc_path(pid, ("map_files/" + mapping.start_text + "-" + mapping.end_text).c_str());
+    int pinned = open(map_file.c_str(), O_PATH | O_CLOEXEC);
+    if (pinned < 0 && !deleted_mapping(mapping.path) && !mapping.path.empty() && mapping.path.front() == '/') {
+        // map_files may require privileges unavailable even to a container's
+        // root. Resolve a live pathname in the target's mount namespace, then
+        // insist that it still names exactly the device/inode in /proc/maps.
+        pinned = open((proc_path(pid, "root") + mapping.path).c_str(), O_PATH | O_CLOEXEC);
+    }
+    if (pinned < 0) return ImageKind::Unavailable;
+    struct stat info{};
+    const bool matches = fstat(pinned, &info) == 0 && S_ISREG(info.st_mode) &&
+        static_cast<uint64_t>(info.st_ino) == mapping.inode &&
+        major(info.st_dev) == mapping.device_major && minor(info.st_dev) == mapping.device_minor;
+    if (!matches) { close(pinned); return ImageKind::Unavailable; }
+
+    // O_PATH follows the proc symlink without opening the underlying file for
+    // I/O. Only after checking the pinned inode is a regular file do we reopen
+    // our own descriptor for a tiny read. A pathname swap cannot turn this into
+    // a FIFO/device open, and a deleted mapping cannot select a replacement file.
+    const auto descriptor_path = "/proc/self/fd/" + std::to_string(pinned);
+    const int readable = open(descriptor_path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    close(pinned);
+    if (readable < 0) return ImageKind::Unavailable;
+    unsigned char header[EI_NIDENT + 2]{};
+    ssize_t length;
+    do { length = pread(readable, header, sizeof(header), 0); } while (length < 0 && errno == EINTR);
+    close(readable);
+    if (length < 0) return ImageKind::Unavailable;
+    if (length != static_cast<ssize_t>(sizeof(header)) || std::memcmp(header, ELFMAG, SELFMAG) != 0 ||
+        (header[EI_CLASS] != ELFCLASS32 && header[EI_CLASS] != ELFCLASS64) ||
+        (header[EI_DATA] != ELFDATA2LSB && header[EI_DATA] != ELFDATA2MSB) || header[EI_VERSION] != EV_CURRENT)
+        return ImageKind::OtherFile;
+    const auto type = header[EI_DATA] == ELFDATA2LSB ? header[EI_NIDENT] | (header[EI_NIDENT + 1] << 8) :
+        (header[EI_NIDENT] << 8) | header[EI_NIDENT + 1];
+    return type == ET_EXEC || type == ET_DYN ? ImageKind::ElfImage : ImageKind::OtherFile;
+}
+
+std::string hex_address(uint64_t address) {
+    std::ostringstream text;
+    text << std::hex << address;
+    return text.str();
+}
+
 Json process_json(const ProcessStat& stat, const std::map<uid_t, std::string>& users) {
     const auto status = read_text(proc_path(stat.pid, "status"));
     const auto uid = status.empty() ? std::numeric_limits<uid_t>::max() :
@@ -214,9 +282,9 @@ Json snapshot() {
 Json process_details(const Json& request) {
     const auto identity = request_identity(request);
     require_identity(identity);
-    Json files = Json::array(), modules = Json::array();
-    size_t file_budget = 1024 * 1024, module_budget = 1024 * 1024;
-    bool files_truncated = false, modules_truncated = false;
+    Json files = Json::array(), modules = Json::array(), memory = Json::array();
+    size_t file_budget = 1024 * 1024, module_budget = 1024 * 1024, memory_budget = 1024 * 1024;
+    bool files_truncated = false, modules_truncated = false, memory_truncated = false;
     const auto fd_path = proc_path(identity.pid, "fd");
     DIR* directory = opendir(fd_path.c_str());
     const bool files_accessible = directory != nullptr;
@@ -243,18 +311,72 @@ Json process_details(const Json& request) {
     const bool maps_truncated = maps.size() == 8 * 1024 * 1024;
     std::istringstream lines(maps);
     std::string line;
+    std::map<std::pair<std::string, uint64_t>, MappedImage> images;
     while (std::getline(lines, line)) {
+        // Do not turn a cap-truncated final line into a misleading filename.
+        if (maps_truncated && lines.eof()) break;
         std::istringstream fields(line);
-        std::string range, permissions, offset, device, inode, path;
-        if (!(fields >> range >> permissions >> offset >> device >> inode)) continue;
-        std::getline(fields >> std::ws, path);
-        const auto dash = range.find('-');
-        if (path.empty() || dash == std::string::npos) continue;
-        if (!append_with_budget(modules, {{"path", path}, {"start", range.substr(0, dash)},
-            {"end", range.substr(dash + 1)}, {"permissions", permissions}}, module_budget)) {
-            modules_truncated = true; break;
+        std::string range, inode_text;
+        MemoryMapping mapping;
+        if (!(fields >> range >> mapping.permissions >> mapping.offset_text >> mapping.device >> inode_text)) continue;
+        std::getline(fields >> std::ws, mapping.path);
+        const auto dash = range.find('-'), colon = mapping.device.find(':');
+        if (dash == std::string::npos || colon == std::string::npos) continue;
+        mapping.start_text = range.substr(0, dash);
+        mapping.end_text = range.substr(dash + 1);
+        try {
+            mapping.start = std::stoull(mapping.start_text, nullptr, 16);
+            mapping.end = std::stoull(mapping.end_text, nullptr, 16);
+            mapping.offset = std::stoull(mapping.offset_text, nullptr, 16);
+            mapping.inode = unsigned_value(inode_text);
+            mapping.device_major = std::stoul(mapping.device.substr(0, colon), nullptr, 16);
+            mapping.device_minor = std::stoul(mapping.device.substr(colon + 1), nullptr, 16);
+        } catch (const std::exception&) { continue; }
+        if (mapping.end <= mapping.start) continue;
+        const auto length = mapping.end - mapping.start;
+        if (!memory_truncated && !append_with_budget(memory, {
+            {"start", mapping.start_text}, {"end", mapping.end_text}, {"size_bytes", length},
+            {"permissions", mapping.permissions}, {"offset", mapping.offset_text},
+            {"path", mapping.path}, {"device", mapping.device}, {"inode", mapping.inode},
+            {"deleted", deleted_mapping(mapping.path)}}, memory_budget))
+            memory_truncated = true;
+
+        // Anonymous VMAs, JIT regions, [heap], [stack], and [vdso] belong in
+        // Memory. Named data files remain there unless verified as an ELF image.
+        if (mapping.inode == 0 || mapping.path.empty() || mapping.path.front() != '/') continue;
+        const auto key = std::make_pair(mapping.device, mapping.inode);
+        auto inserted = images.emplace(key, MappedImage{mapping, mapping.start, mapping.end, 0, false, false});
+        auto& image = inserted.first->second;
+        image.base = std::min(image.base, mapping.start);
+        image.end = std::max(image.end, mapping.end);
+        image.mapped_bytes += length;
+        image.executable = image.executable || mapping.permissions.find('x') != std::string::npos;
+        image.deleted = image.deleted || deleted_mapping(mapping.path);
+        if (mapping.offset == 0) image.representative = mapping;
+    }
+    size_t modules_unverified = 0;
+    std::vector<const MappedImage*> ordered_images;
+    for (const auto& entry : images) if (entry.second.executable) ordered_images.push_back(&entry.second);
+    std::sort(ordered_images.begin(), ordered_images.end(), [](const MappedImage* a, const MappedImage* b) {
+        return a->base < b->base;
+    });
+    for (const auto* image : ordered_images) {
+        const auto kind = inspect_mapped_image(identity.pid, image->representative);
+        if (kind == ImageKind::Unavailable) { ++modules_unverified; continue; }
+        if (kind != ImageKind::ElfImage) continue;
+        const auto& mapping = image->representative;
+        if (!append_with_budget(modules, {{"path", mapping.path}, {"base", hex_address(image->base)},
+            {"end", hex_address(image->end)}, {"size_bytes", image->mapped_bytes},
+            {"mapped_bytes", image->mapped_bytes}, {"device", mapping.device}, {"inode", mapping.inode},
+            {"identity", mapping.device + ":" + std::to_string(mapping.inode)}, {"deleted", image->deleted}}, module_budget)) {
+            modules_truncated = true;
+            break;
         }
     }
+    const std::string module_classification_note =
+        "Modules are verified ELF executables/shared objects with an executable mapping, grouped by device and inode. "
+        "Mapped size sums segments and excludes gaps. Anonymous executable regions, [vdso], and unverified files remain in Memory." +
+        (modules_unverified ? " " + std::to_string(modules_unverified) + " executable mapped files could not be verified." : "");
     std::string namespace_text;
     for (const auto* name : {"cgroup", "ipc", "mnt", "net", "pid", "pid_for_children", "time", "user", "uts"})
         namespace_text += std::string(name) + ": " + read_link(proc_path(identity.pid, (std::string("ns/") + name).c_str())) + "\n";
@@ -303,8 +425,9 @@ Json process_details(const Json& request) {
     }
     const bool summary_truncated = summary.size() > 256 * 1024;
     if (summary_truncated) summary.resize(256 * 1024);
-    if (files_truncated || modules_truncated || maps_truncated || environment_truncated || threads_truncated || summary_truncated)
+    if (files_truncated || modules_truncated || memory_truncated || maps_truncated || environment_truncated || threads_truncated || summary_truncated)
         summary += "\nSome inspection data was truncated to keep the response within transport limits.\n";
+    summary += "\nModule classification\n" + module_classification_note + "\n";
     auto overview = process_json(process_stat(identity.pid), local_user_names());
     const auto status = read_text(proc_path(identity.pid, "status"));
     overview["cwd"] = read_link(proc_path(identity.pid, "cwd"));
@@ -320,9 +443,12 @@ Json process_details(const Json& request) {
     const auto no_new_privs = field_text(status, "NoNewPrivs:");
     overview["no_new_privs"] = no_new_privs == "1" ? "Yes" : no_new_privs == "0" ? "No" : no_new_privs;
     require_identity(identity);
-    return {{"overview", overview}, {"threads", threads}, {"environment", environment}, {"summary", summary}, {"files", files}, {"modules", modules},
+    return {{"overview", overview}, {"threads", threads}, {"environment", environment}, {"summary", summary}, {"files", files}, {"modules", modules}, {"memory", memory},
             {"files_accessible", files_accessible}, {"modules_accessible", !maps.empty()},
+            {"memory_accessible", !maps.empty()}, {"modules_unverified", modules_unverified},
+            {"module_classification_note", module_classification_note},
             {"files_truncated", files_truncated}, {"modules_truncated", maps_truncated || modules_truncated},
+            {"memory_truncated", maps_truncated || memory_truncated},
             {"environment_truncated", environment_truncated}, {"threads_truncated", threads_truncated},
             {"summary_truncated", summary_truncated}};
 }

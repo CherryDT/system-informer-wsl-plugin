@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cwctype>
+#include <unordered_map>
 
 namespace wsl
 {
@@ -13,11 +14,13 @@ constexpr int ConnectionsPage = 5;
 constexpr size_t ConnectionsTable = ConnectionsPage - 1;
 constexpr int StacksPage = ConnectionsPage + 1;
 constexpr int RawPage = StacksPage + 1;
-constexpr int PageCount = RawPage + 1;
-constexpr int RuntimeStacksPage = PageCount;
+constexpr int RuntimeStacksPage = RawPage + 1;
+constexpr int MemoryPage = RuntimeStacksPage + 1;
+constexpr size_t MemoryTable = ConnectionsTable + 1;
+constexpr size_t TableCount = MemoryTable + 1;
 // Keep model indices stable while presenting the available native property pages
 // in their familiar order. Linux-only views follow the shared Windows pages.
-constexpr std::array<int, PageCount> ProcessPages = {0, 4, 2, 3, 1, ConnectionsPage, StacksPage, RawPage};
+constexpr std::array<int, 9> ProcessPages = {0, 4, 2, MemoryPage, 3, 1, ConnectionsPage, StacksPage, RawPage};
 constexpr wchar_t OverviewClass[] = L"WslTools.Overview";
 constexpr int OverviewValueBase = 1000;
 enum class Operation
@@ -52,7 +55,8 @@ enum ControlId
     RawDetails,
     StackText,
     CaptureStack,
-    RuntimeStackText
+    RuntimeStackText,
+    Memory
 };
 
 struct OverviewField
@@ -84,8 +88,8 @@ struct Inspector
     HWND refresh = nullptr, copy = nullptr, copyAll = nullptr, save = nullptr;
     HWND open = nullptr, path = nullptr, value = nullptr;
     HWND filterLabel = nullptr, filter = nullptr, clearFilter = nullptr;
-    std::array<Table, ConnectionsPage> tables;
-    std::array<std::vector<Row>, ConnectionsPage> snapshots;
+    std::array<Table, TableCount> tables;
+    std::array<std::vector<Row>, TableCount> snapshots;
     std::shared_ptr<Mailbox> mailbox = std::make_shared<Mailbox>();
     std::wstring distro;
     Json process;
@@ -109,9 +113,10 @@ struct Inspector
     std::wstring connectionsNotice;
     std::wstring stacksNotice;
     std::wstring runtimeStacksNotice;
-    std::array<bool, ConnectionsPage> available{};
-    std::array<bool, ConnectionsPage> snapshotReady{};
-    std::array<bool, ConnectionsPage> snapshotComplete{};
+    std::array<bool, TableCount> available{};
+    std::array<bool, TableCount> snapshotReady{};
+    std::array<bool, TableCount> snapshotComplete{};
+    std::array<std::wstring, TableCount> tableNotices;
 };
 
 COLORREF inspectorBackground()
@@ -625,6 +630,8 @@ std::string rowKey(const Json &object, const char *key)
 
 Table *activeTable(Inspector &state)
 {
+    if (!state.isService && state.page == MemoryPage)
+        return &state.tables[MemoryTable];
     return !state.isService && state.page > 0 && state.page <= ConnectionsPage ? &state.tables[state.page - 1]
                                                                                : nullptr;
 }
@@ -633,11 +640,16 @@ std::wstring selectedPath(Inspector &state, bool actionable = false)
 {
     if (state.page == 0)
         return cell(state.overviewData, state.isService ? "fragment_path" : "exe");
-    if (state.isService || (state.page != 1 && state.page != 2))
+    if (state.isService || (state.page != 1 && state.page != 2 && state.page != MemoryPage))
         return L"";
-    const Row *row = actionable ? state.tables[state.page - 1].selectedActionable()
-                                : state.tables[state.page - 1].selected();
+    Table *table = activeTable(state);
+    if (!table)
+        return L"";
+    const Row *row = actionable ? table->selectedActionable() : table->selected();
     if (!row)
+        return L"";
+    auto deleted = row->data.find("deleted");
+    if (actionable && deleted != row->data.end() && deleted->is_boolean() && deleted->get<bool>())
         return L"";
     return cell(row->data, state.page == 1 ? "target" : "path");
 }
@@ -646,7 +658,10 @@ bool canOpen(const std::wstring &path)
 {
     // procfs also reports socket:[...], pipe:[...], and anon_inode:[...].
     // These are useful identifiers to copy, but are not filesystem paths.
-    return !path.empty() && path.front() == L'/';
+    const std::wstring deleted = L" (deleted)";
+    return !path.empty() && path.front() == L'/' &&
+           (path.size() < deleted.size() ||
+            path.compare(path.size() - deleted.size(), deleted.size(), deleted) != 0);
 }
 
 Operation activeOperation(const Inspector &state)
@@ -677,7 +692,7 @@ void layout(Inspector &state);
 
 void updateActions(Inspector &state)
 {
-    bool pathTab = !state.isService && (state.page == 1 || state.page == 2);
+    bool pathTab = !state.isService && (state.page == 1 || state.page == 2 || state.page == MemoryPage);
     bool overviewPage = state.page == 0;
     SetWindowTextW(state.open, overviewPage ? (state.isService ? L"Open &unit file" : L"Open &executable")
                                             : L"&Open location");
@@ -718,23 +733,26 @@ void updateActions(Inspector &state)
         message = L"Connections will load after the current request finishes…";
     if (message.empty() && activeTable(state))
     {
-        if (!state.available[state.page - 1])
+        size_t index = state.page == MemoryPage ? MemoryTable : static_cast<size_t>(state.page - 1);
+        if (!state.available[index])
             message = L"This information is unavailable.";
         else
         {
-            const auto &rows = state.tables[state.page - 1].rows;
+            const auto &rows = state.tables[index].rows;
             size_t removed = static_cast<size_t>(
                 std::count_if(rows.begin(), rows.end(), [](const Row &row) { return row.removed; }));
             size_t count = rows.size() - removed;
             message = std::to_wstring(count) + (count == 1 ? L" entry" : L" entries");
-            size_t total = state.snapshots[state.page - 1].size();
-            if (state.snapshotComplete[state.page - 1] && count < total)
+            size_t total = state.snapshots[index].size();
+            if (state.snapshotComplete[index] && count < total)
                 message += L" shown of " + std::to_wstring(total);
             else if (count == 0 && removed == 0)
                 message += L" — no entries reported";
             if (removed)
                 message += L" · " + std::to_wstring(removed) + L" recently removed";
         }
+        if (!state.tableNotices[index].empty())
+            message += L" · " + state.tableNotices[index];
     }
     if (state.status)
     {
@@ -768,7 +786,9 @@ void showPage(Inspector &state)
     ShowWindow(state.runtimeStacks, !state.isService && state.page == RuntimeStacksPage ? SW_SHOW : SW_HIDE);
     for (size_t i = 0; i < state.tables.size(); ++i)
         if (state.tables[i].window)
-            ShowWindow(state.tables[i].window, state.page == static_cast<int>(i + 1) ? SW_SHOW : SW_HIDE);
+            ShowWindow(state.tables[i].window,
+                       state.page == (i == MemoryTable ? MemoryPage : static_cast<int>(i + 1)) ? SW_SHOW
+                                                                                               : SW_HIDE);
     if (state.filter)
     {
         int visibility = activeTable(state) ? SW_SHOW : SW_HIDE;
@@ -1131,7 +1151,7 @@ void contextMenu(Inspector &state, HWND source, LPARAM position)
     AppendMenuW(menu, MF_STRING, CopySelection, L"Copy &selection\tCtrl+C");
     AppendMenuW(menu, MF_STRING, CopyAll, L"Copy &all");
     AppendMenuW(menu, MF_STRING, Save, L"&Save this view…\tCtrl+S");
-    if (state.page == 1 || state.page == 2)
+    if (state.page == 1 || state.page == 2 || state.page == MemoryPage)
     {
         std::wstring path = selectedPath(state);
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -1154,6 +1174,16 @@ void contextMenu(Inspector &state, HWND source, LPARAM position)
 
 void syncRuntimeTab(Inspector &state, const Json &data);
 
+std::wstring mappedAddress(const Json &value, const char *key)
+{
+    std::wstring address = cell(value, key);
+    if (address.empty())
+        return address;
+    if (address.size() < 16)
+        address.insert(0, 16 - address.size(), L'0');
+    return L"0x" + address;
+}
+
 void loadProcessDetails(Inspector &state, const Json &data)
 {
     updateOverview(state, data);
@@ -1161,45 +1191,111 @@ void loadProcessDetails(Inspector &state, const Json &data)
     std::wstring summary = cell(data, "summary");
     SetWindowTextW(state.raw,
                    summary.empty() ? L"No process summary was returned." : editText(summary).c_str());
-    const char *sections[] = {"files", "modules", "environment", "threads"};
-    const std::vector<std::vector<const char *>> fields = {{"fd", "target", "flags"},
-                                                           {"path", "start", "end", "permissions"},
-                                                           {"name", "value"},
-                                                           {"tid", "name", "state", "wchan"}};
-    for (size_t section = 0; section < ConnectionsTable; ++section)
+    struct Section
     {
+        size_t index;
+        const char *name;
+    };
+    const Section sections[] = {
+        {0, "files"}, {1, "modules"}, {2, "environment"}, {3, "threads"}, {MemoryTable, "memory"}};
+    for (const auto &section : sections)
+    {
+        size_t index = section.index;
         std::vector<Row> rows;
-        auto values = data.find(sections[section]);
-        state.available[section] = data.is_object() && values != data.end() && values->is_array();
-        std::string accessibleKey = std::string(sections[section]) + "_accessible";
-        auto accessible = data.find(accessibleKey);
+        auto values = data.find(section.name);
+        state.available[index] = values != data.end() && values->is_array();
+        auto accessible = data.find(std::string(section.name) + "_accessible");
         if (accessible != data.end() && accessible->is_boolean() && !accessible->get<bool>())
-            state.available[section] = false;
-        if (state.available[section])
+            state.available[index] = false;
+        state.tableNotices[index].clear();
+        auto truncated = data.find(std::string(section.name) + "_truncated");
+        if (truncated != data.end() && truncated->is_boolean() && truncated->get<bool>())
+            state.tableNotices[index] = L"Collection limit reached; results are incomplete.";
+        if (index == 1)
         {
+            auto unverified = data.find("modules_unverified");
+            if (unverified != data.end() && unverified->is_number_integer() && *unverified > 0)
+            {
+                if (!state.tableNotices[index].empty())
+                    state.tableNotices[index] += L" ";
+                std::wstring note = cell(data, "module_classification_note");
+                state.tableNotices[index] +=
+                    note.empty() ? L"Some mapped files could not be verified as ELF modules." : note;
+            }
+        }
+        if (state.available[index])
+        {
+            std::unordered_map<std::string, size_t> nameOccurrences;
             for (const auto &value : *values)
             {
                 if (!value.is_object())
                     continue;
                 Row row;
                 row.data = value;
-                for (const char *field : fields[section])
-                    row.cells.push_back(cell(value, field));
-                row.key = rowKey(value, fields[section][0]);
-                // A module can have several mapped segments with the same path.
-                if (section == 0)
-                    row.key += ":" + rowKey(value, "target");
-                if (section == 1)
-                    row.key += ":" + rowKey(value, "start");
+                auto deleted = value.find("deleted");
+                std::wstring deletedText =
+                    deleted != value.end() && deleted->is_boolean() && deleted->get<bool>() ? L"Yes" : L"No";
+                switch (index)
+                {
+                case 0:
+                    row.cells = {cell(value, "fd"), cell(value, "target"), cell(value, "flags")};
+                    row.key = rowKey(value, "fd") + ":" + rowKey(value, "target");
+                    break;
+                case 1:
+                    row.cells = {cell(value, "path"),
+                                 mappedAddress(value, "base"),
+                                 mappedAddress(value, "end"),
+                                 cell(value, "size_bytes"),
+                                 cell(value, "device"),
+                                 cell(value, "inode"),
+                                 deletedText};
+                    row.key = rowKey(value, "identity");
+                    if (row.key.empty())
+                        row.key = rowKey(value, "device") + ":" + rowKey(value, "inode");
+                    break;
+                case 2:
+                    row.cells = {cell(value, "name"), cell(value, "value")};
+                    row.key = rowKey(value, "name");
+                    row.key += ":" + std::to_string(nameOccurrences[row.key]++);
+                    break;
+                case 3:
+                    row.cells = {cell(value, "tid"), cell(value, "name"), cell(value, "state"),
+                                 cell(value, "wchan")};
+                    row.key = rowKey(value, "tid");
+                    break;
+                case MemoryTable: {
+                    std::wstring backing = cell(value, "path");
+                    row.cells = {mappedAddress(value, "start"),
+                                 mappedAddress(value, "end"),
+                                 cell(value, "size_bytes"),
+                                 cell(value, "permissions"),
+                                 mappedAddress(value, "offset"),
+                                 backing.empty() ? L"[anonymous]" : backing,
+                                 cell(value, "device"),
+                                 cell(value, "inode"),
+                                 deletedText};
+                    // A protection change updates a VMA; a split or a different
+                    // backing object at the same address creates a different VMA.
+                    row.key = rowKey(value, "start") + ":" + rowKey(value, "end") + ":" +
+                              rowKey(value, "device") + ":" + rowKey(value, "inode") + ":" +
+                              rowKey(value, "offset");
+                    break;
+                }
+                }
                 rows.push_back(std::move(row));
             }
         }
-        state.snapshots[section] = std::move(rows);
-        auto truncated = data.find(std::string(sections[section]) + "_truncated");
-        state.snapshotReady[section] = state.snapshotReady[section] || state.available[section];
-        state.snapshotComplete[section] =
-            state.available[section] &&
+        state.snapshots[index] = std::move(rows);
+        state.snapshotReady[index] = state.snapshotReady[index] || state.available[index];
+        state.snapshotComplete[index] =
+            state.available[index] &&
             !(truncated != data.end() && truncated->is_boolean() && truncated->get<bool>());
+        if (index == 1)
+        {
+            auto unverified = data.find("modules_unverified");
+            if (unverified != data.end() && unverified->is_number_integer() && *unverified > 0)
+                state.snapshotComplete[index] = false;
+        }
     }
 }
 
@@ -1509,7 +1605,7 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
     if (message == WM_CONTEXTMENU)
     {
         int id = GetDlgCtrlID(window);
-        if (id >= Files && id <= Connections)
+        if ((id >= Files && id <= Connections) || id == Memory)
         {
             SendMessageW(inspector, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(window), lParam);
             return 0;
@@ -1541,7 +1637,7 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             int page = tabs && state ? pageFromTab(*state, TabCtrl_GetCurSel(tabs)) : 0;
             if (shift && page == 3)
                 id = CopyValue;
-            else if (shift && (page == 1 || page == 2))
+            else if (shift && (page == 1 || page == 2 || page == MemoryPage))
                 id = CopyPath;
         }
         if (ctrl && wParam == 'F')
@@ -1580,7 +1676,7 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         }
         if (wParam == VK_RETURN)
         {
-            if (controlId == Files || controlId == Modules)
+            if (controlId == Files || controlId == Modules || controlId == Memory)
                 id = OpenLocation;
             else if ((controlId >= Refresh && controlId <= CopyValue) || controlId == ClearFilter ||
                      controlId == CaptureStack)
@@ -1742,6 +1838,46 @@ void createTooltips(Inspector &state)
     }
 }
 
+void migrateModuleLayout(Table &table, HWND owner)
+{
+    if (readSetting(L"ModulesLayoutVersion", 0) >= 2)
+        return;
+    // The old tab showed mappings. Path/base/end keep their useful widths;
+    // permissions and its sort order must not become a mapped-size preference.
+    std::vector<int> order(table.columns.size());
+    for (size_t i = 0; i < table.columns.size(); ++i)
+    {
+        order[i] = static_cast<int>(i);
+        if (i >= 3)
+            ListView_SetColumnWidth(table.window, static_cast<int>(i), scale(owner, table.columns[i].width));
+    }
+    ListView_SetColumnOrderArray(table.window, static_cast<int>(order.size()), order.data());
+    if (table.sortColumn >= 3)
+    {
+        table.sortColumn = -1;
+        table.descending = false;
+        HWND header = ListView_GetHeader(table.window);
+        for (size_t i = 0; i < table.columns.size(); ++i)
+        {
+            HDITEMW item{};
+            item.mask = HDI_FORMAT;
+            Header_GetItem(header, static_cast<int>(i), &item);
+            item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+            Header_SetItem(header, static_cast<int>(i), &item);
+        }
+    }
+    try
+    {
+        table.saveLayout();
+        writeSetting(L"ModulesLayoutVersion", 2);
+    }
+    catch (const std::exception &)
+    {
+        // The corrected in-memory layout remains usable. Without the version
+        // marker a later window will retry saving it, rather than losing data.
+    }
+}
+
 void createControls(Inspector &state)
 {
     HWND window = state.window;
@@ -1780,9 +1916,10 @@ void createControls(Inspector &state)
             control(state.tabs, WC_BUTTONW, L"Clear", BS_PUSHBUTTON | WS_TABSTOP, ClearFilter);
     }
     std::vector<std::wstring> names =
-        state.isService ? std::vector<std::wstring>{L"General", L"Details"}
-                        : std::vector<std::wstring>{L"General", L"Threads", L"Modules", L"Environment",
-                                                    L"Handles", L"Network", L"Stacks",  L"Details"};
+        state.isService
+            ? std::vector<std::wstring>{L"General", L"Details"}
+            : std::vector<std::wstring>{L"General", L"Threads", L"Modules", L"Memory", L"Environment",
+                                        L"Handles", L"Network", L"Stacks",  L"Details"};
     if (!state.runtime.empty())
         names.insert(names.end() - 1, std::wstring(runtimeLabel(state)) + L" Stacks");
     for (int i = 0; i < static_cast<int>(names.size()); ++i)
@@ -1813,9 +1950,25 @@ void createControls(Inspector &state)
         if (!state.runtime.empty())
             createRuntimeStackControl(state);
         state.tables[0].create(state.tabs, Files, {{L"FD", 65, true}, {L"Target", 520}, {L"Flags", 170}});
-        state.tables[1].create(
-            state.tabs, Modules,
-            {{L"Mapped file", 460}, {L"Start", 130}, {L"End", 130}, {L"Permissions", 100}});
+        state.tables[1].create(state.tabs, Modules,
+                               {{L"Module path", 350},
+                                {L"Base address", 145},
+                                {L"End address", 145},
+                                {L"Mapped bytes", 110, true},
+                                {L"Device", 85},
+                                {L"Inode", 105, true},
+                                {L"Deleted", 65}});
+        migrateModuleLayout(state.tables[1], state.window);
+        state.tables[MemoryTable].create(state.tabs, Memory,
+                                         {{L"Start address", 145},
+                                          {L"End address", 145},
+                                          {L"Size (bytes)", 110, true},
+                                          {L"Protection", 85},
+                                          {L"File offset", 145},
+                                          {L"Backing", 350},
+                                          {L"Device", 85},
+                                          {L"Inode", 105, true},
+                                          {L"Deleted", 65}});
         state.tables[2].create(state.tabs, Environment, {{L"Variable", 230}, {L"Value", 600}});
         state.tables[3].create(state.tabs, Threads,
                                {{L"TID", 85, true}, {L"Name", 210}, {L"State", 100}, {L"Wait channel", 390}});
@@ -1828,12 +1981,13 @@ void createControls(Inspector &state)
                                                {L"State", 125},
                                                {L"Socket inode", 130, true}});
         state.tables[0].kind = Table::Kind::Handles;
-        state.tables[1].kind = Table::Kind::Memory;
+        state.tables[1].kind = Table::Kind::Modules;
+        state.tables[MemoryTable].kind = Table::Kind::Memory;
         state.tables[3].kind = Table::Kind::Threads;
         state.tables[ConnectionsTable].kind = Table::Kind::Network;
-        const wchar_t *labels[] = {L"Open file descriptors", L"Memory mapped modules",
-                                   L"Environment variables", L"Process threads",
-                                   L"Process network connections"};
+        const wchar_t *labels[] = {L"Open file descriptors",       L"Loaded ELF modules",
+                                   L"Environment variables",       L"Process threads",
+                                   L"Process network connections", L"Virtual memory mappings"};
         for (size_t i = 0; i < state.tables.size(); ++i)
             SetWindowTextW(state.tables[i].window, labels[i]);
     }
@@ -1929,7 +2083,7 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
             if (hdr->code == NM_CUSTOMDRAW)
                 return table.customDraw(reinterpret_cast<NMLVCUSTOMDRAW *>(hdr));
             table.notify(hdr);
-            if (hdr->code == NM_DBLCLK && (state->page == 1 || state->page == 2))
+            if (hdr->code == NM_DBLCLK && (state->page == 1 || state->page == 2 || state->page == MemoryPage))
                 command(*state, OpenLocation);
             if (hdr->code == LVN_ITEMCHANGED)
                 updateActions(*state);
