@@ -113,6 +113,8 @@ void render(View &v, uintptr_t changed)
         const double cpuThreshold = std::pow(10.0, -precision);
         const bool ownOnly = WslHostIntegerSetting(L"HideOtherUserProcesses") != 0;
         const bool hideSystem = WslHostIntegerSetting(L"HideMicrosoftProcesses") != 0;
+        const bool hideWindowsToWsl = readSetting(L"HideWindowsToWslInterop", 0) != 0;
+        const bool hideWslToWindows = readSetting(L"HideWslToWindowsInterop", 0) != 0;
         v.processes.setAncestryOrder(tree, tree && (WslHostIntegerSetting(L"SortChildProcesses") ||
                                                     WslHostIntegerSetting(L"SortRootProcesses")));
         for (const auto &p : items)
@@ -244,7 +246,18 @@ void render(View &v, uintptr_t changed)
         }
         v.processes.replace(
             std::move(rows),
-            [query, ownOnly, hideSystem, uid = v.defaultUid](const Row &row) {
+            [query, ownOnly, hideSystem, hideWindowsToWsl, hideWslToWindows,
+             uid = v.defaultUid](const Row &row) {
+                // Deliberately exact: similarly named executables and longer
+                // argv[0] prefixes must not disappear as interop plumbing.
+                if (row.data.value("exe", std::string{}) == "/init")
+                {
+                    const auto command = row.data.value("command", std::string{});
+                    if (hideWindowsToWsl && row.data.value("pid", 0) != 1 && command == "/init")
+                        return false;
+                    if (hideWslToWindows && command.size() > 6 && command.compare(0, 6, "/init ") == 0)
+                        return false;
+                }
                 // A root process started through sudo belongs to Elevated,
                 // independently of whether either highlighting color is enabled.
                 const bool system = row.data.value("euid", row.data.value("uid", -1)) == 0 &&

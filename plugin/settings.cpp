@@ -220,26 +220,28 @@ void layoutOptions(HWND window)
         place(GetDlgItem(window, id), units.left, units.top, bounds.right - units.left - units.right,
               units.bottom);
     };
-    position(IDC_WSL_GENERAL_GROUP, 7, 7, 7, 129);
+    position(IDC_WSL_GENERAL_GROUP, 7, 7, 7, 165);
     position(IDC_WSL_CPU_LABEL, 14, 20, 14, 10);
     position(IDC_WSL_CPU_MODE, 14, 33, 14, 70);
     position(IDC_WSL_NODE_INSPECTOR, 14, 53, 14, 20);
     position(IDC_WSL_DETECT_32BIT, 14, 76, 14, 14);
     position(IDC_WSL_BACKGROUND_CAPTURE, 14, 94, 14, 14);
-    position(IDC_WSL_REFRESH_NOTE, 14, 114, 14, 16);
-    position(IDC_WSL_PATH_GROUP, 7, 143, 7, 99);
-    position(IDC_WSL_DISTRO_LABEL, 14, 156, 14, 10);
-    position(IDC_WSL_DISTRO, 14, 169, 14, 70);
-    position(IDC_WSL_PREFIX_LABEL, 14, 189, 14, 10);
-    position(IDC_WSL_PREFIX, 14, 202, 89, 14);
-    RECT button{0, 201, 70, 16};
+    position(IDC_WSL_HIDE_WINDOWS_TO_WSL, 14, 112, 14, 14);
+    position(IDC_WSL_HIDE_WSL_TO_WINDOWS, 14, 130, 14, 14);
+    position(IDC_WSL_REFRESH_NOTE, 14, 150, 14, 16);
+    position(IDC_WSL_PATH_GROUP, 7, 179, 7, 99);
+    position(IDC_WSL_DISTRO_LABEL, 14, 192, 14, 10);
+    position(IDC_WSL_DISTRO, 14, 205, 14, 70);
+    position(IDC_WSL_PREFIX_LABEL, 14, 225, 14, 10);
+    position(IDC_WSL_PREFIX, 14, 238, 89, 14);
+    RECT button{0, 237, 70, 16};
     MapDialogRect(window, &button);
     RECT margin{14, 0, 0, 0};
     MapDialogRect(window, &margin);
     place(GetDlgItem(window, IDC_WSL_APPLY_PREFIX), bounds.right - margin.left - button.right, button.top,
           button.right, button.bottom);
-    position(IDC_WSL_PREFIX_HINT, 14, 222, 14, 14);
-    position(IDC_WSL_OPTIONS_STATUS, 7, 248, 7, 18);
+    position(IDC_WSL_PREFIX_HINT, 14, 258, 14, 14);
+    position(IDC_WSL_OPTIONS_STATUS, 7, 284, 7, 18);
 }
 
 INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
@@ -261,6 +263,10 @@ INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                        readSetting(L"Detect32BitProcesses", 0) ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(window, IDC_WSL_BACKGROUND_CAPTURE,
                        readSetting(L"EnableBackgroundCapture", 1) ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(window, IDC_WSL_HIDE_WINDOWS_TO_WSL,
+                       readSetting(L"HideWindowsToWslInterop", 0) ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(window, IDC_WSL_HIDE_WSL_TO_WINDOWS,
+                       readSetting(L"HideWslToWindowsInterop", 0) ? BST_CHECKED : BST_UNCHECKED);
         SendDlgItemMessageW(window, IDC_WSL_PREFIX, EM_SETLIMITTEXT, 32760, 0);
         try
         {
@@ -328,6 +334,16 @@ INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 writeSetting(L"EnableBackgroundCapture",
                              IsDlgButtonChecked(window, id) == BST_CHECKED ? 1 : 0);
                 optionsStatus(window, L"Background capture preference saved.");
+                return TRUE;
+            }
+            if ((id == IDC_WSL_HIDE_WINDOWS_TO_WSL || id == IDC_WSL_HIDE_WSL_TO_WINDOWS) &&
+                event == BN_CLICKED)
+            {
+                writeSetting(id == IDC_WSL_HIDE_WINDOWS_TO_WSL ? L"HideWindowsToWslInterop"
+                                                               : L"HideWslToWindowsInterop",
+                             IsDlgButtonChecked(window, id) == BST_CHECKED ? 1 : 0);
+                WslHostViewSettingsChanged();
+                optionsStatus(window, L"Interop process filter saved.");
                 return TRUE;
             }
             if (id == IDC_WSL_PREFIX && event == EN_CHANGE)

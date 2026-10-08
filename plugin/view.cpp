@@ -137,16 +137,18 @@ Json snapshotRequest(const View &v)
     };
     auto enabled = [](PCWSTR name) { return WslHostIntegerSetting(name) != 0; };
     const bool tooltips = enabled(L"EnableTooltipSupport");
+    const bool interopFilter =
+        readSetting(L"HideWindowsToWslInterop", 0) || readSetting(L"HideWslToWindowsInterop", 0);
     if (needs({ProcessUser}) || tooltips)
         fields.insert("user");
     // Search is intentionally restricted to the data actually collected. The
     // command line remains searchable when its column is visible (the default).
-    if (needs({ProcessCommand}) || (tooltips && enabled(L"EnableCommandLineTooltips")))
+    if (needs({ProcessCommand}) || interopFilter || (tooltips && enabled(L"EnableCommandLineTooltips")))
         fields.insert("command");
     if (needs({ProcessRead, ProcessWrite, ProcessReadTotal, ProcessWriteTotal, ProcessReadChars,
                ProcessWriteChars, ProcessReadCalls, ProcessWriteCalls}))
         fields.insert("io");
-    if (needs({ProcessExecutable}) || tooltips)
+    if (needs({ProcessExecutable}) || interopFilter || tooltips)
         fields.insert("exe");
     if (needs({ProcessDirectory}) || tooltips)
         fields.insert("cwd");
