@@ -423,6 +423,43 @@ def debugger_event(session, message):
         session.paused = None
 
 
+def retry_timer_stack(session, frames, deadline):
+    if (session.preexisting_pause or not session.pause_requested or len(frames) != 1
+            or frames[0].get("functionName") != "processTimers"):
+        return frames
+
+    # A pause often lands between timer callbacks. Let this same thread run
+    # briefly and sample it again, sharing one 200 ms window across all tries.
+    # Keep the last real stack if the event loop becomes idle in the meantime.
+    retry_deadline = min(deadline - 0.15, time.monotonic() + 0.2)
+    while time.monotonic() + 0.01 < retry_deadline:
+        try:
+            resume_debugger(session, retry_deadline)
+            session.paused = None
+            time.sleep(0.01)
+            if time.monotonic() >= retry_deadline:
+                break
+            session.pause_requested = True
+            session.command("Debugger.pause", {}, retry_deadline)
+            while session.paused is None:
+                session.pump(retry_deadline)
+        except (socket.timeout, DeadlineExpired):
+            # The retry window also bounds resume acknowledgements. Use the
+            # cleanup reserve to confirm that our pause (including an idle
+            # pause-on-next-statement request) is gone, then retain the earlier
+            # sample. Cleanup failures must still reach the caller.
+            resume_debugger(session, deadline)
+            break
+        sample = session.paused.get("callFrames", [])
+        if not isinstance(sample, list):
+            raise CaptureError("Invalid JavaScript stack response")
+        if sample:
+            frames = sample
+            if len(frames) != 1 or frames[0].get("functionName") != "processTimers":
+                break
+    return frames
+
+
 def debugger_stack(session, heading, deadline):
     session.capture_note = ""
     session.command("Debugger.enable", {}, deadline)
@@ -449,6 +486,7 @@ def debugger_stack(session, heading, deadline):
     frames = session.paused.get("callFrames", [])
     if not isinstance(frames, list):
         raise CaptureError("Invalid JavaScript stack response")
+    frames = retry_timer_stack(session, frames, deadline)
     lines = [heading, ""]
     for index, frame in enumerate(frames[:256]):
         location = frame.get("location", {})
