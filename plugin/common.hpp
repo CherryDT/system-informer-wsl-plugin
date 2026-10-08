@@ -115,6 +115,7 @@ class Table
     void showHeaderMenu(POINT point);
     void trackHover(POINT point);
     void clearHover();
+    void invalidateRows(int first, int last) const;
     void trackHeaderHover(POINT point, HWND header);
     void clearHeaderHover();
     LRESULT drawHeader(NMCUSTOMDRAW *draw) const;

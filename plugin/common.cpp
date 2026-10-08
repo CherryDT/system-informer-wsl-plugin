@@ -299,7 +299,20 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
     }
     if (message == WM_NCDESTROY)
         RemoveWindowSubclass(window, tableLayoutProc, id);
+    // ListView scrolls only the area covered by its columns. We also paint row
+    // backgrounds to the right of them, so that area must move with the rows.
+    const bool mayScrollVertically = message == WM_VSCROLL || message == WM_MOUSEWHEEL ||
+                                    message == WM_KEYDOWN || message == WM_CHAR ||
+                                    message == LVM_ENSUREVISIBLE || message == LVM_SCROLL;
+    const int previousTop = mayScrollVertically ? ListView_GetTopIndex(window) : -1;
     const auto result = DefSubclassProc(window, message, wparam, lparam);
+    if (mayScrollVertically && previousTop != ListView_GetTopIndex(window))
+        table->invalidateRows(0, static_cast<int>(table->rows.size()) - 1);
+    if (message == WM_SETFOCUS || message == WM_KILLFOCUS)
+    {
+        const int selected = ListView_GetNextItem(window, -1, LVNI_SELECTED);
+        table->invalidateRows(selected, selected);
+    }
     if (message == WM_SIZE || message == WM_HSCROLL || message == WM_MOUSEHWHEEL || message == LVM_SCROLL ||
         message == LVM_SETCOLUMNWIDTH || message == LVM_SETCOLUMNORDERARRAY || message == WM_SETFONT)
     {
@@ -1071,7 +1084,7 @@ void Table::present()
             previous[index].cells != rows[index].cells || previous[index].removed != rows[index].removed ||
             previous[index].highlightedSince != rows[index].highlightedSince ||
             previous[index].data != rows[index].data)
-            ListView_RedrawItems(window, i, i);
+            invalidateRows(i, i);
     }
     // Clear a vacated tail once when processes exit; unchanged snapshots never
     // invalidate headers, scrollbars, or the empty part of the table.
@@ -1154,6 +1167,22 @@ bool Table::notify(NMHDR *hdr)
 {
     if (hdr->hwndFrom != window)
         return false;
+    if (hdr->code == LVN_ITEMCHANGED)
+    {
+        const auto change = reinterpret_cast<NMLISTVIEW *>(hdr);
+        if ((change->uChanged & LVIF_STATE) &&
+            ((change->uOldState ^ change->uNewState) & (LVIS_SELECTED | LVIS_FOCUSED)))
+            invalidateRows(change->iItem, change->iItem);
+        // The owner may also need to update actions for the new selection.
+        return false;
+    }
+    if (hdr->code == LVN_ODSTATECHANGED)
+    {
+        const auto change = reinterpret_cast<NMLVODSTATECHANGE *>(hdr);
+        if ((change->uOldState ^ change->uNewState) & (LVIS_SELECTED | LVIS_FOCUSED))
+            invalidateRows(change->iFrom, change->iTo);
+        return false;
+    }
     if (hdr->code == LVN_ENDSCROLL)
     {
         updateColumnGeometry();
@@ -1403,10 +1432,10 @@ void Table::trackHover(POINT point)
     if (next != hotRow)
     {
         if (hotRow >= 0)
-            ListView_RedrawItems(window, hotRow, hotRow);
+            invalidateRows(hotRow, hotRow);
         hotRow = next;
         if (hotRow >= 0)
-            ListView_RedrawItems(window, hotRow, hotRow);
+            invalidateRows(hotRow, hotRow);
     }
     TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
     TrackMouseEvent(&tracking);
@@ -1416,7 +1445,34 @@ void Table::clearHover()
     const int old = hotRow;
     hotRow = -1;
     if (old >= 0)
-        ListView_RedrawItems(window, old, old);
+        invalidateRows(old, old);
+}
+void Table::invalidateRows(int first, int last) const
+{
+    if (first < 0 || last < first || rows.empty())
+        return;
+    const int top = std::max(0, ListView_GetTopIndex(window));
+    first = std::max(first, top);
+    last = std::min({last, static_cast<int>(rows.size()) - 1, top + ListView_GetCountPerPage(window)});
+    if (first > last)
+        return;
+
+    RECT bounds{}, end{}, client{}, header{};
+    if (!ListView_GetItemRect(window, first, &bounds, LVIR_BOUNDS) ||
+        !ListView_GetItemRect(window, last, &end, LVIR_BOUNDS))
+        return;
+    GetClientRect(window, &client);
+    const HWND headerWindow = ListView_GetHeader(window);
+    GetWindowRect(headerWindow, &header);
+    MapWindowPoints(nullptr, window, reinterpret_cast<POINT *>(&header), 2);
+    bounds.left = 0;
+    bounds.right = client.right;
+    bounds.top = std::max(bounds.top, header.bottom);
+    bounds.bottom = std::min(end.bottom, client.bottom);
+    // LVM_REDRAWITEMS stops at the last column. Our custom background and
+    // selection fill the complete width, including the otherwise empty tail.
+    if (bounds.top < bounds.bottom)
+        InvalidateRect(window, &bounds, FALSE);
 }
 void Table::trackHeaderHover(POINT point, HWND header)
 {
