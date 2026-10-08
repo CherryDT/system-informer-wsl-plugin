@@ -377,6 +377,7 @@ LRESULT CALLBACK overviewProc(HWND window, UINT message, WPARAM wparam, LPARAM l
 
 std::wstring overviewValue(const Inspector &state, const OverviewField &field)
 {
+    const std::string key = field.key;
     std::wstring value = cell(state.overviewData, field.key);
     if (value.empty())
     {
@@ -384,7 +385,11 @@ std::wstring overviewValue(const Inspector &state, const OverviewField &field)
             return L"Systemd default";
         return L"Not available";
     }
-    std::string key = field.key;
+    if (!state.isService && key == "service_unit")
+    {
+        const auto scope = cell(state.overviewData, "service_scope");
+        value += scope == L"user" ? L" (user service)" : L" (system service)";
+    }
     if (key == "rss_bytes" || key == "virtual_bytes" || key == "read_bytes" || key == "write_bytes" ||
         key == "memory_current")
     {
@@ -460,6 +465,7 @@ void createOverviewFields(Inspector &state)
                                 {"exe", L"Executable"},
                                 {"command", L"Command line", true},
                                 {"cwd", L"Working directory"},
+                                {"service_unit", L"Service"},
                                 {"rss_bytes", L"Resident memory"},
                                 {"virtual_bytes", L"Virtual memory"},
                                 {"read_bytes", L"Storage reads"},
