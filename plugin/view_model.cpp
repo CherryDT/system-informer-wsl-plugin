@@ -44,6 +44,14 @@ bool matches(const Row &row, const std::wstring &query)
 }
 } // namespace
 
+std::string connectionKey(const Json &c)
+{
+    return Json::array({c.value("protocol", ""), c.value("inode", 0ull), c.value("pid", 0),
+                        c.value("start_ticks", 0ull), c.value("local_address", ""), c.value("local_port", 0),
+                        c.value("remote_address", ""), c.value("remote_port", 0)})
+        .dump();
+}
+
 void clearDistro(View &v)
 {
     if (!v.selectedDistro.empty())
@@ -67,6 +75,10 @@ void clearDistro(View &v)
     v.connections.clear();
     v.services.clear();
     v.statistics.clear();
+    v.defaultUid.reset();
+    v.collectConnections = false;
+    v.collectServices = false;
+    v.pendingExecutable.clear();
     status(v, L"Connecting to the selected distribution…");
     PostMessageW(v.graph, GraphSampleChanged, 0, 0);
     PostMessageW(v.memoryGraph, GraphSampleChanged, 0, 0);
@@ -83,7 +95,7 @@ void render(View &v)
         v.cpuPercentOfTotal && v.snapshot.is_object() ? std::max(1.0, v.snapshot.value("cpus", 1.0)) : 1.0;
     std::vector<Row> rows;
     const auto query = lower(windowText(v.search));
-    if (v.page == 0 && v.snapshot.contains("processes"))
+    if (v.snapshot.contains("processes"))
     {
         auto items = v.snapshot["processes"].get<std::vector<Json>>();
         std::map<int, int> depths;
@@ -119,12 +131,63 @@ void render(View &v)
         }
         for (const auto &p : items)
         {
+            const double hz = std::max(1.0, v.snapshot.value("clock_ticks", 100.0));
+            auto optionalNumber = [&](const char *key, double divisor = 1.0) {
+                return p.contains(key) ? number(p[key].get<double>() / divisor, divisor == 1.0 ? 0 : 2) : L"";
+            };
+            auto cpuTime = [&](const char *key) {
+                return p.contains(key) ? number(p[key].get<double>() / hz) + L" s" : L"";
+            };
             auto key = processKey(p);
             std::wstring name = std::wstring(depths[p.value("pid", 0)] * 2, L' ') + text(p, "name");
-            Row row{{name, text(p, "pid"), text(p, "user"), number(v.cpu[key] / cpuDivisor),
-                     number(p.value("rss_bytes", 0ull) / 1048576.0), number(v.readRate[key] / 1024.0),
-                     number(v.writeRate[key] / 1024.0), text(p, "state"), text(p, "threads"), text(p, "ppid"),
-                     text(p, "command")},
+            Row row{{name,
+                     text(p, "pid"),
+                     text(p, "user"),
+                     number(v.cpu[key] / cpuDivisor),
+                     number(p.value("rss_bytes", 0ull) / 1048576.0),
+                     number(v.readRate[key] / 1024.0),
+                     number(v.writeRate[key] / 1024.0),
+                     text(p, "state"),
+                     text(p, "threads"),
+                     text(p, "ppid"),
+                     text(p, "command"),
+                     text(p, "uid"),
+                     text(p, "euid"),
+                     text(p, "gid"),
+                     text(p, "egid"),
+                     text(p, "tty"),
+                     text(p, "nice"),
+                     text(p, "priority"),
+                     number(std::max(0.0, v.snapshot.value("uptime_seconds", 0.0) -
+                                              p.value("start_ticks", 0.0) / hz)) +
+                         L" s",
+                     optionalNumber("virtual_bytes", 1048576.0),
+                     text(p, "session"),
+                     text(p, "pgrp"),
+                     text(p, "processor"),
+                     text(p, "minor_faults"),
+                     text(p, "major_faults"),
+                     text(p, "exe"),
+                     text(p, "cwd"),
+                     text(p, "cgroup"),
+                     text(p, "tracer_pid"),
+                     optionalNumber("swap_bytes", 1048576.0),
+                     optionalNumber("read_bytes", 1048576.0),
+                     optionalNumber("write_bytes", 1048576.0),
+                     optionalNumber("read_chars", 1048576.0),
+                     optionalNumber("write_chars", 1048576.0),
+                     text(p, "syscr"),
+                     text(p, "syscw"),
+                     text(p, "voluntary_switches"),
+                     text(p, "involuntary_switches"),
+                     text(p, "seccomp"),
+                     p.contains("no_new_privs") ? (p.value("no_new_privs", false) ? L"Yes" : L"No") : L"",
+                     (readSetting(L"Detect32BitProcesses", 0) && p.contains("is_32bit"))
+                         ? (p.value("is_32bit", false) ? L"32-bit" : L"64-bit")
+                         : L"",
+                     cpuTime("user_ticks"),
+                     cpuTime("kernel_ticks"),
+                     text(p, "policy")},
                     p,
                     key};
             rows.push_back(std::move(row));
@@ -133,8 +196,9 @@ void render(View &v)
             std::move(rows), [query](const Row &row) { return matches(row, query); },
             !v.snapshot.value("processes_truncated", false));
     }
-    else if (v.page == 1 && v.sockets.contains("connections"))
+    if (v.sockets.contains("connections"))
     {
+        rows.clear();
         bool onlyListeners = SendMessageW(v.listeners, BM_GETCHECK, 0, 0) == BST_CHECKED;
         for (const auto &c : v.sockets["connections"])
         {
@@ -142,11 +206,7 @@ void render(View &v)
             Row row{{protocol, text(c, "local_address"), text(c, "local_port"), text(c, "remote_address"),
                      text(c, "remote_port"), state, text(c, "pid"), text(c, "process"), text(c, "inode")},
                     c,
-                    Json::array({c.value("protocol", ""), c.value("inode", 0ull), c.value("pid", 0),
-                                 c.value("start_ticks", 0ull), c.value("local_address", ""),
-                                 c.value("local_port", 0), c.value("remote_address", ""),
-                                 c.value("remote_port", 0)})
-                        .dump()};
+                    connectionKey(c)};
             rows.push_back(std::move(row));
         }
         v.connections.replace(
@@ -161,8 +221,9 @@ void render(View &v)
             !v.sockets.value("connections_truncated", false) &&
                 v.sockets.value("inaccessible_processes", 0) == 0);
     }
-    else if (v.page == 2 && v.units.contains("services"))
+    if (v.units.contains("services"))
     {
+        rows.clear();
         for (const auto &s : v.units["services"])
         {
             Row row{{text(s, "name"), text(s, "active"), text(s, "sub"), text(s, "enabled"), text(s, "load"),
@@ -204,7 +265,8 @@ void updateSnapshot(View &v, const Json &data)
     {
         auto key = processKey(p);
         ProcessSample sample{p.value("cpu_ticks", 0ull), p.value("read_bytes", 0ull),
-                             p.value("write_bytes", 0ull)};
+                             p.value("write_bytes", 0ull),
+                             p.contains("read_bytes") && p.contains("write_bytes")};
         double usage = 0, read = 0, written = 0;
         auto previous = v.previous.find(key);
         if (elapsed > 0 && hz > 0 && previous != v.previous.end())
@@ -212,9 +274,9 @@ void updateSnapshot(View &v, const Json &data)
             auto &old = previous->second;
             if (sample.ticks >= old.ticks)
                 usage = 100.0 * (sample.ticks - old.ticks) / hz / elapsed;
-            if (sample.read >= old.read)
+            if (sample.hasIo && old.hasIo && sample.read >= old.read)
                 read = (sample.read - old.read) / elapsed;
-            if (sample.written >= old.written)
+            if (sample.hasIo && old.hasIo && sample.written >= old.written)
                 written = (sample.written - old.written) / elapsed;
         }
         samples[key] = sample;
@@ -237,7 +299,51 @@ void updateSnapshot(View &v, const Json &data)
     }
     v.previous = std::move(samples);
     v.previousTime = now;
+    // Cheap background samples omit expensive fields. Retain the last known
+    // values only for the same PID/start-time identity; PID reuse never inherits
+    // another process's command line, credentials or highlighting metadata.
+    std::map<std::string, Json> prior;
+    if (v.snapshot.contains("processes"))
+        for (const auto &process : v.snapshot["processes"])
+            prior.emplace(processKey(process), process);
     v.snapshot = data;
+    for (auto &process : v.snapshot["processes"])
+    {
+        auto previous = prior.find(processKey(process));
+        if (previous != prior.end())
+        {
+            Json merged = std::move(previous->second);
+            // Requested-but-unavailable fields must become unknown, not retain
+            // a pre-exec image/credential value. Unrequested fields are cached.
+            const Json fields = data.value("fields", Json::array());
+            std::set<std::string> requested;
+            for (const auto &field : fields)
+                requested.insert(field.get<std::string>());
+            const bool allFields = !data.contains("fields");
+            auto dropGroup = [&](const char *group, std::initializer_list<const char *> keys) {
+                for (const auto key : keys)
+                    if (allFields || requested.count(group) || requested.count(key))
+                        merged.erase(key);
+            };
+            if (requested.count("user") || requested.count("sudo"))
+                requested.insert("status");
+            dropGroup("status", {"uid", "euid", "gid", "egid", "status_accessible", "tracer_pid",
+                                 "voluntary_switches", "involuntary_switches", "seccomp", "no_new_privs",
+                                 "capabilities", "swap_bytes", "is_own"});
+            dropGroup("user", {"user"});
+            dropGroup("io", {"read_bytes", "write_bytes", "read_chars", "write_chars", "syscr", "syscw",
+                             "cancelled_write_bytes", "io_accessible"});
+            dropGroup("exe", {"exe", "runtime"});
+            dropGroup("cwd", {"cwd"});
+            dropGroup("command", {"command"});
+            dropGroup("cgroup", {"cgroup", "is_service"});
+            dropGroup("sudo", {"sudo_root"});
+            dropGroup("suspension", {"is_suspended", "is_partially_suspended", "stopped_threads"});
+            dropGroup("elf32", {"is_32bit"});
+            merged.update(process);
+            process = std::move(merged);
+        }
+    }
     double cpus = std::max(1.0, data.value("cpus", 1.0));
     if (elapsed > 0)
     {

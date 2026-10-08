@@ -3,7 +3,9 @@
 #include "host_bridge.h"
 #include "graphs.hpp"
 #include "view_state.hpp"
+#include "transport.hpp"
 #include <algorithm>
+#include <set>
 #include <windowsx.h>
 
 namespace wsl::ui
@@ -25,18 +27,103 @@ void queue(View &v, Json request, uintptr_t tag)
     v.pending = true;
     submit(v.selectedDistro, std::move(request), v.mailbox, (static_cast<uintptr_t>(v.epoch) << 16) | tag);
 }
+namespace
+{
+bool contentVisible(const View &v)
+{
+    HWND host = GetAncestor(v.window, GA_ROOT);
+    return v.active && IsWindowVisible(v.window) && IsWindowVisible(host) && !IsIconic(host);
+}
+Json mergeIdentitySnapshot(const Json &previous, const Json &incoming, const char *arrayName)
+{
+    if (!incoming.value("identities_only", false) || !previous.contains(arrayName))
+        return incoming;
+    const bool connections = std::string(arrayName) == "connections";
+    auto key = [&](const Json &item) { return connections ? connectionKey(item) : item.value("name", ""); };
+    std::map<std::string, Json> metadata;
+    for (const auto &item : previous[arrayName])
+        metadata.emplace(key(item), item);
+    Json merged = incoming;
+    for (auto &item : merged[arrayName])
+    {
+        const auto old = metadata.find(key(item));
+        if (old != metadata.end())
+        {
+            Json updated = std::move(old->second);
+            updated.update(item);
+            item = std::move(updated);
+        }
+    }
+    return merged;
+}
+
+Json snapshotRequest(const View &v)
+{
+    Json request{{"op", "snapshot"}, {"fields", Json::array()}};
+    if (!contentVisible(v) || v.page != 0)
+        return request;
+    std::set<std::string> fields;
+    auto needs = [&](std::initializer_list<int> columns) {
+        for (int column : columns)
+            if (v.processes.isColumnVisible(column) || v.processes.sortColumn == column)
+                return true;
+        return false;
+    };
+    auto enabled = [](PCWSTR name) { return WslHostIntegerSetting(name) != 0; };
+    if (needs({ProcessUser}))
+        fields.insert("user");
+    // Search is intentionally restricted to the data actually collected. The
+    // command line remains searchable when its column is visible (the default).
+    if (needs({ProcessCommand}))
+        fields.insert("command");
+    if (needs({ProcessRead, ProcessWrite, ProcessReadTotal, ProcessWriteTotal, ProcessReadChars,
+               ProcessWriteChars, ProcessReadCalls, ProcessWriteCalls}))
+        fields.insert("io");
+    if (needs({ProcessExecutable}))
+        fields.insert("exe");
+    if (needs({ProcessDirectory}))
+        fields.insert("cwd");
+    if (needs({ProcessCgroup}) || enabled(L"UseColorServiceProcesses"))
+        fields.insert("cgroup");
+    if (needs({ProcessUid, ProcessEuid, ProcessGid, ProcessEgid, ProcessTracer, ProcessSwap,
+               ProcessVoluntarySwitches, ProcessInvoluntarySwitches, ProcessSeccomp,
+               ProcessNoNewPrivileges}) ||
+        enabled(L"UseColorDebuggedProcesses") || enabled(L"UseColorOwnProcesses") ||
+        enabled(L"UseColorSystemProcesses"))
+        fields.insert("status");
+    if (enabled(L"UseColorElevatedProcesses"))
+        fields.insert("sudo");
+    if (enabled(L"UseColorSuspended") || enabled(L"UseColorPartiallySuspended"))
+        fields.insert("suspension");
+    if (readSetting(L"Detect32BitProcesses", 0) &&
+        (needs({ProcessArchitecture}) || enabled(L"UseColorWow64Processes")))
+    {
+        fields.insert("elf32");
+        request["detect_32bit"] = true;
+    }
+    for (const auto &field : fields)
+        request["fields"].push_back(field);
+    if (v.defaultUid)
+        request["default_uid"] = *v.defaultUid;
+    return request;
+}
+} // namespace
 void refresh(View &v)
 {
-    if (!v.active || (v.paused && !v.forceRefresh) || v.pending || v.failed)
+    if ((v.paused && !v.forceRefresh) || v.pending || v.failed)
         return;
     if (v.selectedDistro.empty())
     {
-        queue(v, {{"op", "discover"}}, DiscoverTag);
+        if (v.active)
+            queue(v, {{"op", "discover"}}, DiscoverTag);
         return;
     }
-    // Keep graphs live in every inner view, then refresh that view's rows.
+    // Background monitoring keeps graph samples and object identities current;
+    // expensive process metadata is requested only for visible columns/colors.
     v.forceRefresh = false;
-    queue(v, {{"op", "snapshot"}}, SnapshotTag);
+    v.collectConnections = v.page == 1 || v.sockets.is_object();
+    v.collectServices = v.page == 2 || v.units.is_object();
+    queue(v, snapshotRequest(v), SnapshotTag);
 }
 namespace
 {
@@ -60,7 +147,7 @@ void layout(View &v)
         return textSize.cx + GetSystemMetricsForDpi(SM_CXMENUCHECK, GetDpiForWindow(check)) + s(6);
     };
     const int optionWidth = checkWidth(v.page == 1 ? v.listeners : v.tree);
-    const int combo = std::max(s(110), std::min(s(300), width - s(224) - optionWidth - gap));
+    const int combo = std::max(s(110), std::min(s(300), width - s(350) - optionWidth - gap));
     place(v.distro, 0, 0, combo, s(300));
     // A dropdown's requested height includes its popup. Measure the collapsed
     // control so adjacent buttons have exactly the same visual height.
@@ -69,6 +156,7 @@ void layout(View &v)
     const int line = std::max(s(20), static_cast<int>(comboRect.bottom - comboRect.top));
     place(v.settings, combo + gap, 0, s(88), line);
     place(v.exportButton, combo + s(88) + 2 * gap, 0, s(114), line);
+    place(v.findHandles, combo + s(202) + 3 * gap, 0, s(118), line);
     place(v.tree, width - checkWidth(v.tree), 0, checkWidth(v.tree), line);
     place(v.listeners, width - checkWidth(v.listeners), 0, checkWidth(v.listeners), line);
     const int footerHeight = s(18);
@@ -76,7 +164,7 @@ void layout(View &v)
     place(v.status, s(2), footerY, width - s(4), footerHeight);
 
     const bool content = !v.componentMissing;
-    for (HWND child : {v.graph, v.memoryGraph, v.tabs, v.exportButton})
+    for (HWND child : {v.graph, v.memoryGraph, v.tabs, v.exportButton, v.findHandles})
         ShowWindow(child, content ? SW_SHOW : SW_HIDE);
     ShowWindow(v.processes.window, content && v.page == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.connections.window, content && v.page == 1 ? SW_SHOW : SW_HIDE);
@@ -127,6 +215,8 @@ void switchPage(View &v)
                                                         : L"Filter service, state or description…"));
     layout(v);
     render(v);
+    v.forceRefresh = true;
+    v.refreshAfterPending = v.pending;
     refresh(v);
 }
 void manualRefresh(View &v)
@@ -225,8 +315,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         v->search = control(window, L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, SearchEdit);
         v->listeners = control(window, L"BUTTON", L"Listening / bound ports only",
                                BS_AUTOCHECKBOX | WS_TABSTOP, ListenerCheck);
-        v->tree =
-            control(window, L"BUTTON", L"Show process ancestry", BS_AUTOCHECKBOX | WS_TABSTOP, TreeCheck);
+        v->tree = control(window, L"BUTTON", L"Show process tree", BS_AUTOCHECKBOX | WS_TABSTOP, TreeCheck);
 
         v->processes.kind = Table::Kind::Processes;
         v->connections.kind = Table::Kind::Network;
@@ -236,13 +325,46 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                              {L"PID", 70, true},
                              {L"User", 90},
                              {L"CPU %", 80, true},
-                             {L"RSS MiB", 90, true},
-                             {L"Read KiB/s", 95, true},
-                             {L"Write KiB/s", 95, true},
+                             {L"RSS MB", 90, true},
+                             {L"Read kB/s", 95, true},
+                             {L"Write kB/s", 95, true},
                              {L"State", 60},
                              {L"Threads", 65, true},
                              {L"PPID", 65, true},
-                             {L"Command line", 540}},
+                             {L"Command line", 540},
+                             {L"UID", 75, true, false},
+                             {L"Effective UID", 95, true, false},
+                             {L"GID", 75, true, false},
+                             {L"Effective GID", 95, true, false},
+                             {L"TTY", 120, false, false},
+                             {L"Nice", 70, true, false},
+                             {L"Priority", 75, true, false},
+                             {L"Relative start time", 135, true, false},
+                             {L"Virtual size MB", 115, true, false},
+                             {L"Session ID", 90, true, false},
+                             {L"Process group", 105, true, false},
+                             {L"Last CPU", 80, true, false},
+                             {L"Minor faults", 100, true, false},
+                             {L"Major faults", 100, true, false},
+                             {L"Executable", 360, false, false},
+                             {L"Working directory", 300, false, false},
+                             {L"Control group", 360, false, false},
+                             {L"Tracer PID", 90, true, false},
+                             {L"Swap MB", 95, true, false},
+                             {L"Read total MB", 115, true, false},
+                             {L"Write total MB", 115, true, false},
+                             {L"Read characters MB", 140, true, false},
+                             {L"Write characters MB", 140, true, false},
+                             {L"Read calls", 100, true, false},
+                             {L"Write calls", 100, true, false},
+                             {L"Voluntary switches", 140, true, false},
+                             {L"Involuntary switches", 150, true, false},
+                             {L"Seccomp", 85, false, false},
+                             {L"No new privileges", 130, false, false},
+                             {L"Architecture", 95, false, false},
+                             {L"User CPU time", 120, true, false},
+                             {L"Kernel CPU time", 120, true, false},
+                             {L"Scheduling policy", 130, false, false}},
                             3, true);
 
         v->connections.create(window, ConnectionTable,
@@ -263,6 +385,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                             {L"Load", 100},
                             {L"Description", 500}});
         v->exportButton = control(window, L"BUTTON", L"Export view...", WS_TABSTOP, ExportButton);
+        v->findHandles = control(window, L"BUTTON", L"Find handles...", WS_TABSTOP, FindHandlesButton);
         v->installNotice =
             control(window, L"STATIC",
                     L"Install the WSL inspection component\r\n\r\n"
@@ -278,7 +401,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                             SS_LEFT, 0);
         for (HWND child :
              {v->distro, v->settings, v->tabs, v->search, v->listeners, v->tree, v->processes.window,
-              v->connections.window, v->services.window, v->exportButton, v->installButton})
+              v->connections.window, v->services.window, v->exportButton, v->installButton, v->findHandles})
             SetWindowSubclass(child, childKeys, 1, reinterpret_cast<DWORD_PTR>(v));
         v->tooltips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
                                       WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -291,6 +414,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             info.lpszText = const_cast<wchar_t *>(label);
             SendMessageW(v->tooltips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
         };
+        tip(v->findHandles, L"Find open files and mapped modules across processes in this distribution");
         tip(v->exportButton, L"Export the visible rows and columns");
         tip(v->settings, L"WSL options: CPU percentage, Inspector capture and Explorer path mapping");
         WslApplyTheme(window);
@@ -320,7 +444,17 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         layout(*v);
         return 0;
     case WM_TIMER: {
-
+        const bool foreground = contentVisible(*v);
+        if (foreground != v->foreground)
+        {
+            v->foreground = foreground;
+            if (foreground)
+            {
+                v->forceRefresh = true;
+                v->refreshAfterPending = v->pending;
+                refresh(*v);
+            }
+        }
         if (v->cpuPercentOfTotal != (readSetting(L"CpuPercentOfTotal", 1) != 0))
             render(*v);
         auto now = GetTickCount64();
@@ -341,6 +475,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             {
                 clearDistro(*v);
                 v->selectedDistro = chosen;
+                v->defaultUid = distroDefaultUid(chosen);
                 v->forceRefresh = true;
                 layout(*v);
                 refresh(*v);
@@ -371,8 +506,15 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             showSettings(window, v->selectedDistro);
             break;
         case TreeCheck:
+            render(*v);
+            v->processes.centerSelection();
+            break;
         case ListenerCheck:
             render(*v);
+            break;
+        case FindHandlesButton:
+            if (!v->selectedDistro.empty())
+                openHandleSearch(window, v->selectedDistro);
             break;
         case ExportButton:
             saveText(window, v->table().exportText(),
@@ -383,6 +525,18 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         }
         return 0;
     }
+    case SortResetMessage:
+        if (reinterpret_cast<HWND>(lparam) == v->processes.window)
+        {
+            SendMessageW(v->tree, BM_SETCHECK, BST_UNCHECKED, 0);
+            render(*v);
+        }
+        return 0;
+    case ColumnsChangedMessage:
+        v->forceRefresh = true;
+        v->refreshAfterPending = v->pending;
+        refresh(*v);
+        return 0;
     case WM_NOTIFY: {
         auto hdr = reinterpret_cast<NMHDR *>(lparam);
         if (hdr->hwndFrom == v->tabs && hdr->code == TCN_SELCHANGE)
@@ -415,6 +569,10 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         break;
     }
     case WM_CONTEXTMENU: {
+        // Header menus belong to Table. A header right-click also generates a
+        // context-menu message; do not turn that into a second resource menu.
+        if (reinterpret_cast<HWND>(wparam) != v->table().window)
+            return 0;
         POINT p{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         if (p.x == -1)
         {
@@ -444,7 +602,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                                              : L"Component not installed in " + v->selectedDistro + L".");
                 return 0;
             }
-            if (tag == ActionTag)
+            if (tag == ActionTag || tag == ExecutableTag)
             {
                 // A refused signal or service action does not necessarily mean
                 // the observer disconnected. Do not retry the action; refresh
@@ -461,6 +619,26 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         }
         try
         {
+            if (tag == ExecutableTag)
+            {
+                bool found = false;
+                for (const auto &process : reply->data.at("processes"))
+                    if (process.at("pid").dump() + ":" + process.at("start_ticks").dump() ==
+                        v->pendingExecutable)
+                    {
+                        const auto path = text(process, "exe");
+                        if (!path.empty())
+                            openLinuxPath(window, v->selectedDistro, path);
+                        else
+                            errorBox(window, L"The executable is inaccessible or this is a kernel thread.");
+                        found = true;
+                        break;
+                    }
+                if (!found)
+                    errorBox(window, L"The process has exited. Refresh the process list.");
+                v->pendingExecutable.clear();
+                return 0;
+            }
             if (tag == InstallTag)
             {
                 v->componentMissing = false;
@@ -502,6 +680,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                 {
                     clearDistro(*v);
                     v->selectedDistro = distro;
+                    v->defaultUid = distroDefaultUid(distro);
                 }
                 refresh(*v);
             }
@@ -524,21 +703,34 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                         status(*v, L"The socket owner has exited. Refresh the connections view.");
                     v->pendingSelection.clear();
                 }
-                if (v->page != 0)
+                if (v->collectConnections)
                 {
-                    queue(*v, {{"op", v->page == 1 ? "connections" : "services"}},
-                          v->page == 1 ? ConnectionsTag : ServicesTag);
+                    queue(*v,
+                          {{"op", "connections"}, {"identities_only", !contentVisible(*v) || v->page != 1}},
+                          ConnectionsTag);
+                    return 0;
+                }
+                if (v->collectServices)
+                {
+                    queue(*v, {{"op", "services"}, {"identities_only", !contentVisible(*v) || v->page != 2}},
+                          ServicesTag);
                     return 0;
                 }
             }
             else if (tag == ConnectionsTag)
             {
-                v->sockets = reply->data;
+                v->sockets = mergeIdentitySnapshot(v->sockets, reply->data, "connections");
                 render(*v);
+                if (v->collectServices)
+                {
+                    queue(*v, {{"op", "services"}, {"identities_only", !contentVisible(*v) || v->page != 2}},
+                          ServicesTag);
+                    return 0;
+                }
             }
             else if (tag == ServicesTag)
             {
-                v->units = reply->data;
+                v->units = mergeIdentitySnapshot(v->units, reply->data, "services");
                 render(*v);
                 if (!v->units.value("available", true))
                 {
@@ -554,6 +746,12 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                 return 0;
             }
 
+            if (!v->pending && v->refreshAfterPending)
+            {
+                v->refreshAfterPending = false;
+                v->forceRefresh = true;
+                refresh(*v);
+            }
             if (!v->pending)
             {
                 SYSTEMTIME time{};
@@ -639,20 +837,15 @@ extern "C" void WslSetActive(BOOL active)
     {
         v.failed = false;
         v.paused = !WslHostRefreshAutomatically();
-        v.forceRefresh = !v.snapshot.is_object();
-        v.previousTime = 0;
+        v.forceRefresh = true;
+        v.refreshAfterPending = v.pending;
         render(v);
         if (v.paused && !v.forceRefresh)
             status(v, L"Automatic refresh is off. Use View > Refresh (F5) to update.");
         refresh(v);
     }
-    else
-    {
-        disconnect(v.selectedDistro);
-        ++v.epoch;
-        v.pending = false;
-        status(v, L"Collector disconnected while the WSL tab is hidden.");
-    }
+    // Keep the existing connection and sample identities/graphs in the
+    // background. Returning to WSL immediately requests visible metadata.
 }
 extern "C" void WslShutdown(void)
 {

@@ -70,11 +70,6 @@ void action(View &v, int id)
     }
     if (row.removed)
         return;
-    if (id == OpenExecutable)
-    {
-        openLinuxPath(v.window, v.selectedDistro, text(row.data, "exe"));
-        return;
-    }
     if (v.pending)
     {
         errorBox(v.window, L"A request is still running. Wait for it to finish, then try the action again.");
@@ -83,6 +78,18 @@ void action(View &v, int id)
     if (!v.active || v.failed)
     {
         errorBox(v.window, L"Refresh before changing a process or service.");
+        return;
+    }
+    if (id == OpenExecutable)
+    {
+        v.pendingExecutable = row.key;
+        queue(v,
+              {{"op", "snapshot"},
+               {"fields", Json::array({"exe"})},
+               {"pid", row.data["pid"]},
+               {"start_ticks", row.data["start_ticks"]}},
+              ExecutableTag);
+        status(v, L"Resolving the process executable…");
         return;
     }
     if (v.page == 0)
@@ -132,6 +139,12 @@ void action(View &v, int id)
             signal == 1 || signal == 10 || signal == 12
                 ? L"The program defines this signal's behavior. Without a handler, it terminates the process."
                 : L"This action runs as Linux root. Termination may lose unsaved work.";
+        const auto executable = text(row.data, "exe");
+        const auto basename = executable.substr(executable.find_last_of(L'/') + 1);
+        if ((signal == 9 || signal == 15 || signal == 19) &&
+            (basename == L"wsl-observer" || text(row.data, "name") == L"wsl-observer"))
+            prompt += L"\r\n\r\nThis is the WSL inspection component. Stopping it disconnects WSL "
+                      L"monitoring and may interrupt another inspection. Use View > Refresh to reconnect.";
         if (MessageBoxW(v.window, prompt.c_str(), L"Confirm process signal",
                         MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES)
             return;
@@ -184,6 +197,7 @@ void menu(View &v, POINT point)
         return;
     HMENU popup = CreatePopupMenu();
     AppendMenuW(popup, MF_STRING, Inspect, v.page == 1 ? L"Go to process\tEnter" : L"Inspect…\tEnter");
+    SetMenuDefaultItem(popup, Inspect, FALSE);
     AppendMenuW(popup, MF_STRING, CopyRow, L"Copy row\tCtrl+C");
     if (v.page == 0)
     {

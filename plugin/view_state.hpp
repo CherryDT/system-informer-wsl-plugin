@@ -3,6 +3,7 @@
 #include "common.hpp"
 #include <deque>
 #include <map>
+#include <optional>
 
 // Private to the WSL main view. Inspectors and the controller do not depend on
 // this state; all access happens on the window thread.
@@ -26,6 +27,7 @@ enum Id
     ActionsButton,
     ExportButton,
     InstallButton,
+    FindHandlesButton,
     Inspect = 200,
     CopyRow,
     CopyCommand,
@@ -49,6 +51,7 @@ enum Id
 struct ProcessSample
 {
     uint64_t ticks = 0, read = 0, written = 0;
+    bool hasIo = false;
 };
 struct GraphSample
 {
@@ -63,7 +66,7 @@ struct GraphSample
 struct View
 {
     HWND window{}, distro{}, settings{}, search{}, tabs{}, listeners{}, tree{}, exportButton{}, status{},
-        graph{}, memoryGraph{}, installNotice{}, installButton{}, tooltips{};
+        graph{}, memoryGraph{}, installNotice{}, installButton{}, tooltips{}, findHandles{};
     Table processes, connections, services;
     std::shared_ptr<Mailbox> mailbox = std::make_shared<Mailbox>();
     Json snapshot, sockets, units;
@@ -75,19 +78,74 @@ struct View
     uint64_t previousTime = 0;
     std::string bootId;
     std::wstring selectedDistro;
+    std::optional<uint32_t> defaultUid;
     std::wstring statistics;
     std::string pendingSelection;
+    std::string pendingExecutable;
     // Replies from earlier distro selections or disconnected sessions are ignored.
     unsigned epoch = 1;
     int page = 0;
     bool active = false, paused = false, pending = false, failed = false;
-    bool forceRefresh = false;
+    bool forceRefresh = false, refreshAfterPending = false;
+    bool foreground = false;
+    bool collectConnections = false, collectServices = false;
     ULONGLONG lastRefresh = 0;
     bool componentMissing = false, cpuPercentOfTotal = true;
     Table &table()
     {
         return page == 0 ? processes : page == 1 ? connections : services;
     }
+};
+
+constexpr uintptr_t ExecutableTag = 7;
+
+// Stable logical IDs: persisted column layouts must survive new optional columns.
+enum ProcessColumn
+{
+    ProcessName,
+    ProcessPid,
+    ProcessUser,
+    ProcessCpu,
+    ProcessRss,
+    ProcessRead,
+    ProcessWrite,
+    ProcessState,
+    ProcessThreads,
+    ProcessParent,
+    ProcessCommand,
+    ProcessUid,
+    ProcessEuid,
+    ProcessGid,
+    ProcessEgid,
+    ProcessTty,
+    ProcessNice,
+    ProcessPriority,
+    ProcessAge,
+    ProcessVirtual,
+    ProcessSession,
+    ProcessGroup,
+    ProcessProcessor,
+    ProcessMinorFaults,
+    ProcessMajorFaults,
+    ProcessExecutable,
+    ProcessDirectory,
+    ProcessCgroup,
+    ProcessTracer,
+    ProcessSwap,
+    ProcessReadTotal,
+    ProcessWriteTotal,
+    ProcessReadChars,
+    ProcessWriteChars,
+    ProcessReadCalls,
+    ProcessWriteCalls,
+    ProcessVoluntarySwitches,
+    ProcessInvoluntarySwitches,
+    ProcessSeccomp,
+    ProcessNoNewPrivileges,
+    ProcessArchitecture,
+    ProcessUserTime,
+    ProcessKernelTime,
+    ProcessPolicy
 };
 
 // Window/controller boundary. Queue tags carry the current epoch in their high
@@ -103,6 +161,7 @@ void clearDistro(View &view);
 void updateButtons(View &view);
 void render(View &view);
 void updateSnapshot(View &view, const Json &data);
+std::string connectionKey(const Json &connection);
 
 // Commands shared by toolbar buttons, keyboard shortcuts and context menus.
 void inspect(View &view);
