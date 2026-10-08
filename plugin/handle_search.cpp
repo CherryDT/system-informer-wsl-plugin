@@ -254,7 +254,9 @@ LRESULT CALLBACK searchProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     switch (message)
     {
     case WM_CREATE:
-        state->query = control(window, WC_EDITW, L"", WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, Query);
+        // The native search control owns its frame. Creating EDIT with WS_BORDER
+        // leaves a second cached inner border after that frame is installed.
+        state->query = control(window, WC_EDITW, L"", WS_TABSTOP | ES_AUTOHSCROLL, Query);
         state->caseSensitive = WslHostIntegerSetting(L"SearchControlCaseSensitive") != 0;
         state->regex = WslHostIntegerSetting(L"SearchControlRegex") != 0;
         WslCreateSearch(window, state->query, L"Search handle and mapped file names", queryChanged, state);
