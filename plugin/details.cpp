@@ -110,6 +110,8 @@ struct Inspector
     std::wstring stacksNotice;
     std::wstring runtimeStacksNotice;
     std::array<bool, ConnectionsPage> available{};
+    std::array<bool, ConnectionsPage> snapshotReady{};
+    std::array<bool, ConnectionsPage> snapshotComplete{};
 };
 
 COLORREF inspectorBackground()
@@ -627,13 +629,14 @@ Table *activeTable(Inspector &state)
                                                                                : nullptr;
 }
 
-std::wstring selectedPath(Inspector &state)
+std::wstring selectedPath(Inspector &state, bool actionable = false)
 {
     if (state.page == 0)
         return cell(state.overviewData, state.isService ? "fragment_path" : "exe");
     if (state.isService || (state.page != 1 && state.page != 2))
         return L"";
-    const Row *row = state.tables[state.page - 1].selected();
+    const Row *row = actionable ? state.tables[state.page - 1].selectedActionable()
+                                : state.tables[state.page - 1].selected();
     if (!row)
         return L"";
     return cell(row->data, state.page == 1 ? "target" : "path");
@@ -683,7 +686,7 @@ void updateActions(Inspector &state)
     ShowWindow(state.path, pathTab || overviewPage ? SW_SHOW : SW_HIDE);
     ShowWindow(state.value, state.page == 3 ? SW_SHOW : SW_HIDE);
     std::wstring path = selectedPath(state);
-    EnableWindow(state.open, !state.loading && canOpen(path));
+    EnableWindow(state.open, !state.loading && canOpen(selectedPath(state, true)));
     EnableWindow(state.path,
                  overviewPage ? !cell(state.overviewData, state.isService ? "exec_start" : "command").empty()
                               : !path.empty());
@@ -692,7 +695,9 @@ void updateActions(Inspector &state)
     bool stackAction =
         !state.isService && (state.page == 4 || state.page == StacksPage || state.page == RuntimeStacksPage);
     ShowWindow(state.captureStack, stackAction ? SW_SHOW : SW_HIDE);
-    EnableWindow(state.captureStack, !state.loading);
+    bool removedThread =
+        state.page == 4 && state.tables[3].selected() && !state.tables[3].selectedActionable();
+    EnableWindow(state.captureStack, !state.loading && !removedThread);
     std::wstring captureLabel = state.page == RuntimeStacksPage
                                     ? std::wstring(L"Capture ") + runtimeLabel(state) + L" &stacks…"
                                 : state.page == 4 && state.tables[3].selected() ? L"View &thread stack…"
@@ -717,13 +722,18 @@ void updateActions(Inspector &state)
             message = L"This information is unavailable.";
         else
         {
-            size_t count = state.tables[state.page - 1].rows.size();
+            const auto &rows = state.tables[state.page - 1].rows;
+            size_t removed = static_cast<size_t>(
+                std::count_if(rows.begin(), rows.end(), [](const Row &row) { return row.removed; }));
+            size_t count = rows.size() - removed;
             message = std::to_wstring(count) + (count == 1 ? L" entry" : L" entries");
             size_t total = state.snapshots[state.page - 1].size();
-            if (count != total)
+            if (state.snapshotComplete[state.page - 1] && count < total)
                 message += L" shown of " + std::to_wstring(total);
-            else if (count == 0)
+            else if (count == 0 && removed == 0)
                 message += L" — no entries reported";
+            if (removed)
+                message += L" · " + std::to_wstring(removed) + L" recently removed";
         }
     }
     if (state.status)
@@ -778,19 +788,21 @@ void applyFilter(Inspector &state)
     std::wstring query = folded(windowText(state.filter));
     for (size_t i = 0; i < state.tables.size(); ++i)
     {
-        if (!state.tables[i].window)
+        // An empty view before its first reply is not a process snapshot. It
+        // must not make every row in that first reply appear newly created.
+        if (!state.tables[i].window || !state.snapshotReady[i])
             continue;
-        std::vector<Row> rows;
-        for (const auto &row : state.snapshots[i])
-        {
-            bool match = query.empty();
-            for (const auto &value : row.cells)
-                if (!match && folded(value).find(query) != std::wstring::npos)
-                    match = true;
-            if (match)
-                rows.push_back(row);
-        }
-        state.tables[i].replace(std::move(rows));
+        state.tables[i].replace(
+            state.snapshots[i],
+            [query](const Row &row) {
+                if (query.empty())
+                    return true;
+                for (const auto &value : row.cells)
+                    if (folded(value).find(query) != std::wstring::npos)
+                        return true;
+                return false;
+            },
+            state.snapshotComplete[i]);
     }
     updateActions(state);
 }
@@ -929,7 +941,9 @@ void captureStacks(Inspector &state)
     }
     if (state.page == 4)
     {
-        const Row *thread = state.tables[3].selected();
+        const Row *thread = state.tables[3].selectedActionable();
+        if (!thread && state.tables[3].selected())
+            return;
         if (thread)
         {
             auto tid = thread->data.find("tid");
@@ -1084,7 +1098,7 @@ void command(Inspector &state, int id)
             copyText(state.window, cell(row->data, "value"));
         break;
     case OpenLocation: {
-        std::wstring path = selectedPath(state);
+        std::wstring path = selectedPath(state, true);
         if (!state.loading && canOpen(path))
             openLinuxPath(state.window, state.distro, path);
         break;
@@ -1121,8 +1135,8 @@ void contextMenu(Inspector &state, HWND source, LPARAM position)
     {
         std::wstring path = selectedPath(state);
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING | (state.loading || !canOpen(path) ? MF_GRAYED : 0), OpenLocation,
-                    L"&Open location\tEnter");
+        AppendMenuW(menu, MF_STRING | (state.loading || !canOpen(selectedPath(state, true)) ? MF_GRAYED : 0),
+                    OpenLocation, L"&Open location\tEnter");
         AppendMenuW(menu, MF_STRING | (path.empty() ? MF_GRAYED : 0), CopyPath, L"Copy &path\tCtrl+Shift+C");
     }
     else if (state.page == 3)
@@ -1173,12 +1187,19 @@ void loadProcessDetails(Inspector &state, const Json &data)
                     row.cells.push_back(cell(value, field));
                 row.key = rowKey(value, fields[section][0]);
                 // A module can have several mapped segments with the same path.
+                if (section == 0)
+                    row.key += ":" + rowKey(value, "target");
                 if (section == 1)
                     row.key += ":" + rowKey(value, "start");
                 rows.push_back(std::move(row));
             }
         }
         state.snapshots[section] = std::move(rows);
+        auto truncated = data.find(std::string(sections[section]) + "_truncated");
+        state.snapshotReady[section] = state.snapshotReady[section] || state.available[section];
+        state.snapshotComplete[section] =
+            state.available[section] &&
+            !(truncated != data.end() && truncated->is_boolean() && truncated->get<bool>());
     }
 }
 
@@ -1227,6 +1248,12 @@ void loadConnections(Inspector &state, const Json &data)
             state.connectionsNotice += L" ";
         state.connectionsNotice += L"Connection results reached the collection limit and are incomplete.";
     }
+    state.snapshotReady[ConnectionsTable] =
+        state.snapshotReady[ConnectionsTable] || state.available[ConnectionsTable];
+    state.snapshotComplete[ConnectionsTable] =
+        state.available[ConnectionsTable] &&
+        !(truncated != data.end() && truncated->is_boolean() && truncated->get<bool>()) &&
+        !(inaccessible != data.end() && inaccessible->is_number_integer() && *inaccessible > 0);
 }
 
 void loadStacks(Inspector &state, const Json &data)
@@ -1800,6 +1827,10 @@ void createControls(Inspector &state)
                                                {L"Remote port", 95, true},
                                                {L"State", 125},
                                                {L"Socket inode", 130, true}});
+        state.tables[0].kind = Table::Kind::Handles;
+        state.tables[1].kind = Table::Kind::Memory;
+        state.tables[3].kind = Table::Kind::Threads;
+        state.tables[ConnectionsTable].kind = Table::Kind::Network;
         const wchar_t *labels[] = {L"Open file descriptors", L"Memory mapped modules",
                                    L"Environment variables", L"Process threads",
                                    L"Process network connections"};

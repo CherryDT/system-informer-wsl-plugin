@@ -291,6 +291,9 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         v->tree =
             control(window, L"BUTTON", L"Show process ancestry", BS_AUTOCHECKBOX | WS_TABSTOP, TreeCheck);
 
+        v->processes.kind = Table::Kind::Processes;
+        v->connections.kind = Table::Kind::Network;
+        v->services.kind = Table::Kind::Services;
         v->processes.create(window, ProcessTable,
                             {{L"Process", 180},
                              {L"PID", 70, true},

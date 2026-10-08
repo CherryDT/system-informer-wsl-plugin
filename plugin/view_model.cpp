@@ -62,9 +62,9 @@ void clearDistro(View &v)
     v.snapshot = Json();
     v.sockets = Json();
     v.units = Json();
-    v.processes.replace({});
-    v.connections.replace({});
-    v.services.replace({});
+    v.processes.clear();
+    v.connections.clear();
+    v.services.clear();
     v.statistics.clear();
     status(v, L"Connecting to the selected distribution…");
     InvalidateRect(v.graph, nullptr, FALSE);
@@ -126,10 +126,10 @@ void render(View &v)
                      text(p, "command")},
                     p,
                     key};
-            if (matches(row, query))
-                rows.push_back(std::move(row));
+            rows.push_back(std::move(row));
         }
-        v.processes.replace(std::move(rows));
+        v.processes.replace(std::move(rows), [query](const Row &row) { return matches(row, query); },
+                            !v.snapshot.value("processes_truncated", false));
     }
     else if (v.page == 1 && v.sockets.contains("connections"))
     {
@@ -137,19 +137,21 @@ void render(View &v)
         for (const auto &c : v.sockets["connections"])
         {
             const auto protocol = text(c, "protocol"), state = text(c, "state");
-            const bool listening =
-                state == L"LISTEN" || state == L"LISTENING" ||
-                (protocol.find(L"udp") != std::wstring::npos && c.value("remote_port", 0) == 0);
-            if (onlyListeners && !listening)
-                continue;
             Row row{{protocol, text(c, "local_address"), text(c, "local_port"), text(c, "remote_address"),
                      text(c, "remote_port"), state, text(c, "pid"), text(c, "process"), text(c, "inode")},
                     c,
-                    c.dump()};
-            if (matches(row, query))
-                rows.push_back(std::move(row));
+                    Json::array({c.value("protocol", ""), c.value("inode", 0ull), c.value("pid", 0),
+                                 c.value("start_ticks", 0ull), c.value("local_address", ""),
+                                 c.value("local_port", 0), c.value("remote_address", ""),
+                                 c.value("remote_port", 0)}).dump()};
+            rows.push_back(std::move(row));
         }
-        v.connections.replace(std::move(rows));
+        v.connections.replace(std::move(rows), [query, onlyListeners](const Row &row) {
+            const auto protocol = text(row.data, "protocol"), state = text(row.data, "state");
+            const bool listening = state == L"LISTEN" || state == L"LISTENING" ||
+                (protocol.find(L"udp") != std::wstring::npos && row.data.value("remote_port", 0) == 0);
+            return (!onlyListeners || listening) && matches(row, query);
+        }, !v.sockets.value("connections_truncated", false) && v.sockets.value("inaccessible_processes", 0) == 0);
     }
     else if (v.page == 2 && v.units.contains("services"))
     {
@@ -159,10 +161,10 @@ void render(View &v)
                      text(s, "description")},
                     s,
                     s.value("name", "")};
-            if (matches(row, query))
-                rows.push_back(std::move(row));
+            rows.push_back(std::move(row));
         }
-        v.services.replace(std::move(rows));
+        v.services.replace(std::move(rows), [query](const Row &row) { return matches(row, query); },
+                           v.units.value("available", true));
     }
     updateButtons(v);
 }

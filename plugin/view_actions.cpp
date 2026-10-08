@@ -5,7 +5,7 @@ namespace wsl::ui
 {
 void inspect(View &v)
 {
-    const Row *row = v.table().selected();
+    const Row *row = v.table().selectedActionable();
     if (!row)
         return;
     if (v.page == 0)
@@ -68,6 +68,8 @@ void action(View &v, int id)
         copyText(v.window, text(row.data, "command"));
         return;
     }
+    if (row.removed)
+        return;
     if (id == OpenExecutable)
     {
         openLinuxPath(v.window, v.selectedDistro, text(row.data, "exe"));
@@ -208,6 +210,11 @@ void menu(View &v, POINT point)
         AppendMenuW(popup, MF_STRING, EnableService, L"Enable at boot");
         AppendMenuW(popup, MF_STRING, DisableService, L"Disable at boot");
     }
+    if (!v.table().selectedActionable())
+        for (int id : {Inspect, OpenExecutable, Terminate, Kill, Suspend, Resume, Hangup, WindowChanged,
+                       User1, User2, StartService, StopService, RestartService, ReloadService,
+                       EnableService, DisableService, GoToProcess})
+            EnableMenuItem(popup, id, MF_BYCOMMAND | MF_GRAYED);
     int chosen =
         TrackPopupMenu(popup, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, v.window, nullptr);
     DestroyMenu(popup);

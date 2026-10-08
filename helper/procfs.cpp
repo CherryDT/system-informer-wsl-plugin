@@ -74,10 +74,12 @@ Json process_json(const ProcessStat& stat, const std::map<uid_t, std::string>& u
     std::replace(command.begin(), command.end(), '\0', ' ');
     if (!command.empty() && command.back() == ' ') command.pop_back();
     const auto io = read_text(proc_path(stat.pid, "io"));
+    const auto cgroup = read_text(proc_path(stat.pid, "cgroup"), 4096);
     const auto executable = read_link(proc_path(stat.pid, "exe"));
     return {{"pid", stat.pid}, {"ppid", stat.ppid}, {"start_ticks", stat.start_ticks},
             {"name", stat.name}, {"state", stat.state}, {"user", user},
-            {"status_accessible", !status.empty()},
+            {"status_accessible", !status.empty()}, {"tracer_pid", field_value(status, "TracerPid:")},
+            {"is_service", cgroup.find("/system.slice/") != std::string::npos && cgroup.find(".service") != std::string::npos},
             {"uid", uid}, {"threads", stat.threads}, {"cpu_ticks", stat.cpu_ticks},
             {"rss_bytes", stat.rss_bytes}, {"virtual_bytes", stat.virtual_bytes},
             {"read_bytes", field_value(io, "read_bytes:")},

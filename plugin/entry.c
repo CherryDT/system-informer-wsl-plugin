@@ -18,6 +18,7 @@ extern INT_PTR CALLBACK WslOptionsDialogProc(HWND window, UINT message, WPARAM w
 static HINSTANCE PluginModule;
 static PH_CALLBACK_REGISTRATION MainWindowRegistration;
 static PH_CALLBACK_REGISTRATION UnloadRegistration;
+static PH_CALLBACK_REGISTRATION SettingsUpdatedRegistration;
 static PH_CALLBACK_REGISTRATION OptionsRegistration;
 static PH_CALLBACK_REGISTRATION PluginOptionsRegistration;
 static HWND ViewWindow;
@@ -45,6 +46,23 @@ static VOID NTAPI ShowPluginOptions(PVOID parameter, PVOID context)
 {
     UNREFERENCED_PARAMETER(context);
     WslOpenHostOptions((HWND)parameter);
+}
+
+static BOOL CALLBACK InvalidateInspector(HWND window, LPARAM parameter)
+{
+    WCHAR name[64];
+    UNREFERENCED_PARAMETER(parameter);
+    if (GetClassNameW(window, name, RTL_NUMBER_OF(name)) && wcscmp(name, L"WslTools.Inspector") == 0)
+        RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    return TRUE;
+}
+
+static VOID NTAPI HostSettingsUpdated(PVOID parameter, PVOID context)
+{
+    UNREFERENCED_PARAMETER(parameter);
+    UNREFERENCED_PARAMETER(context);
+    if (ViewWindow) RedrawWindow(ViewWindow, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    EnumThreadWindows(GetCurrentThreadId(), InvalidateInspector, 0);
 }
 
 DWORD WslHostIntegerSetting(PCWSTR name)
@@ -318,6 +336,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
         L"Processes, connections, open files, modules and systemd services for WSL 2. MIT licensed.";
     information->HasOptions = TRUE;
 
+    PhRegisterCallback(PhGetGeneralCallback(GeneralCallbackSettingsUpdated), HostSettingsUpdated, NULL,
+                       &SettingsUpdatedRegistration);
     PhRegisterCallback(PhGetGeneralCallback(GeneralCallbackMainWindowShowing), MainWindowShowing, NULL,
                        &MainWindowRegistration);
     PhRegisterCallback(PhGetPluginCallback(plugin, PluginCallbackUnload), PluginUnloading, NULL,

@@ -72,10 +72,25 @@ struct Row
     std::vector<std::wstring> cells;
     Json data;
     std::string key;
+    // Removed rows remain copyable until the host highlighting period expires.
+    bool removed = false;
+    ULONGLONG highlightedSince = 0;
 };
 class Table
 {
   public:
+    enum class Kind
+    {
+        Generic,
+        Processes,
+        Services,
+        Network,
+        Threads,
+        Modules,
+        Memory,
+        Handles
+    };
+    Kind kind = Kind::Generic;
     HWND window = nullptr;
     std::vector<Row> rows;
     std::vector<Column> columns;
@@ -85,17 +100,28 @@ class Table
                 bool defaultDescending = false);
     void saveLayout() const;
     void setAncestryOrder(bool enabled);
-    void replace(std::vector<Row> next);
+    // Always pass the complete snapshot. Filtering must not look like removal.
+    // The predicate is retained for expiry redraws; capture local values by value.
+    // Incomplete collections cannot establish that an absent object exited.
+    void replace(std::vector<Row> next, std::function<bool(const Row &)> filter = {}, bool complete = true);
+    void clear();
+    void expireHighlights();
     void sort(int column);
     bool notify(NMHDR *hdr);
     LRESULT customDraw(NMLVCUSTOMDRAW *draw) const;
     const Row *selected() const;
+    const Row *selectedActionable() const;
     void selectKey(const std::string &key);
     std::wstring exportText() const;
 
   private:
     std::wstring settingsPrefix;
     bool ancestryOrder = false;
+    bool initialized = false;
+    std::vector<Row> source;
+    std::function<bool(const Row &)> filter;
+    void present();
+    void refreshTimer();
     void order();
 };
 } // namespace wsl

@@ -1,5 +1,7 @@
 #include "common.hpp"
 #include "settings.hpp"
+#include "host_bridge.h"
+#include <unordered_map>
 #include <algorithm>
 #include <commdlg.h>
 #include <iomanip>
@@ -154,6 +156,7 @@ void drainReplies(HWND window)
 namespace
 {
 constexpr UINT SaveTableLayout = WM_APP + 82;
+constexpr UINT_PTR HighlightTimer = 0x57534c;
 LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR id,
                                  DWORD_PTR context)
 {
@@ -161,6 +164,11 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
     if (message == SaveTableLayout)
     {
         table->saveLayout();
+        return 0;
+    }
+    if (message == WM_TIMER && wparam == HighlightTimer)
+    {
+        table->expireHighlights();
         return 0;
     }
     if (message == WM_NOTIFY)
@@ -174,7 +182,10 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
         return result;
     }
     if (message == WM_DESTROY)
+    {
+        KillTimer(window, HighlightTimer);
         table->saveLayout();
+    }
     if (message == WM_NCDESTROY)
         RemoveWindowSubclass(window, tableLayoutProc, id);
     return DefSubclassProc(window, message, wparam, lparam);
@@ -255,6 +266,11 @@ const Row *Table::selected() const
     int index = ListView_GetNextItem(window, -1, LVNI_SELECTED);
     return index >= 0 && static_cast<size_t>(index) < rows.size() ? &rows[index] : nullptr;
 }
+const Row *Table::selectedActionable() const
+{
+    const auto row = selected();
+    return row && !row->removed ? row : nullptr;
+}
 void Table::selectKey(const std::string &key)
 {
     const int current = ListView_GetNextItem(window, -1, LVNI_SELECTED);
@@ -296,8 +312,103 @@ void Table::order()
         return descending ? comparison > 0 : comparison < 0;
     });
 }
-void Table::replace(std::vector<Row> next)
+void Table::replace(std::vector<Row> next, std::function<bool(const Row &)> predicate, bool complete)
 {
+    const auto now = GetTickCount64();
+    const auto duration = WslHostIntegerSetting(L"HighlightingDuration");
+    std::unordered_map<std::string, size_t> previous;
+    for (size_t i = 0; i < source.size(); ++i)
+        previous.emplace(source[i].key, i);
+
+    for (auto &row : next)
+    {
+        row.removed = false;
+        row.highlightedSince = 0;
+        auto found = previous.find(row.key);
+        if (found != previous.end() && !source[found->second].removed)
+        {
+            const auto started = source[found->second].highlightedSince;
+            if (started && now - started < duration)
+                row.highlightedSince = started;
+        }
+        else if (initialized && duration)
+            row.highlightedSince = now;
+        if (found != previous.end())
+            previous.erase(found);
+    }
+    // Retain removed objects in their last known state. Their identity is never
+    // handed to actions, although users can still copy and export these rows.
+    for (auto &old : source)
+    {
+        if (!previous.count(old.key))
+            continue;
+        if (!complete && !old.removed)
+        {
+            // A truncated or inaccessible collection says nothing about absent
+            // objects. Keep their last known values until collection succeeds.
+            if (old.highlightedSince && now - old.highlightedSince >= duration)
+                old.highlightedSince = 0;
+            next.push_back(std::move(old));
+            continue;
+        }
+        if (!duration)
+            continue;
+        if (!old.removed)
+        {
+            old.removed = true;
+            old.highlightedSince = now;
+        }
+        if (now - old.highlightedSince < duration)
+            next.push_back(std::move(old));
+    }
+    initialized = true;
+    source = std::move(next);
+    filter = std::move(predicate);
+    present();
+    refreshTimer();
+}
+void Table::clear()
+{
+    initialized = false;
+    source.clear();
+    filter = {};
+    present();
+    KillTimer(window, HighlightTimer);
+}
+void Table::refreshTimer()
+{
+    const bool pending =
+        std::any_of(source.begin(), source.end(), [](const Row &row) { return row.highlightedSince != 0; });
+    if (pending)
+        SetTimer(window, HighlightTimer, 100, nullptr);
+    else
+        KillTimer(window, HighlightTimer);
+}
+void Table::expireHighlights()
+{
+    const auto now = GetTickCount64();
+    const auto duration = WslHostIntegerSetting(L"HighlightingDuration");
+    bool changed = false;
+    source.erase(std::remove_if(source.begin(), source.end(),
+                                [&](Row &row) {
+                                    if (!row.highlightedSince || now - row.highlightedSince < duration)
+                                        return false;
+                                    changed = true;
+                                    row.highlightedSince = 0;
+                                    return row.removed;
+                                }),
+                 source.end());
+    if (changed)
+        present();
+    refreshTimer();
+}
+void Table::present()
+{
+    std::vector<Row> next;
+    next.reserve(source.size());
+    for (const auto &row : source)
+        if (!filter || filter(row))
+            next.push_back(row);
     const std::string selectedKey = selected() ? selected()->key : "";
     auto previous = std::move(rows);
     rows = std::move(next);
@@ -321,7 +432,9 @@ void Table::replace(std::vector<Row> next)
     {
         const auto index = static_cast<size_t>(i);
         if (index >= previous.size() || previous[index].key != rows[index].key ||
-            previous[index].cells != rows[index].cells)
+            previous[index].cells != rows[index].cells || previous[index].removed != rows[index].removed ||
+            previous[index].highlightedSince != rows[index].highlightedSince ||
+            previous[index].data != rows[index].data)
             ListView_RedrawItems(window, i, i);
     }
     // Clear a vacated tail once when processes exit; unchanged snapshots never
@@ -399,32 +512,76 @@ LRESULT Table::customDraw(NMLVCUSTOMDRAW *draw) const
     if (ListView_GetItemState(window, static_cast<int>(draw->nmcd.dwItemSpec), LVIS_SELECTED) & LVIS_SELECTED)
         return CDRF_DODEFAULT;
 
-    const auto &item = rows[draw->nmcd.dwItemSpec].data;
-    const bool dark = WslIsDarkTheme() != FALSE;
+    const auto &row = rows[draw->nmcd.dwItemSpec];
+    const auto &item = row.data;
     COLORREF background = CLR_NONE;
-    COLORREF foreground = dark ? RGB(235, 235, 235) : RGB(30, 30, 30);
+    COLORREF foreground = CLR_NONE;
     const auto state = item.value("state", std::string{});
     const auto active = item.value("active", std::string{});
+    auto enabled = [](PCWSTR setting) { return WslHostIntegerSetting(setting) != 0; };
+    auto color = [](PCWSTR setting) { return static_cast<COLORREF>(WslHostIntegerSetting(setting)); };
 
-    // Use semantic states, not alternating decoration. Selection remains owned
-    // by the native list control so focus and contrast stay consistent.
-    if (state == "Z" || state == "X" || active == "failed" ||
-        item.value("permissions", std::string{}).find("rwx") != std::string::npos)
-        background = dark ? RGB(78, 42, 43) : RGB(255, 224, 225);
-    else if (state == "T" || state == "t" || item.value("enabled", std::string{}).find("masked") == 0)
-        background = dark ? RGB(77, 65, 36) : RGB(255, 244, 208);
-    else if (active == "active")
-        background = dark ? RGB(35, 65, 49) : RGB(228, 247, 234);
-    else if (state == "LISTEN" || state == "LISTENING")
-        background = dark ? RGB(34, 58, 78) : RGB(225, 241, 255);
-    else if (item.contains("uid") && item["uid"].is_number() && item["uid"] == 0)
-        background = dark ? RGB(59, 47, 73) : RGB(242, 231, 253);
-    else if (active == "inactive")
-        foreground = dark ? RGB(165, 165, 165) : RGB(105, 105, 105);
+    // Temporary lifecycle colors have priority over semantic colors, matching
+    // TreeNew's temporary background behavior. All colors come from the host.
+    if (row.highlightedSince)
+        background = color(row.removed ? L"ColorRemoved" : L"ColorNew");
+    else if (kind == Kind::Processes || (kind == Kind::Generic && item.contains("uid")))
+    {
+        // Keep the native process priority: debugged, suspended, elevated,
+        // then service. Do not guess Windows-only properties from Linux names.
+        if (item.value("tracer_pid", 0) != 0 && enabled(L"UseColorDebuggedProcesses"))
+            background = color(L"ColorDebuggedProcesses");
+        else if ((state == "T" || state == "t") && enabled(L"UseColorSuspended"))
+            background = color(L"ColorSuspended");
+        else if (item.contains("uid") && item["uid"].is_number() && item["uid"] == 0 &&
+                 enabled(L"UseColorElevatedProcesses"))
+            background = color(L"ColorElevatedProcesses");
+        else if (item.value("is_service", false) && enabled(L"UseColorServiceProcesses"))
+            background = color(L"ColorServiceProcesses");
+    }
+    else if (kind == Kind::Services || (kind == Kind::Generic && item.contains("active")))
+    {
+        const bool stopped = active == "inactive" || active == "failed";
+        const auto unitState = item.value("enabled", std::string{});
+        if (stopped && (unitState == "disabled" || unitState.find("masked") == 0) &&
+            enabled(L"UseColorServiceDisabled"))
+            background = color(L"ColorServiceDisabled");
+        else if (stopped && enabled(L"UseColorServiceStop"))
+            foreground = color(L"ColorServiceStop");
+    }
+    else if (kind == Kind::Threads || (kind == Kind::Generic && item.contains("tid")))
+    {
+        if ((state == "T" || state == "t") && enabled(L"UseColorThreadSuspended"))
+            background = color(L"ColorThreadSuspended");
+    }
+    else if (kind == Kind::Memory)
+    {
+        const auto permissions = item.value("permissions", std::string{});
+        const auto path = item.value("path", std::string{});
+        if (permissions.find('x') != std::string::npos && enabled(L"UseColorMemoryExecutePages"))
+            background = color(L"ColorMemoryExecutePages");
+        else if (permissions.find('p') != std::string::npos && (path.empty() || path.front() == '[') &&
+                 enabled(L"UseColorMemoryPrivatePages"))
+            background = color(L"ColorMemoryPrivatePages");
+    }
+    else if (kind == Kind::Network || (kind == Kind::Generic && item.contains("protocol")))
+    {
+        if (item.value("pid", 0) == 0 && enabled(L"UseColorNetworkUnknownProcess"))
+            background = color(L"ColorNetworkUnknownProcess");
+    }
 
     if (background != CLR_NONE)
+    {
         draw->clrTextBk = background;
-    draw->clrText = foreground;
+        // TreeNew uses this same brightness threshold for user-selected colors.
+        const auto brightness =
+            (std::min({GetRValue(background), GetGValue(background), GetBValue(background)}) +
+             std::max({GetRValue(background), GetGValue(background), GetBValue(background)})) /
+            2;
+        foreground = brightness > 100 ? RGB(0, 0, 0) : RGB(255, 255, 255);
+    }
+    if (foreground != CLR_NONE)
+        draw->clrText = foreground;
     return CDRF_NEWFONT;
 }
 
