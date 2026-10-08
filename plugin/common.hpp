@@ -31,6 +31,7 @@ struct Reply
     Json data;
     std::string error;
     uintptr_t tag = 0;
+    bool componentMissing = false;
 };
 // A closed window detaches its mailbox. The controller owns no UI objects.
 struct Mailbox

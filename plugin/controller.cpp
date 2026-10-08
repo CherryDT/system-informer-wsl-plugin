@@ -25,6 +25,7 @@ std::condition_variable ready;
 std::deque<Job> jobs;
 std::thread worker;
 bool stopping = true;
+std::atomic<bool> cancellationRequested{true};
 // Accessed under queueMutex. Shared ownership keeps cancellation safe while
 // the worker finishes a request or removes a disconnected client from its map.
 std::shared_ptr<Client> activeClient;
@@ -71,10 +72,13 @@ void run() {
         try {
             if (operation == "discover") {
                 reply->data = Json::array();
-                for (const auto& distro : runningDistros())
+                for (const auto& distro : runningDistros([] { return cancellationRequested.load(); }))
                     reply->data.push_back(utf8(distro.name));
             } else {
                 auto& client = clients[job.distro];
+                // Installation is the explicit action that may replace a
+                // terminal missing-component connection with a fresh one.
+                if (operation == "install_component") client.reset();
                 if (!client) client = std::make_shared<Client>(job.distro, helperPath());
                 {
                     std::lock_guard<std::mutex> lock(queueMutex);
@@ -83,8 +87,12 @@ void run() {
                 }
                 const auto timeout = operation == "service_details" || operation == "service_action" || operation == "stacks"
                     ? std::chrono::seconds(35) : std::chrono::seconds(20);
-                reply->data = client->request(job.request, timeout);
+                reply->data = operation == "install_component"
+                    ? client->installComponent() : client->request(job.request, timeout);
             }
+        } catch (const ComponentMissing& error) {
+            reply->componentMissing = true;
+            reply->error = error.what();
         } catch (const std::exception& error) {
             reply->error = error.what();
             // A valid remote error leaves the connection usable. A transport
@@ -112,10 +120,12 @@ void startController() {
     std::lock_guard<std::mutex> lock(queueMutex);
     if (worker.joinable()) return;
     stopping = false;
+    cancellationRequested = false;
     try {
         worker = std::thread(run);
     } catch (...) {
         stopping = true;
+        cancellationRequested = true;
         throw;
     }
 }
@@ -162,6 +172,7 @@ void stopController() {
     {
         std::lock_guard<std::mutex> lock(queueMutex);
         stopping = true;
+        cancellationRequested = true;
         jobs.clear();
         if (activeClient) activeClient->close();
     }

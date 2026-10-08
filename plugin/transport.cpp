@@ -4,6 +4,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <atomic>
@@ -116,13 +117,15 @@ struct Process {
     std::string pending;
 
     ~Process() {
-        // Closing stdin lets a healthy helper exit and remove its private file.
+        // Closing stdin lets a healthy helper exit and an unfinished installer
+        // remove its temporary upload; the installed component is retained.
         input.reset();
-        if (process && WaitForSingleObject(process.get(), 300) == WAIT_TIMEOUT) {
+        if (process && WaitForSingleObject(process.get(), 100) == WAIT_TIMEOUT) {
             // Only our wsl.exe launcher is terminated. Never use --terminate or
             // --shutdown: other sessions and the distro must remain untouched.
             TerminateProcess(process.get(), ERROR_CANCELLED);
-            WaitForSingleObject(process.get(), 300);
+            // TerminateProcess is asynchronous. Releasing our handle does not
+            // require waiting for WSL or its service to acknowledge the exit.
         }
     }
 
@@ -255,12 +258,13 @@ std::unique_ptr<Process> launch(const std::vector<std::wstring>& arguments) {
     return result;
 }
 
-std::string runDiscovery() {
+std::string runDiscovery(const std::function<bool()>& cancelled) {
     auto process = launch({L"--list", L"--running", L"--quiet"});
     process->input.reset();
     std::string result;
     const auto deadline = Clock::now() + std::chrono::seconds(10);
     for (;;) {
+        if (cancelled && cancelled()) throw std::runtime_error("WSL discovery cancelled.");
         process->check(nullptr, deadline);
         DWORD available = 0;
         const BOOL open = PeekNamedPipe(process->output.get(), nullptr, 0, nullptr, &available, nullptr);
@@ -343,6 +347,93 @@ std::string readHelper(const std::wstring& path) {
     return bytes;
 }
 
+std::string sha256(const std::string& bytes) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0)
+        throw std::runtime_error("Windows could not initialize SHA256 for the WSL component.");
+    struct AlgorithmGuard {
+        BCRYPT_ALG_HANDLE handle;
+        ~AlgorithmGuard() { BCryptCloseAlgorithmProvider(handle, 0); }
+    } guard{algorithm};
+    unsigned char digest[32];
+    if (BCryptHash(algorithm, nullptr, 0,
+        reinterpret_cast<PUCHAR>(const_cast<char*>(bytes.data())), static_cast<ULONG>(bytes.size()),
+        digest, sizeof(digest)) < 0)
+        throw std::runtime_error("Windows could not hash the packaged WSL component.");
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(64);
+    for (const auto byte : digest) {
+        result.push_back(hex[byte >> 4]);
+        result.push_back(hex[byte & 15]);
+    }
+    return result;
+}
+
+std::string componentBootstrap(std::size_t size, const std::string& digest, bool allowInstall) {
+    // Only a decimal length, our computed hexadecimal SHA256 and a boolean are
+    // inserted into this script. Distro names and user input never enter it.
+    // Every parent is checked before trusting the persistent executable; root
+    // ownership alone is insufficient if another account can replace a parent.
+    return "expected=" + digest + "; count=" + std::to_string(size) +
+        "; allow_install=" + (allowInstall ? "1" : "0") + R"SH(
+set -eu
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+dir=/usr/local/lib/system-informer-wsl
+target=$dir/wsl-observer
+fail() { printf '%s\n' "$1" >&2; exit 1; }
+missing() { printf '{"bootstrap":"missing"}\n'; exit 0; }
+safe_owner_mode() {
+    [ "$(stat -c %u -- "$1")" = 0 ] || fail "WSL component path is not owned by root: $1"
+    mode=$(stat -c %a -- "$1")
+    [ "$((0$mode & 022))" -eq 0 ] || fail "WSL component path is writable by another account: $1"
+}
+[ "$(id -u)" = 0 ] || fail 'The WSL component must run as root.'
+for parent in / /usr /usr/local /usr/local/lib "$dir"; do
+    [ ! -L "$parent" ] || fail "WSL component parent must not be a symlink: $parent"
+    if [ ! -e "$parent" ]; then
+        [ "$allow_install" = 1 ] || missing
+        mkdir -m 755 -- "$parent"
+    fi
+    [ -d "$parent" ] || fail "WSL component parent is not a directory: $parent"
+    safe_owner_mode "$parent"
+done
+[ ! -L "$target" ] || fail 'The installed WSL component must not be a symlink.'
+if [ -e "$target" ]; then
+    [ -f "$target" ] || fail 'The installed WSL component is not a regular file.'
+    safe_owner_mode "$target"
+    [ "$(stat -c %h -- "$target")" = 1 ] || fail 'The installed WSL component must not have hard links.'
+    actual=$(sha256sum -- "$target")
+    actual=${actual%% *}
+else
+    [ "$allow_install" = 1 ] || missing
+    actual=
+fi
+if [ "$actual" != "$expected" ]; then
+    temporary=$(mktemp "$dir/.observer.XXXXXX")
+    trap 'rm -f -- "$temporary"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf '{"bootstrap":"upload"}\n'
+    head -c "$count" > "$temporary"
+    [ "$(wc -c < "$temporary")" -eq "$count" ] || fail 'The WSL component upload was incomplete.'
+    actual=$(sha256sum -- "$temporary")
+    actual=${actual%% *}
+    [ "$actual" = "$expected" ] || fail 'The WSL component upload failed SHA256 verification.'
+    chown 0:0 -- "$temporary"
+    chmod 700 -- "$temporary"
+    mv -fT -- "$temporary" "$target"
+    trap - EXIT HUP INT TERM
+fi
+[ -x "$target" ] || fail 'The installed WSL component is not executable.'
+printf '{"bootstrap":"ready"}\n'
+exec "$target"
+)SH";
+}
+
 } // namespace
 
 std::string utf8(const std::wstring& value) {
@@ -358,11 +449,13 @@ std::string utf8(const std::wstring& value) {
 
 std::wstring wide(const std::string& value) {
     if (value.empty()) return {};
-    const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+    // Diagnostics from a failed wsl.exe need not be valid UTF-8. Replace bad
+    // sequences for display instead of throwing from a window error handler.
+    const int length = MultiByteToWideChar(CP_UTF8, 0, value.data(),
         static_cast<int>(value.size()), nullptr, 0);
     if (!length) throw std::runtime_error("Invalid UTF-8 text.");
     std::wstring result(length, L'\0');
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), result.data(), length);
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), length);
     return result;
 }
 
@@ -385,9 +478,10 @@ std::wstring quoteArg(const std::wstring& value) {
     return result;
 }
 
-std::vector<Distro> runningDistros() {
+std::vector<Distro> runningDistros(const std::function<bool()>& cancelled) {
+    if (cancelled && cancelled()) throw std::runtime_error("WSL discovery cancelled.");
     const auto registered = registeredWsl2Distros();
-    const auto list = decodeList(runDiscovery());
+    const auto list = decodeList(runDiscovery(cancelled));
     std::vector<Distro> result;
     std::size_t start = 0;
     while (start < list.size()) {
@@ -411,6 +505,7 @@ struct Client::Impl {
     std::unique_ptr<Process> process;
     std::uint64_t nextId = 1;
     bool failed = false;
+    bool componentMissing = false;
 
     Impl(std::wstring name, std::wstring path) : distro(std::move(name)), helperPath(std::move(path)) {
         if (!cancellation) throw winError("Create cancellation event");
@@ -433,32 +528,40 @@ struct Client::Impl {
         return response.at("data");
     }
 
-    void connect() {
+    Json connect(bool allowInstall = false) {
         if (WaitForSingleObject(cancellation.get(), 0) == WAIT_OBJECT_0)
             throw std::runtime_error("WSL connection cancelled.");
         // Verify immediately before launch. WSL has no public atomic 'attach only'
         // launch; a distribution stopping between this check and launch is a
         // documented platform race. Failed clients are never restarted here.
-        const auto running = runningDistros();
+        const auto running = runningDistros([this] {
+            return WaitForSingleObject(cancellation.get(), 0) == WAIT_OBJECT_0;
+        });
         if (WaitForSingleObject(cancellation.get(), 0) == WAIT_OBJECT_0)
             throw std::runtime_error("WSL connection cancelled.");
         if (std::none_of(running.begin(), running.end(), [&](const Distro& item) {
             return CompareStringOrdinal(item.name.c_str(), -1, distro.c_str(), -1, TRUE) == CSTR_EQUAL;
         })) throw std::runtime_error("This WSL2 distribution is no longer running.");
         const auto helper = readHelper(helperPath);
-        const auto deadline = Clock::now() + std::chrono::seconds(20);
-        const std::string script = "set -eu; umask 077; d=$(mktemp -d /tmp/system-informer-wsl.XXXXXX); "
-            "trap 'rm -rf -- \"$d\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; "
-            "head -c " + std::to_string(helper.size()) + " > \"$d/observer\"; "
-            "[ \"$(wc -c < \"$d/observer\")\" -eq " + std::to_string(helper.size()) + " ]; "
-            "chmod 700 \"$d/observer\"; \"$d/observer\"";
+        const auto digest = sha256(helper);
+        const auto deadline = Clock::now() + std::chrono::seconds(30);
+        const auto script = componentBootstrap(helper.size(), digest, allowInstall);
         if (WaitForSingleObject(cancellation.get(), 0) == WAIT_OBJECT_0)
             throw std::runtime_error("WSL connection cancelled.");
         process = launch({L"--distribution", distro, L"--user", L"root", L"--exec", L"/bin/sh", L"-c", wide(script)});
-        process->write(helper.data(), helper.size(), cancellation.get(), deadline);
+        auto bootstrap = Json::parse(process->readLine(cancellation.get(), deadline));
+        auto state = bootstrap.value("bootstrap", "");
+        if (state == "missing") throw ComponentMissing();
+        if (state == "upload") {
+            process->write(helper.data(), helper.size(), cancellation.get(), deadline);
+            bootstrap = Json::parse(process->readLine(cancellation.get(), deadline));
+            state = bootstrap.value("bootstrap", "");
+        }
+        if (state != "ready") throw std::runtime_error("Unexpected WSL component installation response.");
         const auto hello = exchange(Json{{"op", "hello"}}, deadline);
         if (hello.value("protocol", 0) != 1)
             throw std::runtime_error("Unsupported WSL helper protocol. Reinstall matching plugin and helper files.");
+        return hello;
     }
 };
 
@@ -469,13 +572,31 @@ Client::~Client() { close(); }
 
 void Client::close() noexcept { SetEvent(impl_->cancellation.get()); }
 
+Json Client::installComponent() {
+    if (impl_->failed) throw std::runtime_error("Create a fresh connection before installing the WSL component.");
+    try {
+        if (impl_->process) return impl_->exchange(Json{{"op", "hello"}}, Clock::now() + std::chrono::seconds(20));
+        return impl_->connect(true);
+    } catch (...) {
+        impl_->failed = true;
+        impl_->process.reset();
+        throw;
+    }
+}
+
 Json Client::request(const Json& payload, std::chrono::milliseconds timeout) {
+    if (impl_->componentMissing) throw ComponentMissing();
     if (impl_->failed) throw std::runtime_error("The WSL connection is closed. Reconnect to try again.");
     if (!payload.is_object() || !payload.contains("op") || !payload["op"].is_string())
         throw std::invalid_argument("A WSL request must contain a string op field.");
     if (!impl_->process) {
         try {
             impl_->connect();
+        } catch (const ComponentMissing&) {
+            impl_->componentMissing = true;
+            impl_->failed = true;
+            impl_->process.reset();
+            throw;
         } catch (...) {
             impl_->failed = true;
             impl_->process.reset();

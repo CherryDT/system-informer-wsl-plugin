@@ -18,6 +18,6 @@ target_compile_definitions(WslTools PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN
 target_compile_options(WslTools PRIVATE /W4 /Zi /utf-8 $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
 target_include_directories(WslTools SYSTEM PRIVATE "${SYSTEM_INFORMER_SDK}/include" "${CMAKE_SOURCE_DIR}/vendor")
 target_link_libraries(WslTools PRIVATE "${SYSTEM_INFORMER_SDK}/lib/SystemInformer.lib"
-    ntdll comctl32 uxtheme shell32 shlwapi advapi32 ole32 user32 gdi32 comdlg32)
+    ntdll comctl32 uxtheme shell32 shlwapi advapi32 bcrypt ole32 user32 gdi32 comdlg32)
 target_link_options(WslTools PRIVATE /DEBUG:FULL /OPT:REF /OPT:ICF)
 set_target_properties(WslTools PROPERTIES PREFIX "" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dist")

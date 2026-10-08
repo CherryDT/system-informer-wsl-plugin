@@ -1,6 +1,8 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
+#include <stdexcept>
 #include <memory>
 #include <string>
 #include <vector>
@@ -20,7 +22,13 @@ struct Distro {
 };
 
 // Lists already-running WSL2 distributions. Discovery never launches a distro.
-std::vector<Distro> runningDistros();
+std::vector<Distro> runningDistros(const std::function<bool()>& cancelled = {});
+
+class ComponentMissing : public std::runtime_error {
+public:
+    ComponentMissing() : std::runtime_error(
+        "The WSL component is not installed in this distribution. Choose Install and retry to install it.") {}
+};
 
 class Client {
 public:
@@ -33,6 +41,10 @@ public:
     // client only after the user explicitly reconnects or discovery sees it again.
     Json request(const Json& payload,
         std::chrono::milliseconds timeout = std::chrono::seconds(20));
+
+    // Explicit user-authorized first installation. Existing installations are
+    // updated automatically on connection when the packaged SHA256 changes.
+    Json installComponent();
 
     // Thread-safe cancellation. The worker releases pipes and its launcher when
     // it observes cancellation; this does not shut down WSL or the distribution.

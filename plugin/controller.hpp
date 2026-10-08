@@ -6,6 +6,7 @@ constexpr uintptr_t SnapshotTag = 2;
 constexpr uintptr_t ConnectionsTag = 3;
 constexpr uintptr_t ServicesTag = 4;
 constexpr uintptr_t ActionTag = 5;
+constexpr uintptr_t InstallTag = 6;
 void startController();
 void stopController();
 void disconnect(const std::wstring& distro);
