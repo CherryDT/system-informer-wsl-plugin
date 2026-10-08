@@ -17,6 +17,7 @@ constexpr int StacksPage = ConnectionsPage + 1;
 constexpr int RawPage = StacksPage + 1;
 constexpr int RuntimeStacksPage = RawPage + 1;
 constexpr int MemoryPage = RuntimeStacksPage + 1;
+constexpr int JournalPage = MemoryPage + 1;
 constexpr size_t MemoryTable = ConnectionsTable + 1;
 constexpr size_t TableCount = MemoryTable + 1;
 // Keep model indices stable while presenting the available native property pages
@@ -58,7 +59,8 @@ enum ControlId
     StackText,
     CaptureStack,
     RuntimeStackText,
-    Memory
+    Memory,
+    JournalText
 };
 
 struct OverviewField
@@ -81,7 +83,7 @@ struct Inspector
     std::wstring tooltipText;
     bool statusVisible = false;
     HWND lastOverviewEdit = nullptr;
-    HWND stacks = nullptr, runtimeStacks = nullptr, captureStack = nullptr;
+    HWND stacks = nullptr, runtimeStacks = nullptr, journal = nullptr, captureStack = nullptr;
     HFONT uiFont = nullptr, rawFont = nullptr;
     int overviewScroll = 0;
     bool overviewLayoutActive = false;
@@ -134,15 +136,11 @@ COLORREF pageBackground()
 
 int pageFromTab(const Inspector &state, int index)
 {
-    if (state.isService)
-        return index == 1 ? 1 : 0;
     return index >= 0 && static_cast<size_t>(index) < state.pages.size() ? state.pages[index] : 0;
 }
 
 int tabFromPage(const Inspector &state, int page)
 {
-    if (state.isService)
-        return page == 1 ? 1 : 0;
     auto position = std::find(state.pages.begin(), state.pages.end(), page);
     return position == state.pages.end() ? 0 : static_cast<int>(position - state.pages.begin());
 }
@@ -186,6 +184,8 @@ const wchar_t *runtimeExportName(const Inspector &state)
 
 HWND activeTextControl(const Inspector &state)
 {
+    if (state.isService && state.page == JournalPage)
+        return state.journal;
     if (!state.isService && state.page == RuntimeStacksPage)
         return state.runtimeStacks;
     if (!state.isService && state.page == StacksPage)
@@ -516,6 +516,9 @@ void updateInspectorFonts(Inspector &state)
     if (state.runtimeStacks)
         SendMessageW(state.runtimeStacks, WM_SETFONT,
                      reinterpret_cast<WPARAM>(next ? next : GetStockObject(ANSI_FIXED_FONT)), TRUE);
+    if (state.journal)
+        SendMessageW(state.journal, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(next ? next : GetStockObject(ANSI_FIXED_FONT)), TRUE);
     if (state.rawFont)
         DeleteObject(state.rawFont);
     state.rawFont = next;
@@ -807,6 +810,8 @@ void updateActions(Inspector &state)
         if (!state.tableNotices[index].empty())
             message += L" · " + state.tableNotices[index];
     }
+    if (message.empty() && state.isService && state.page == JournalPage)
+        message = L"Most recent 100 journal entries.";
     if (state.status)
     {
         SetWindowTextW(state.status, message.c_str());
@@ -834,7 +839,9 @@ void ensureConnections(Inspector &state)
 void showPage(Inspector &state)
 {
     ShowWindow(state.overview, state.page == 0 ? SW_SHOW : SW_HIDE);
-    ShowWindow(state.raw, state.page == (state.isService ? 1 : RawPage) ? SW_SHOW : SW_HIDE);
+    ShowWindow(state.raw, state.page == RawPage ? SW_SHOW : SW_HIDE);
+    if (state.journal)
+        ShowWindow(state.journal, state.page == JournalPage ? SW_SHOW : SW_HIDE);
     ShowWindow(state.stacks, !state.isService && state.page == StacksPage ? SW_SHOW : SW_HIDE);
     ShowWindow(state.runtimeStacks, !state.isService && state.page == RuntimeStacksPage ? SW_SHOW : SW_HIDE);
     for (size_t i = 0; i < state.tables.size(); ++i)
@@ -936,6 +943,8 @@ void layout(Inspector &state)
     }
     place(state.overview, body.left, body.top, body.right - body.left, body.bottom - body.top);
     place(state.raw, body.left, body.top, body.right - body.left, body.bottom - body.top);
+    if (state.journal)
+        place(state.journal, body.left, body.top, body.right - body.left, body.bottom - body.top);
     if (state.stacks)
         place(state.stacks, body.left, body.top, body.right - body.left, body.bottom - body.top);
     if (state.runtimeStacks)
@@ -1152,10 +1161,11 @@ void command(Inspector &state, int id)
         break;
     case Save:
         saveText(state.window, allText(state),
-                 state.isService                   ? L"wsl-service.txt"
-                 : state.page == RuntimeStacksPage ? runtimeExportName(state)
-                 : state.page == StacksPage        ? L"wsl-stacks.txt"
-                                                   : L"wsl-process.txt");
+                 state.isService && state.page == JournalPage ? L"wsl-service-journal.txt"
+                 : state.isService                            ? L"wsl-service.txt"
+                 : state.page == RuntimeStacksPage            ? runtimeExportName(state)
+                 : state.page == StacksPage                   ? L"wsl-stacks.txt"
+                                                              : L"wsl-process.txt");
         break;
     case CopyPath: {
         std::wstring value = state.page == 0
@@ -1648,6 +1658,9 @@ void loadReply(Inspector &state, const Reply &reply)
             std::wstring content = cell(reply.data, "text");
             SetWindowTextW(state.raw, content.empty() ? L"No service details were returned."
                                                       : editText(content).c_str());
+            content = cell(reply.data, "journal");
+            SetWindowTextW(state.journal, content.empty() ? L"No journal entries were returned."
+                                                          : editText(content).c_str());
             state.hasData = true;
         }
         else
@@ -1685,7 +1698,7 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         int controlId = GetDlgCtrlID(window);
         if (ctrl && wParam == 'A' &&
             (controlId == RawDetails || controlId == StackText || controlId == RuntimeStackText ||
-             controlId == Filter || controlId >= OverviewValueBase))
+             controlId == JournalText || controlId == Filter || controlId >= OverviewValueBase))
         {
             SendMessageW(window, EM_SETSEL, 0, -1);
             return 0;
@@ -1948,7 +1961,10 @@ void migrateModuleLayout(Table &table, HWND owner)
 void createControls(Inspector &state)
 {
     HWND window = state.window;
-    state.pages.assign(ProcessPages.begin(), ProcessPages.end());
+    if (state.isService)
+        state.pages = {0, JournalPage, RawPage};
+    else
+        state.pages.assign(ProcessPages.begin(), ProcessPages.end());
     auto runtime = state.process.find("runtime");
     if (!state.isService && runtime != state.process.end() && runtime->is_string())
     {
@@ -1981,7 +1997,7 @@ void createControls(Inspector &state)
     }
     std::vector<std::wstring> names =
         state.isService
-            ? std::vector<std::wstring>{L"General", L"Details"}
+            ? std::vector<std::wstring>{L"General", L"Journal", L"Details"}
             : std::vector<std::wstring>{L"General", L"Threads", L"Modules", L"Memory", L"Environment",
                                         L"Handles", L"Network", L"Stacks",  L"Details"};
     if (!state.runtime.empty())
@@ -2004,6 +2020,14 @@ void createControls(Inspector &state)
                             ES_AUTOVSCROLL | ES_AUTOHSCROLL,
                         RawDetails);
     SendMessageW(state.raw, EM_SETLIMITTEXT, 16 * 1024 * 1024, 0);
+    if (state.isService)
+    {
+        state.journal = control(state.pageWindow, WC_EDITW, L"Loading…",
+                                WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | WS_CLIPSIBLINGS | ES_MULTILINE |
+                                    ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                                JournalText);
+        SendMessageW(state.journal, EM_SETLIMITTEXT, 16 * 1024 * 1024, 0);
+    }
     if (!state.isService)
     {
         state.stacks = control(state.pageWindow, WC_EDITW, nativeStackIntro(),

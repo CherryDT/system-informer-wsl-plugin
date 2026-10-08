@@ -373,7 +373,8 @@ Json service_details(const Json& request) {
     if (!systemd_available()) throw std::runtime_error("systemd is not running in this distribution");
     const auto properties = run_command({"systemctl", "show", "--no-pager", "--", name});
     checked_output(properties);
-    const auto status = run_command({"systemctl", "status", "--no-pager", "--full", "--", name});
+    // Keep journal history in its own response field and inspector page.
+    const auto status = run_command({"systemctl", "status", "--no-pager", "--full", "--lines=0", "--", name});
     const auto unit = run_command({"systemctl", "cat", "--no-pager", "--", name});
     const auto journal = run_command({"journalctl", "--unit=" + name, "--lines=100", "--no-pager", "--output=short-iso"});
     auto format = [](const CommandResult& result) {
@@ -404,7 +405,8 @@ Json service_details(const Json& request) {
     Json overview = Json::object();
     for (const auto& field : fields) overview[field.first] = property_values[field.second];
     if (overview["name"].get<std::string>().empty()) overview["name"] = name;
-    return {{"overview", overview}, {"text", "Status\n" + format(status) + "\nProperties\n" + format(properties) + "\nUnit files\n" + format(unit) + "\nRecent journal\n" + format(journal)}};
+    return {{"overview", overview}, {"journal", format(journal)},
+            {"text", "Status\n" + format(status) + "\nProperties\n" + format(properties) + "\nUnit files\n" + format(unit)}};
 }
 Json service_action(const Json& request) {
     const auto name = unit_name(request);
