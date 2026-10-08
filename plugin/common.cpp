@@ -6,6 +6,10 @@
 #include <commdlg.h>
 #include <iomanip>
 #include <sstream>
+#include <uxtheme.h>
+#include <vssym32.h>
+#include <windowsx.h>
+#include <cmath>
 
 namespace wsl
 {
@@ -49,21 +53,50 @@ std::wstring text(const Json &value, const char *key, const std::wstring &fallba
 }
 std::wstring number(double value, int decimals)
 {
+    // Use Windows' user locale, including custom decimal/grouping separators.
+    // The C++ stream remains invariant so GetNumberFormatEx receives its expected input.
     std::wostringstream out;
+    out.imbue(std::locale::classic());
     out << std::fixed << std::setprecision(decimals) << value;
-    return out.str();
+    const auto raw = out.str();
+    wchar_t decimal[16]{}, thousands[16]{}, grouping[16]{};
+    GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SDECIMAL, decimal, 16);
+    GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_STHOUSAND, thousands, 16);
+    GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SGROUPING, grouping, 16);
+    NUMBERFMTW format{};
+    format.NumDigits = static_cast<UINT>(std::max(0, decimals));
+    format.LeadingZero = 1;
+    format.lpDecimalSep = decimal;
+    format.lpThousandSep = thousands;
+    // Windows represents a repeated final group with a trailing zero (3;0 -> 3).
+    for (const wchar_t *p = grouping; *p; ++p)
+        if (*p >= L'1' && *p <= L'9')
+            format.Grouping = format.Grouping * 10 + static_cast<UINT>(*p - L'0');
+    if (*grouping && grouping[wcslen(grouping) - 1] != L'0')
+        format.Grouping *= 10;
+    DWORD negativeOrder = 1;
+    GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_INEGNUMBER | LOCALE_RETURN_NUMBER,
+                    reinterpret_cast<LPWSTR>(&negativeOrder), sizeof(negativeOrder) / sizeof(wchar_t));
+    format.NegativeOrder = negativeOrder;
+    const int length = GetNumberFormatEx(LOCALE_NAME_USER_DEFAULT, 0, raw.c_str(), &format, nullptr, 0);
+    if (!length)
+        return raw;
+    std::wstring formatted(static_cast<size_t>(length), L'\0');
+    GetNumberFormatEx(LOCALE_NAME_USER_DEFAULT, 0, raw.c_str(), &format, formatted.data(), length);
+    formatted.resize(static_cast<size_t>(length - 1));
+    return formatted;
 }
 std::wstring bytes(uint64_t value)
 {
-    const wchar_t *units[] = {L"B", L"KiB", L"MiB", L"GiB", L"TiB"};
+    const wchar_t *units[] = {L"B", L"kB", L"MB", L"GB", L"TB", L"PB", L"EB"};
     double amount = static_cast<double>(value);
     size_t unit = 0;
-    while (amount >= 1024 && unit < 4)
+    while (amount >= 1024 && unit + 1 < std::size(units))
     {
         amount /= 1024;
         ++unit;
     }
-    return number(amount, unit ? 1 : 0) + L" " + units[unit];
+    return number(amount, unit ? 2 : 0) + L" " + units[unit];
 }
 void errorBox(HWND owner, const std::wstring &message)
 {
@@ -171,9 +204,27 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
         table->expireHighlights();
         return 0;
     }
+    if (message == WM_MOUSEMOVE)
+        table->trackHover({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
+    if (message == WM_MOUSELEAVE)
+        table->clearHover();
     if (message == WM_NOTIFY)
     {
         auto header = reinterpret_cast<NMHDR *>(lparam);
+        if (header->hwndFrom == ListView_GetHeader(window))
+        {
+            if (header->code == NM_CUSTOMDRAW)
+                return table->drawHeader(reinterpret_cast<NMCUSTOMDRAW *>(lparam));
+            if (header->code == NM_RCLICK)
+            {
+                const DWORD position = GetMessagePos();
+                table->showHeaderMenu({GET_X_LPARAM(position), GET_Y_LPARAM(position)});
+                return 0;
+            }
+            if ((header->code == HDN_BEGINTRACKW || header->code == HDN_BEGINTRACKA) &&
+                !table->isColumnVisible(reinterpret_cast<NMHEADERW *>(lparam)->iItem))
+                return TRUE;
+        }
         const auto result = DefSubclassProc(window, message, wparam, lparam);
         if (header->hwndFrom == ListView_GetHeader(window) &&
             (header->code == HDN_ENDTRACKW || header->code == HDN_ENDTRACKA || header->code == HDN_ENDDRAG))
@@ -185,6 +236,7 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
     {
         KillTimer(window, HighlightTimer);
         table->saveLayout();
+        table->releaseDrawingResources();
     }
     if (message == WM_NCDESTROY)
         RemoveWindowSubclass(window, tableLayoutProc, id);
@@ -196,6 +248,9 @@ void Table::create(HWND parent, int id, std::vector<Column> definitions, int def
                    bool defaultDescending)
 {
     columns = std::move(definitions);
+    hiddenWidths.resize(columns.size());
+    defaultSortColumn = defaultSort;
+    defaultSortDescending = defaultDescending;
     settingsPrefix = L"Table." + std::to_wstring(id) + L".";
     auto savedSort = readSetting((settingsPrefix + L"SortColumn").c_str(), static_cast<DWORD>(defaultSort));
     sortColumn = savedSort < columns.size() ? static_cast<int>(savedSort) : -1;
@@ -217,6 +272,9 @@ void Table::create(HWND parent, int id, std::vector<Column> definitions, int def
         column.cx =
             scale(parent, static_cast<int>(std::min(
                               4096ul, readSetting((columnKey + L".Width").c_str(), columns[i].width))));
+        hiddenWidths[i] = column.cx > 0 ? column.cx : scale(parent, columns[i].width);
+        if (!readSetting((columnKey + L".Visible").c_str(), columns[i].visible ? 1 : 0))
+            column.cx = 0;
         column.fmt = columns[i].numeric ? LVCFMT_RIGHT : LVCFMT_LEFT;
         ListView_InsertColumn(window, static_cast<int>(i), &column);
         auto position = readSetting((columnKey + L".Order").c_str(), static_cast<DWORD>(i));
@@ -255,10 +313,264 @@ void Table::saveLayout() const
     {
         auto columnKey = settingsPrefix + L"Column." + std::to_wstring(i);
         int width = ListView_GetColumnWidth(window, static_cast<int>(i));
-        writeSetting((columnKey + L".Width").c_str(),
-                     MulDiv(width, 96, static_cast<int>(GetDpiForWindow(window))));
+        writeSetting((columnKey + L".Visible").c_str(), width > 0 ? 1 : 0);
+        writeSetting((columnKey + L".Width").c_str(), MulDiv(width > 0 ? width : hiddenWidths[i], 96,
+                                                             static_cast<int>(GetDpiForWindow(window))));
         writeSetting((columnKey + L".Order").c_str(), static_cast<DWORD>(order[i]));
     }
+}
+
+bool Table::isColumnVisible(size_t column) const
+{
+    return column < columns.size() && ListView_GetColumnWidth(window, static_cast<int>(column)) > 0;
+}
+std::vector<int> Table::visibleColumns() const
+{
+    std::vector<int> order(columns.size());
+    ListView_GetColumnOrderArray(window, static_cast<int>(order.size()), order.data());
+    order.erase(std::remove_if(order.begin(), order.end(), [&](int id) { return !isColumnVisible(id); }),
+                order.end());
+    return order;
+}
+void Table::centerSelection()
+{
+    const int selected = ListView_GetNextItem(window, -1, LVNI_SELECTED);
+    if (selected < 0)
+        return;
+    ListView_EnsureVisible(window, selected, FALSE);
+    RECT item{}, client{}, header{};
+    ListView_GetItemRect(window, selected, &item, LVIR_BOUNDS);
+    GetClientRect(window, &client);
+    GetWindowRect(ListView_GetHeader(window), &header);
+    const int center = (client.bottom + header.bottom - header.top) / 2;
+    ListView_Scroll(window, 0, (item.top + item.bottom) / 2 - center);
+}
+
+namespace
+{
+// The host's chooser is internal (not an SDK export), and supports TreeNew only.
+// Keep the same available/visible-column interaction for our owner-data ListView.
+struct ColumnChoices
+{
+    std::vector<Column> columns;
+    std::vector<int> visible;
+    std::vector<int> available;
+    HFONT font = nullptr;
+};
+constexpr int AvailableColumns = 410, VisibleColumns = 411, ShowColumn = 412, HideColumn = 413,
+              MoveColumnUp = 414, MoveColumnDown = 415;
+void fillColumnChoices(HWND dialog, ColumnChoices &choices)
+{
+    auto fill = [&](int id, const std::vector<int> &columns) {
+        HWND list = GetDlgItem(dialog, id);
+        const auto selected = SendMessageW(list, LB_GETCURSEL, 0, 0);
+        SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(list, LB_RESETCONTENT, 0, 0);
+        for (int column : columns)
+            SendMessageW(list, LB_ADDSTRING, 0,
+                         reinterpret_cast<LPARAM>(choices.columns[column].title.c_str()));
+        if (!columns.empty())
+            SendMessageW(list, LB_SETCURSEL,
+                         std::clamp(static_cast<int>(selected), 0, static_cast<int>(columns.size()) - 1), 0);
+        SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(list, nullptr, TRUE);
+    };
+    fill(AvailableColumns, choices.available);
+    fill(VisibleColumns, choices.visible);
+    EnableWindow(GetDlgItem(dialog, ShowColumn), !choices.available.empty());
+    EnableWindow(GetDlgItem(dialog, HideColumn), choices.visible.size() > 1);
+}
+INT_PTR CALLBACK columnChoicesProc(HWND dialog, UINT message, WPARAM wparam, LPARAM lparam)
+{
+    auto choices = reinterpret_cast<ColumnChoices *>(GetWindowLongPtrW(dialog, DWLP_USER));
+    if (message == WM_INITDIALOG)
+    {
+        choices = reinterpret_cast<ColumnChoices *>(lparam);
+        SetWindowLongPtrW(dialog, DWLP_USER, reinterpret_cast<LONG_PTR>(choices));
+        choices->font = WslCreateUiFont(dialog);
+        auto child = [&](const wchar_t *type, const wchar_t *label, DWORD style, int id, int x, int y,
+                         int width, int height) {
+            HWND control =
+                CreateWindowExW(wcscmp(type, L"LISTBOX") == 0 ? WS_EX_CLIENTEDGE : 0, type, label,
+                                WS_CHILD | WS_VISIBLE | style, scale(dialog, x), scale(dialog, y),
+                                scale(dialog, width), scale(dialog, height), dialog,
+                                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance, nullptr);
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(choices->font), TRUE);
+        };
+        child(L"STATIC", L"Available columns:", 0, -1, 12, 12, 220, 20);
+        child(L"STATIC", L"Visible columns:", 0, -1, 320, 12, 220, 20);
+        child(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, AvailableColumns,
+              12, 34, 220, 266);
+        child(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, VisibleColumns,
+              320, 34, 220, 266);
+        child(L"BUTTON", L"Show >", WS_TABSTOP, ShowColumn, 242, 105, 68, 24);
+        child(L"BUTTON", L"< Hide", WS_TABSTOP, HideColumn, 242, 137, 68, 24);
+        child(L"BUTTON", L"Move up", WS_TABSTOP, MoveColumnUp, 320, 310, 106, 24);
+        child(L"BUTTON", L"Move down", WS_TABSTOP, MoveColumnDown, 434, 310, 106, 24);
+        child(L"BUTTON", L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, 372, 351, 80, 24);
+        child(L"BUTTON", L"Cancel", WS_TABSTOP, IDCANCEL, 460, 351, 80, 24);
+        RECT area{0, 0, scale(dialog, 552), scale(dialog, 387)};
+        AdjustWindowRectExForDpi(&area, static_cast<DWORD>(GetWindowLongPtrW(dialog, GWL_STYLE)), FALSE,
+                                 static_cast<DWORD>(GetWindowLongPtrW(dialog, GWL_EXSTYLE)),
+                                 GetDpiForWindow(dialog));
+        SetWindowPos(dialog, nullptr, 0, 0, area.right - area.left, area.bottom - area.top,
+                     SWP_NOZORDER | SWP_NOMOVE);
+        WslPositionDialog(dialog, GetParent(dialog));
+        fillColumnChoices(dialog, *choices);
+        WslApplyTheme(dialog);
+        return TRUE;
+    }
+    if (!choices)
+        return FALSE;
+    if (message == WM_COMMAND)
+    {
+        int command = LOWORD(wparam);
+        if (HIWORD(wparam) == LBN_DBLCLK)
+            command = command == AvailableColumns ? ShowColumn : HideColumn;
+        if (command == IDOK || command == IDCANCEL)
+        {
+            EndDialog(dialog, command);
+            return TRUE;
+        }
+        const bool show = command == ShowColumn;
+        if (show || command == HideColumn)
+        {
+            auto &from = show ? choices->available : choices->visible;
+            auto &to = show ? choices->visible : choices->available;
+            const int selected = static_cast<int>(
+                SendDlgItemMessageW(dialog, show ? AvailableColumns : VisibleColumns, LB_GETCURSEL, 0, 0));
+            if (selected >= 0 && static_cast<size_t>(selected) < from.size() && (show || from.size() > 1))
+            {
+                to.push_back(from[selected]);
+                from.erase(from.begin() + selected);
+                std::sort(choices->available.begin(), choices->available.end(), [&](int a, int b) {
+                    return choices->columns[a].title < choices->columns[b].title;
+                });
+                fillColumnChoices(dialog, *choices);
+            }
+            return TRUE;
+        }
+        if (command == MoveColumnUp || command == MoveColumnDown)
+        {
+            const int selected =
+                static_cast<int>(SendDlgItemMessageW(dialog, VisibleColumns, LB_GETCURSEL, 0, 0));
+            const int next = selected + (command == MoveColumnUp ? -1 : 1);
+            if (selected >= 0 && next >= 0 && static_cast<size_t>(next) < choices->visible.size())
+            {
+                std::swap(choices->visible[selected], choices->visible[next]);
+                fillColumnChoices(dialog, *choices);
+                SendDlgItemMessageW(dialog, VisibleColumns, LB_SETCURSEL, next, 0);
+            }
+            return TRUE;
+        }
+    }
+    if (message == WM_DESTROY && choices->font)
+    {
+        DeleteObject(choices->font);
+        choices->font = nullptr;
+    }
+    return FALSE;
+}
+} // namespace
+void Table::showHeaderMenu(POINT point)
+{
+    const HWND savedWindow = window;
+    auto alive = [savedWindow, identity = reinterpret_cast<DWORD_PTR>(this)] {
+        DWORD_PTR context = 0;
+        return IsWindow(savedWindow) && GetWindowSubclass(savedWindow, tableLayoutProc, 1, &context) &&
+               context == identity;
+    };
+    HWND header = ListView_GetHeader(window);
+    HDHITTESTINFO hit{};
+    hit.pt = point;
+    ScreenToClient(header, &hit.pt);
+    const int column = static_cast<int>(SendMessageW(header, HDM_HITTEST, 0, reinterpret_cast<LPARAM>(&hit)));
+    HMENU menu = CreatePopupMenu();
+    const bool valid = column >= 0 && isColumnVisible(column);
+    AppendMenuW(menu, MF_STRING | (valid ? 0 : MF_GRAYED), 1, L"Size column to fit");
+    AppendMenuW(menu, MF_STRING, 2, L"Size all columns to fit");
+    AppendMenuW(menu, MF_STRING | (valid && visibleColumns().size() > 1 ? 0 : MF_GRAYED), 3, L"Hide column");
+    AppendMenuW(menu, MF_STRING, 4, L"Reset sort");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 5, L"Choose columns...");
+    const auto command =
+        TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
+    DestroyMenu(menu);
+    if (!alive())
+        return;
+    if (!command)
+        return;
+    auto sizeToFit = [&](int id) {
+        ListView_SetColumnWidth(window, id, LVSCW_AUTOSIZE);
+        HDC dc = GetDC(window);
+        const auto old = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(window, WM_GETFONT, 0, 0)));
+        SIZE size{};
+        GetTextExtentPoint32W(dc, columns[id].title.c_str(), static_cast<int>(columns[id].title.size()),
+                              &size);
+        SelectObject(dc, old);
+        ReleaseDC(window, dc);
+        ListView_SetColumnWidth(
+            window, id,
+            std::max(ListView_GetColumnWidth(window, id), static_cast<int>(size.cx) + scale(window, 20)));
+    };
+    if (command == 1 && valid)
+        sizeToFit(column);
+    if (command == 2)
+        for (int id : visibleColumns())
+            sizeToFit(id);
+    if (command == 3 && valid && visibleColumns().size() > 1)
+    {
+        hiddenWidths[column] = ListView_GetColumnWidth(window, column);
+        ListView_SetColumnWidth(window, column, 0);
+    }
+    if (command == 4)
+    {
+        const auto key = selected() ? selected()->key : "";
+        sortColumn = defaultSortColumn;
+        descending = defaultSortDescending;
+        ancestryOrder = true; // Force header arrow refresh even when tree mode was active.
+        setAncestryOrder(false);
+        order();
+        selectKey(key);
+        InvalidateRect(window, nullptr, FALSE);
+    }
+    if (command == 5)
+    {
+        ColumnChoices choices{columns, visibleColumns(), {}};
+        for (size_t id = 0; id < columns.size(); ++id)
+            if (!isColumnVisible(id))
+                choices.available.push_back(static_cast<int>(id));
+        std::sort(choices.available.begin(), choices.available.end(),
+                  [&](int a, int b) { return columns[a].title < columns[b].title; });
+        // Empty standard dialog template; controls are sized from its actual DPI.
+        const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME;
+        std::vector<WORD> dialog{LOWORD(style), HIWORD(style), 0, 0, 0, 0, 0, 300, 240, 0, 0};
+        const wchar_t title[] = L"Choose columns";
+        dialog.insert(dialog.end(), title, title + std::size(title));
+        if (DialogBoxIndirectParamW(instance, reinterpret_cast<DLGTEMPLATE *>(dialog.data()),
+                                    GetAncestor(window, GA_ROOT), columnChoicesProc,
+                                    reinterpret_cast<LPARAM>(&choices)) != IDOK ||
+            !alive())
+            return;
+        std::vector<int> order = choices.visible;
+        order.insert(order.end(), choices.available.begin(), choices.available.end());
+        for (size_t id = 0; id < columns.size(); ++id)
+        {
+            const int width = ListView_GetColumnWidth(window, static_cast<int>(id));
+            if (width > 0)
+                hiddenWidths[id] = width;
+            const bool visible =
+                std::find(choices.visible.begin(), choices.visible.end(), id) != choices.visible.end();
+            ListView_SetColumnWidth(window, static_cast<int>(id),
+                                    visible ? std::max(1, hiddenWidths[id]) : 0);
+        }
+        ListView_SetColumnOrderArray(window, static_cast<int>(order.size()), order.data());
+    }
+    saveLayout();
+    if (command == 3 || command == 5)
+        PostMessageW(GetParent(window), ColumnsChangedMessage, 0, 0);
+    if (command == 4)
+        PostMessageW(GetParent(window), SortResetMessage, 0, reinterpret_cast<LPARAM>(window));
 }
 
 const Row *Table::selected() const
@@ -293,14 +605,25 @@ void Table::order()
     if (ancestryOrder || sortColumn < 0 || static_cast<size_t>(sortColumn) >= columns.size())
         return;
     const auto column = static_cast<size_t>(sortColumn);
+    wchar_t decimal[16]{}, separator[16]{};
+    GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SDECIMAL, decimal, 16);
+    GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_STHOUSAND, separator, 16);
+    auto numericValue = [&](std::wstring value) {
+        if (*separator)
+            for (size_t position; (position = value.find(separator)) != std::wstring::npos;)
+                value.erase(position, wcslen(separator));
+        if (*decimal && wcscmp(decimal, L".") != 0)
+            if (auto position = value.find(decimal); position != std::wstring::npos)
+                value.replace(position, wcslen(decimal), L".");
+        return wcstod(value.c_str(), nullptr);
+    };
     std::stable_sort(rows.begin(), rows.end(), [&](const Row &a, const Row &b) {
         if (column >= a.cells.size() || column >= b.cells.size())
             return false;
         int comparison;
         if (columns[column].numeric)
         {
-            const double av = wcstod(a.cells[column].c_str(), nullptr),
-                         bv = wcstod(b.cells[column].c_str(), nullptr);
+            const double av = numericValue(a.cells[column]), bv = numericValue(b.cells[column]);
             comparison = av < bv ? -1 : av > bv ? 1 : 0;
         }
         else
@@ -461,6 +784,8 @@ void Table::setAncestryOrder(bool enabled)
 }
 void Table::sort(int column)
 {
+    if (column < 0 || static_cast<size_t>(column) >= columns.size())
+        return;
     setAncestryOrder(false);
     std::string key = selected() ? selected()->key : "";
     descending = sortColumn == column ? !descending : columns[column].numeric;
@@ -506,83 +831,240 @@ LRESULT Table::customDraw(NMLVCUSTOMDRAW *draw) const
         return CDRF_NOTIFYITEMDRAW;
     if (draw->nmcd.dwDrawStage != CDDS_ITEMPREPAINT || draw->nmcd.dwItemSpec >= rows.size())
         return CDRF_DODEFAULT;
-    // Some owner-data list-view paint paths report CDIS_SELECTED for ordinary
-    // rows. Query the retained selection state instead of suppressing colors
-    // based on that notification flag.
-    if (ListView_GetItemState(window, static_cast<int>(draw->nmcd.dwItemSpec), LVIS_SELECTED) & LVIS_SELECTED)
-        return CDRF_DODEFAULT;
 
     const auto &row = rows[draw->nmcd.dwItemSpec];
     const auto &item = row.data;
-    COLORREF background = CLR_NONE;
-    COLORREF foreground = CLR_NONE;
-    const auto state = item.value("state", std::string{});
-    const auto active = item.value("active", std::string{});
-    auto enabled = [](PCWSTR setting) { return WslHostIntegerSetting(setting) != 0; };
-    auto color = [](PCWSTR setting) { return static_cast<COLORREF>(WslHostIntegerSetting(setting)); };
+    COLORREF background = WslIsDarkTheme() ? WslDialogBackground() : GetSysColor(COLOR_WINDOW);
+    COLORREF foreground = WslIsDarkTheme() ? WslDialogText() : GetSysColor(COLOR_WINDOWTEXT);
+    bool semantic = false;
+    auto apply = [&](bool condition, PCWSTR setting) {
+        if (!condition || semantic)
+            return;
+        if (WslHostIntegerSetting((std::wstring(L"Use") + setting).c_str()))
+        {
+            background = WslHostIntegerSetting(setting);
+            semantic = true;
+        }
+    };
 
-    // Temporary lifecycle colors have priority over semantic colors, matching
-    // TreeNew's temporary background behavior. All colors come from the host.
+    // The ordering below follows proctree.c/thrdlist.c/modlist.c/memlist.c.
+    // Linux-only approximations are made by the collector, not from display text.
     if (row.highlightedSince)
-        background = color(row.removed ? L"ColorRemoved" : L"ColorNew");
-    else if (kind == Kind::Processes || (kind == Kind::Generic && item.contains("uid")))
     {
-        // Keep the native process priority: debugged, suspended, elevated,
-        // then service. Do not guess Windows-only properties from Linux names.
-        if (item.value("tracer_pid", 0) != 0 && enabled(L"UseColorDebuggedProcesses"))
-            background = color(L"ColorDebuggedProcesses");
-        else if ((state == "T" || state == "t") && enabled(L"UseColorSuspended"))
-            background = color(L"ColorSuspended");
-        else if (item.contains("uid") && item["uid"].is_number() && item["uid"] == 0 &&
-                 enabled(L"UseColorElevatedProcesses"))
-            background = color(L"ColorElevatedProcesses");
-        else if (item.value("is_service", false) && enabled(L"UseColorServiceProcesses"))
-            background = color(L"ColorServiceProcesses");
+        background = WslHostIntegerSetting(row.removed ? L"ColorRemoved" : L"ColorNew");
+        semantic = true;
     }
-    else if (kind == Kind::Services || (kind == Kind::Generic && item.contains("active")))
+    else if (kind == Kind::Processes)
     {
+        apply(item.value("tracer_pid", 0) != 0, L"ColorDebuggedProcesses");
+        apply(item.value("is_suspended", false), L"ColorSuspended");
+        apply(item.value("is_partially_suspended", false), L"ColorPartiallySuspended");
+        apply(item.value("no_tty", false), L"ColorBackgroundProcesses");
+        apply(item.value("sudo_root", false), L"ColorElevatedProcesses");
+        apply(readSetting(L"Detect32BitProcesses", 0) != 0 && item.value("is_32bit", false),
+              L"ColorWow64Processes");
+        apply(item.value("euid", item.value("uid", -1)) == 0, L"ColorSystemProcesses");
+        apply(item.value("is_own", false), L"ColorOwnProcesses");
+        apply(item.value("is_service", false), L"ColorServiceProcesses");
+    }
+    else if (kind == Kind::Services)
+    {
+        const auto active = item.value("active", std::string{});
         const bool stopped = active == "inactive" || active == "failed";
         const auto unitState = item.value("enabled", std::string{});
-        if (stopped && (unitState == "disabled" || unitState.find("masked") == 0) &&
-            enabled(L"UseColorServiceDisabled"))
-            background = color(L"ColorServiceDisabled");
-        else if (stopped && enabled(L"UseColorServiceStop"))
-            foreground = color(L"ColorServiceStop");
+        apply(stopped && (unitState == "disabled" || unitState.find("masked") == 0), L"ColorServiceDisabled");
+        if (!semantic && stopped && WslHostIntegerSetting(L"UseColorServiceStop"))
+            foreground = WslHostIntegerSetting(L"ColorServiceStop");
     }
-    else if (kind == Kind::Threads || (kind == Kind::Generic && item.contains("tid")))
+    else if (kind == Kind::Threads)
     {
-        if ((state == "T" || state == "t") && enabled(L"UseColorThreadSuspended"))
-            background = color(L"ColorThreadSuspended");
+        const auto wait = item.value("wait_kind", std::string{});
+        const auto state = item.value("state", std::string{});
+        apply(wait == "suspended" || state == "T" || state == "t", L"ColorThreadSuspended");
+        apply(wait == "delay", L"ColorThreadDelayExecution");
+        apply(wait == "user_request", L"ColorThreadUserRequest");
+        apply(wait == "alert", L"ColorThreadAlertByThreadId");
+        apply(wait == "queue", L"ColorThreadQueue");
+        apply(wait == "executive", L"ColorThreadExecutive");
     }
     else if (kind == Kind::Memory)
     {
-        const auto permissions = item.value("permissions", std::string{});
-        const auto path = item.value("path", std::string{});
-        if (permissions.find('x') != std::string::npos && enabled(L"UseColorMemoryExecutePages"))
-            background = color(L"ColorMemoryExecutePages");
-        else if (permissions.find('p') != std::string::npos && (path.empty() || path.front() == '[') &&
-                 enabled(L"UseColorMemoryPrivatePages"))
-            background = color(L"ColorMemoryPrivatePages");
+        apply(item.value("execute_pages", false), L"ColorMemoryExecutePages");
+        // Linux has no direct equivalent of a Windows CFG bitmap allocation.
+        apply(item.value("system_pages", false), L"ColorMemorySystemPages");
+        apply(item.value("private_pages", false), L"ColorMemoryPrivatePages");
     }
-    else if (kind == Kind::Network || (kind == Kind::Generic && item.contains("protocol")))
+    else if (kind == Kind::Modules)
     {
-        if (item.value("pid", 0) == 0 && enabled(L"UseColorNetworkUnknownProcess"))
-            background = color(L"ColorNetworkUnknownProcess");
+        // Normal ELF ASLR is not the Windows image-base collision condition.
+        apply(item.value("known_library", false), L"ColorModuleImageKnownDll");
+        apply(item.value("native_module", false), L"ColorModuleSystem");
+        apply(item.value("mapped_module", false), L"ColorModuleMapped");
+    }
+    else if (kind == Kind::Network)
+        apply(item.value("pid", 0) == 0, L"ColorNetworkUnknownProcess");
+    else if (kind == Kind::Handles)
+        apply(item.value("inherited", false), L"ColorInheritHandles");
+    else if (kind == Kind::Environment)
+    {
+        const auto scope = item.value("scope", std::string("process"));
+        apply(scope == "process", L"ColorEnvironmentProcess");
+        apply(scope == "user", L"ColorEnvironmentUser");
+        apply(scope == "system", L"ColorEnvironmentSystem");
     }
 
-    if (background != CLR_NONE)
+    if (semantic)
     {
-        draw->clrTextBk = background;
-        // TreeNew uses this same brightness threshold for user-selected colors.
         const auto brightness =
             (std::min({GetRValue(background), GetGValue(background), GetBValue(background)}) +
              std::max({GetRValue(background), GetGValue(background), GetBValue(background)})) /
             2;
         foreground = brightness > 100 ? RGB(0, 0, 0) : RGB(255, 255, 255);
     }
-    if (foreground != CLR_NONE)
-        draw->clrText = foreground;
-    return CDRF_NEWFONT;
+    const int index = static_cast<int>(draw->nmcd.dwItemSpec);
+    const bool selected = (ListView_GetItemState(window, index, LVIS_SELECTED) & LVIS_SELECTED) != 0;
+    const bool hot = index == hotRow;
+    HDC dc = draw->nmcd.hdc;
+    const int saved = SaveDC(dc);
+    RECT bounds{};
+    ListView_GetItemRect(window, index, &bounds, LVIR_BOUNDS);
+    SetDCBrushColor(dc, background);
+    FillRect(dc, &bounds, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    // TreeNew paints the TreeView themed item *over* its semantic background.
+    // ListView's built-in hot item replaces that background with opaque blue.
+    // Drawing the same transparent TreeView overlay preserves the row color.
+    if (selected || hot)
+    {
+        HTHEME theme = OpenThemeData(window, L"TreeView");
+        if (theme)
+        {
+            const int state = selected ? (hot                    ? TREIS_HOTSELECTED
+                                          : GetFocus() == window ? TREIS_SELECTED
+                                                                 : TREIS_SELECTEDNOTFOCUS)
+                                       : TREIS_HOT;
+            DrawThemeBackground(theme, dc, TVP_TREEITEM, state, &bounds, nullptr);
+            CloseThemeData(theme);
+        }
+        else if (selected)
+        {
+            FillRect(dc, &bounds, GetSysColorBrush(COLOR_HIGHLIGHT));
+            foreground = GetSysColor(COLOR_HIGHLIGHTTEXT);
+        }
+    }
+    HFONT normal = reinterpret_cast<HFONT>(SendMessageW(window, WM_GETFONT, 0, 0));
+    if (kind == Kind::Modules && item.value("main_module", false))
+    {
+        if (boldSourceFont != normal)
+        {
+            if (boldFont)
+                DeleteObject(boldFont);
+            LOGFONTW description{};
+            GetObjectW(normal, sizeof(description), &description);
+            description.lfWeight = FW_BOLD;
+            boldFont = CreateFontIndirectW(&description);
+            boldSourceFont = normal;
+        }
+        SelectObject(dc, boldFont ? boldFont : normal);
+    }
+    else
+        SelectObject(dc, normal);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, foreground);
+    for (const int column : visibleColumns())
+    {
+        if (static_cast<size_t>(column) >= row.cells.size())
+            continue;
+        RECT cell{};
+        Header_GetItemRect(ListView_GetHeader(window), column, &cell);
+        MapWindowPoints(ListView_GetHeader(window), window, reinterpret_cast<POINT *>(&cell), 2);
+        cell.top = bounds.top;
+        cell.bottom = bounds.bottom;
+        cell.left += scale(window, 6);
+        cell.right -= scale(window, 6);
+        DrawTextW(dc, row.cells[column].c_str(), static_cast<int>(row.cells[column].size()), &cell,
+                  DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX |
+                      (columns[column].numeric ? DT_RIGHT : DT_LEFT));
+    }
+    RestoreDC(dc, saved);
+    return CDRF_SKIPDEFAULT;
+}
+
+void Table::releaseDrawingResources()
+{
+    if (boldFont)
+        DeleteObject(boldFont);
+    boldFont = nullptr;
+    boldSourceFont = nullptr;
+}
+void Table::trackHover(POINT point)
+{
+    LVHITTESTINFO hit{};
+    hit.pt = point;
+    int next = ListView_HitTest(window, &hit);
+    if (next != hotRow)
+    {
+        if (hotRow >= 0)
+            ListView_RedrawItems(window, hotRow, hotRow);
+        hotRow = next;
+        if (hotRow >= 0)
+            ListView_RedrawItems(window, hotRow, hotRow);
+    }
+    TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+    TrackMouseEvent(&tracking);
+}
+void Table::clearHover()
+{
+    const int old = hotRow;
+    hotRow = -1;
+    if (old >= 0)
+        ListView_RedrawItems(window, old, old);
+}
+LRESULT Table::drawHeader(NMCUSTOMDRAW *draw) const
+{
+    if (draw->dwDrawStage == CDDS_PREPAINT)
+        return CDRF_NOTIFYITEMDRAW;
+    if (draw->dwDrawStage != CDDS_ITEMPREPAINT || draw->dwItemSpec >= columns.size())
+        return CDRF_DODEFAULT;
+    const int column = static_cast<int>(draw->dwItemSpec);
+    const int saved = SaveDC(draw->hdc);
+    auto theme = OpenThemeData(ListView_GetHeader(window), L"Header");
+    if (WslIsDarkTheme())
+    {
+        SetDCBrushColor(draw->hdc, WslDialogBackground());
+        FillRect(draw->hdc, &draw->rc, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    }
+    else if (theme)
+        DrawThemeBackground(theme, draw->hdc, HP_HEADERITEM,
+                            (draw->uItemState & CDIS_SELECTED) ? HIS_PRESSED
+                            : (draw->uItemState & CDIS_HOT)    ? HIS_HOT
+                                                               : HIS_NORMAL,
+                            &draw->rc, nullptr);
+    else
+        FillRect(draw->hdc, &draw->rc, GetSysColorBrush(COLOR_WINDOW));
+    RECT textBounds = draw->rc;
+    textBounds.left += scale(window, 6);
+    textBounds.right -= scale(window, 6);
+    SelectObject(draw->hdc, reinterpret_cast<HFONT>(SendMessageW(window, WM_GETFONT, 0, 0)));
+    SetBkMode(draw->hdc, TRANSPARENT);
+    // This is TreeNew's header text color, not COLOR_WINDOWTEXT.
+    SetTextColor(draw->hdc, WslIsDarkTheme() ? RGB(143, 143, 143) : RGB(97, 116, 139));
+    DrawTextW(draw->hdc, columns[column].title.c_str(), -1, &textBounds,
+              DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX |
+                  (columns[column].numeric ? DT_RIGHT : DT_LEFT));
+    if (theme && !ancestryOrder && column == sortColumn)
+    {
+        SIZE size{};
+        GetThemePartSize(theme, draw->hdc, HP_HEADERSORTARROW, descending ? HSAS_SORTEDDOWN : HSAS_SORTEDUP,
+                         nullptr, TS_TRUE, &size);
+        RECT arrow{(draw->rc.left + draw->rc.right - size.cx) / 2, draw->rc.top,
+                   (draw->rc.left + draw->rc.right + size.cx) / 2, draw->rc.top + size.cy};
+        DrawThemeBackground(theme, draw->hdc, HP_HEADERSORTARROW,
+                            descending ? HSAS_SORTEDDOWN : HSAS_SORTEDUP, &arrow, nullptr);
+    }
+    if (theme)
+        CloseThemeData(theme);
+    RestoreDC(draw->hdc, saved);
+    return CDRF_SKIPDEFAULT;
 }
 
 std::wstring Table::exportText() const
@@ -597,13 +1079,19 @@ std::wstring Table::exportText() const
         return value;
     };
     std::wstring result;
-    for (size_t i = 0; i < columns.size(); ++i)
-        result += (i ? L"\t" : L"") + escape(columns[i].title);
+    const auto visible = visibleColumns();
+    for (size_t i = 0; i < visible.size(); ++i)
+        result += (i ? L"\t" : L"") + escape(columns[visible[i]].title);
     result += L"\r\n";
     for (const auto &row : rows)
     {
-        for (size_t i = 0; i < row.cells.size(); ++i)
-            result += (i ? L"\t" : L"") + escape(row.cells[i]);
+        for (size_t i = 0; i < visible.size(); ++i)
+        {
+            if (i)
+                result += L"\t";
+            if (static_cast<size_t>(visible[i]) < row.cells.size())
+                result += escape(row.cells[visible[i]]);
+        }
         result += L"\r\n";
     }
     return result;

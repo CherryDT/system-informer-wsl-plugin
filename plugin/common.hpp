@@ -26,6 +26,8 @@ std::string utf8(const std::wstring &);
 extern HINSTANCE instance;
 extern HFONT font;
 constexpr UINT ReplyMessage = WM_APP + 51;
+constexpr UINT ColumnsChangedMessage = WM_APP + 83;
+constexpr UINT SortResetMessage = WM_APP + 84;
 struct Reply
 {
     Json data;
@@ -46,6 +48,7 @@ struct Mailbox
     }
 };
 void submit(const std::wstring &distro, Json request, std::shared_ptr<Mailbox> mailbox, uintptr_t tag);
+void openHandleSearch(HWND owner, const std::wstring &distro);
 void openDetails(HWND owner, const std::wstring &distro, const Json &process);
 void openServiceDetails(HWND owner, const std::wstring &distro, const std::string &name);
 void openLinuxPath(HWND owner, const std::wstring &distro, const std::wstring &path, bool select = true);
@@ -53,7 +56,7 @@ void copyText(HWND owner, const std::wstring &text);
 void saveText(HWND owner, const std::wstring &text, const wchar_t *defaultName);
 void errorBox(HWND owner, const std::wstring &text);
 std::wstring text(const Json &value, const char *key, const std::wstring &fallback = L"");
-std::wstring number(double value, int decimals = 1);
+std::wstring number(double value, int decimals = 2);
 std::wstring bytes(uint64_t value);
 HWND control(HWND parent, const wchar_t *cls, const wchar_t *label, DWORD style, int id);
 void place(HWND child, int x, int y, int width, int height);
@@ -66,6 +69,7 @@ struct Column
     std::wstring title;
     int width;
     bool numeric = false;
+    bool visible = true;
 };
 struct Row
 {
@@ -88,7 +92,8 @@ class Table
         Threads,
         Modules,
         Memory,
-        Handles
+        Handles,
+        Environment
     };
     Kind kind = Kind::Generic;
     HWND window = nullptr;
@@ -99,6 +104,14 @@ class Table
     void create(HWND parent, int id, std::vector<Column> definitions, int defaultSort = -1,
                 bool defaultDescending = false);
     void saveLayout() const;
+    bool isColumnVisible(size_t column) const;
+    std::vector<int> visibleColumns() const;
+    void centerSelection();
+    void showHeaderMenu(POINT point);
+    void trackHover(POINT point);
+    void clearHover();
+    LRESULT drawHeader(NMCUSTOMDRAW *draw) const;
+    void releaseDrawingResources();
     void setAncestryOrder(bool enabled);
     // Always pass the complete snapshot. Filtering must not look like removal.
     // The predicate is retained for expiry redraws; capture local values by value.
@@ -117,6 +130,12 @@ class Table
   private:
     std::wstring settingsPrefix;
     bool ancestryOrder = false;
+    int hotRow = -1;
+    int defaultSortColumn = -1;
+    bool defaultSortDescending = false;
+    std::vector<int> hiddenWidths;
+    mutable HFONT boldFont = nullptr;
+    mutable HFONT boldSourceFont = nullptr;
     bool initialized = false;
     std::vector<Row> source;
     std::function<bool(const Row &)> filter;
