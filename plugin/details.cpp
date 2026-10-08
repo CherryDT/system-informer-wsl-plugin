@@ -114,6 +114,11 @@ struct Inspector
 
 COLORREF inspectorBackground()
 {
+    return WslDialogBackground();
+}
+
+COLORREF pageBackground()
+{
     return WslIsDarkTheme() ? WslDialogBackground() : RGB(255, 255, 255);
 }
 
@@ -343,7 +348,7 @@ LRESULT CALLBACK overviewProc(HWND window, UINT message, WPARAM wparam, LPARAM l
     case WM_ERASEBKGND: {
         RECT bounds{};
         GetClientRect(window, &bounds);
-        HBRUSH brush = CreateSolidBrush(inspectorBackground());
+        HBRUSH brush = CreateSolidBrush(pageBackground());
         FillRect(reinterpret_cast<HDC>(wparam), &bounds, brush);
         DeleteObject(brush);
         return 1;
@@ -498,12 +503,12 @@ void updateInspectorFonts(Inspector &state)
     state.rawFont = next;
 }
 
-LRESULT dialogControlColor(HDC dc)
+LRESULT dialogControlColor(HDC dc, COLORREF background)
 {
     SetTextColor(dc, WslDialogText());
-    SetBkColor(dc, inspectorBackground());
+    SetBkColor(dc, background);
     SetBkMode(dc, TRANSPARENT);
-    SetDCBrushColor(dc, inspectorBackground());
+    SetDCBrushColor(dc, background);
     return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
 }
 
@@ -511,7 +516,12 @@ LRESULT CALLBACK inspectorColorsProc(HWND window, UINT message, WPARAM wparam, L
                                      DWORD_PTR)
 {
     if (message == WM_CTLCOLORSTATIC || message == WM_CTLCOLOREDIT || message == WM_CTLCOLORDLG)
-        return dialogControlColor(reinterpret_cast<HDC>(wparam));
+    {
+        HWND tabs = GetDlgItem(window, Tabs);
+        bool page = tabs && IsChild(tabs, reinterpret_cast<HWND>(lparam));
+        return dialogControlColor(reinterpret_cast<HDC>(wparam),
+                                  page ? pageBackground() : inspectorBackground());
+    }
     if (message == WM_ERASEBKGND)
     {
         RECT bounds{};
@@ -524,6 +534,64 @@ LRESULT CALLBACK inspectorColorsProc(HWND window, UINT message, WPARAM wparam, L
     if (message == WM_NCDESTROY)
         RemoveWindowSubclass(window, inspectorColorsProc, 3);
     return DefSubclassProc(window, message, wparam, lparam);
+}
+
+void paintControlBorder(HWND window)
+{
+    HDC dc = GetWindowDC(window);
+    if (!dc)
+        return;
+    RECT bounds{};
+    GetWindowRect(window, &bounds);
+    OffsetRect(&bounds, -bounds.left, -bounds.top);
+    COLORREF color = RGB(192, 192, 192);
+    if (WslIsDarkTheme())
+    {
+        COLORREF background = pageBackground(), foreground = WslDialogText();
+        color = RGB((GetRValue(background) * 3 + GetRValue(foreground)) / 4,
+                    (GetGValue(background) * 3 + GetGValue(foreground)) / 4,
+                    (GetBValue(background) * 3 + GetBValue(foreground)) / 4);
+    }
+    HBRUSH brush = CreateSolidBrush(color);
+    int thickness = GetSystemMetricsForDpi(SM_CXBORDER, GetDpiForWindow(window));
+    for (int i = 0; i < std::max(1, thickness); ++i)
+    {
+        FrameRect(dc, &bounds, brush);
+        InflateRect(&bounds, -1, -1);
+    }
+    DeleteObject(brush);
+    ReleaseDC(window, dc);
+}
+
+LRESULT CALLBACK controlBorderProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR,
+                                   DWORD_PTR)
+{
+    if (message == WM_NCDESTROY)
+        RemoveWindowSubclass(window, controlBorderProc, 4);
+    LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+    if (message == WM_NCPAINT || message == WM_NCACTIVATE || message == WM_THEMECHANGED)
+        paintControlBorder(window);
+    return result;
+}
+
+void styleControlBorder(HWND window)
+{
+    // Reserve a native one-pixel frame, then paint it in the subtle dialog
+    // border color instead of the default black WS_BORDER or a raised edge.
+    SetWindowSubclass(window, controlBorderProc, 4, 0);
+    SetWindowLongPtrW(window, GWL_STYLE, GetWindowLongPtrW(window, GWL_STYLE) | WS_BORDER);
+    SetWindowLongPtrW(window, GWL_EXSTYLE, GetWindowLongPtrW(window, GWL_EXSTYLE) & ~WS_EX_CLIENTEDGE);
+    SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+BOOL CALLBACK styleInspectorControl(HWND window, LPARAM)
+{
+    wchar_t name[32]{};
+    GetClassNameW(window, name, static_cast<int>(std::size(name)));
+    if (lstrcmpiW(name, WC_EDITW) == 0 || lstrcmpiW(name, WC_LISTVIEWW) == 0)
+        styleControlBorder(window);
+    return TRUE;
 }
 
 // Pages are true children of the native tab. Its clipping keeps themed hover
@@ -540,7 +608,7 @@ LRESULT CALLBACK tabPageProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         return SendMessageW(inspector, message, wparam, lparam);
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT:
-        return dialogControlColor(reinterpret_cast<HDC>(wparam));
+        return dialogControlColor(reinterpret_cast<HDC>(wparam), pageBackground());
     case WM_NCDESTROY:
         RemoveWindowSubclass(window, tabPageProc, 2);
         break;
@@ -1524,6 +1592,7 @@ void createRuntimeStackControl(Inspector &state)
     {
         SetWindowSubclass(state.runtimeStacks, shortcutProc, 1, reinterpret_cast<DWORD_PTR>(state.window));
         WslApplyTheme(state.runtimeStacks);
+        styleControlBorder(state.runtimeStacks);
         SendMessageW(
             state.runtimeStacks, WM_SETFONT,
             reinterpret_cast<WPARAM>(state.rawFont ? state.rawFont : GetStockObject(ANSI_FIXED_FONT)), TRUE);
@@ -1741,6 +1810,7 @@ void createControls(Inspector &state)
     EnumChildWindows(window, installShortcuts, reinterpret_cast<LPARAM>(window));
     WslApplyTheme(window);
     SetWindowSubclass(window, inspectorColorsProc, 3, 0);
+    EnumChildWindows(window, styleInspectorControl, 0);
     createTooltips(state);
     updateInspectorFonts(state);
     showPage(state);
@@ -1767,7 +1837,9 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
         return reinterpret_cast<LRESULT>(state->uiFont ? state->uiFont : font);
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT:
-        return dialogControlColor(reinterpret_cast<HDC>(wParam));
+        return dialogControlColor(
+            reinterpret_cast<HDC>(wParam),
+            IsChild(state->tabs, reinterpret_cast<HWND>(lParam)) ? pageBackground() : inspectorBackground());
     case WM_ERASEBKGND: {
         RECT bounds{};
         GetClientRect(window, &bounds);
