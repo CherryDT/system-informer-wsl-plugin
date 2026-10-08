@@ -1415,7 +1415,16 @@ void loadRuntimeStacks(Inspector &state, const Json &data)
         if (state.runtimeStacksLoaded)
         {
             state.runtimeStacksNotice += L" The previous capture is still displayed.";
-            SetWindowTextW(state.runtimeStacks, state.runtimeCapture.c_str());
+            if (data.contains("inspector_error"))
+            {
+                // Keep the good capture cached, but do not hide the Inspector
+                // failure or the attempted fallback behind a one-line status.
+                auto combined = state.runtimeStacksNotice + L"\r\n\r\n" + output +
+                    L"\r\n\r\nPrevious successful capture\r\n" + state.runtimeCapture;
+                SetWindowTextW(state.runtimeStacks, editText(combined).c_str());
+            }
+            else
+                SetWindowTextW(state.runtimeStacks, state.runtimeCapture.c_str());
         }
         else
         {

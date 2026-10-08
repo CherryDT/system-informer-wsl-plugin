@@ -59,6 +59,10 @@ class DeadlineExpired(CaptureError):
     pass
 
 
+class InspectorProbeError(CaptureError):
+    """A listener advertised Node Inspector, but its endpoint was invalid."""
+
+
 def remaining(deadline):
     seconds = deadline - time.monotonic()
     if seconds <= 0:
@@ -360,18 +364,21 @@ def inspector_endpoints(listener, deadline):
         for item in listing[:32]:
             if not isinstance(item, dict) or item.get("type") != "node":
                 continue
-            url = urllib.parse.urlsplit(item.get("webSocketDebuggerUrl", ""))
-            if (url.scheme != "ws" or url.username is not None or url.password is not None
-                    or url.port != listener["port"] or url.query or url.fragment
-                    or not UUID_PATH.fullmatch(url.path)):
-                raise CaptureError("An owned listener advertised an invalid Node Inspector endpoint")
-            # The URL never chooses the connection destination. Only accept a
-            # literal matching address (or localhost for a loopback route).
-            valid_host = url.hostname in (listener["host"], listener["bound"])
-            if url.hostname == "localhost" and ipaddress.ip_address(listener["host"]).is_loopback:
-                valid_host = True
-            if not valid_host:
-                raise CaptureError("An owned listener advertised an Inspector endpoint on another address")
+            try:
+                url = urllib.parse.urlsplit(item.get("webSocketDebuggerUrl", ""))
+                if (url.scheme != "ws" or url.username is not None or url.password is not None
+                        or url.port != listener["port"] or url.query or url.fragment
+                        or not UUID_PATH.fullmatch(url.path)):
+                    raise ValueError("invalid WebSocket URL")
+                # The URL never chooses the connection destination. Only accept
+                # our literal address (or localhost for a loopback route).
+                valid_host = url.hostname in (listener["host"], listener["bound"])
+                if url.hostname == "localhost" and ipaddress.ip_address(listener["host"]).is_loopback:
+                    valid_host = True
+                if not valid_host:
+                    raise ValueError("WebSocket URL names another address")
+            except (ValueError, TypeError, AttributeError) as error:
+                raise InspectorProbeError("An owned listener advertised an invalid Node Inspector endpoint: " + str(error)) from error
             result.append((listener, url.path))
         return result
     finally:
@@ -386,20 +393,22 @@ def discover(target, deadline):
         remaining(deadline)
         try:
             endpoints += inspector_endpoints(listener, min(deadline, time.monotonic() + 0.2))
-        except (socket.timeout, DeadlineExpired):
-            failures.append("An owned listener did not answer Inspector discovery before its timeout")
-        except (CaptureError, OSError, ValueError, UnicodeError, TypeError) as error:
-            # Never turn a failed probe into permission to activate another
-            # Inspector: it might be an existing but temporarily busy session.
-            if target.owns(listener):
-                failures.append(str(error))
+        except InspectorProbeError as error:
+            failures.append(str(error))
+        except (CaptureError, OSError, ValueError, UnicodeError, TypeError):
+            # Node apps also own IPC/TCP servers which close, reset or ignore an
+            # HTTP request. Those failures do not identify an Inspector. The
+            # Inspector HTTP server runs independently of the JS event loop.
+            # Activation separately remembers *all* existing listener inodes,
+            # so even a temporarily unresponsive existing Inspector is never
+            # mistaken for a listener we may close after sending SIGUSR1.
+            continue
     if not endpoints:
         if failures:
-            raise CaptureError("Could not establish whether Inspector is already enabled: " + failures[0])
+            raise CaptureError(failures[0])
         if len(candidates) > 32:
             raise CaptureError("The process owns more than 32 listeners; Inspector discovery was incomplete")
     return endpoints
-
 
 def debugger_event(session, message):
     method = message.get("method")
@@ -415,6 +424,7 @@ def debugger_event(session, message):
 
 
 def debugger_stack(session, heading, deadline):
+    session.capture_note = ""
     session.command("Debugger.enable", {}, deadline)
     session.debugger_enabled = True
     # Enable replays an existing pause. Capture it without sending pause/resume
@@ -422,9 +432,20 @@ def debugger_stack(session, heading, deadline):
     session.preexisting_pause = session.paused is not None
     if not session.preexisting_pause:
         session.pause_requested = True
-        session.command("Debugger.pause", {}, deadline)
-        while session.paused is None:
-            session.pump(deadline)
+        pause_deadline = min(deadline - 0.15, time.monotonic() + 1.0)
+        try:
+            session.command("Debugger.pause", {}, pause_deadline)
+            while session.paused is None:
+                session.pump(pause_deadline)
+        except (socket.timeout, DeadlineExpired):
+            if session.paused is None:
+                # An event-loop thread without JS activity may never reach the
+                # requested pause point. Cancel our pending request before
+                # inspecting another thread; do not manufacture JS frames or
+                # leave a surprise pause waiting for the next application event.
+                resume_debugger(session, deadline)
+                session.capture_note = "No JavaScript pause point was reached within the sampling window."
+                return heading + "\n\n" + session.capture_note
     frames = session.paused.get("callFrames", [])
     if not isinstance(frames, list):
         raise CaptureError("Invalid JavaScript stack response")
@@ -447,7 +468,19 @@ def debugger_stack(session, heading, deadline):
 
 def resume_debugger(session, deadline):
     if session.pause_requested and not session.preexisting_pause:
-        session.command("Debugger.resume", {}, deadline)
+        try:
+            session.command("Debugger.resume", {}, deadline)
+        except CaptureError as error:
+            if session.paused is not None or "Can only perform operation while paused" not in str(error):
+                raise
+            # V8 accepted pause-on-next-statement but no statement ran yet.
+            # V8 disable() alone can leave the shared pause-on-next-statement
+            # flag set when another debugger is active. First deactivate this
+            # session's breakpoints: V8 explicitly cancels its pending pause in
+            # that operation. Other sessions retain their own breakpoint state.
+            session.command("Debugger.setBreakpointsActive", {"active": False}, deadline)
+            session.command("Debugger.disable", {}, deadline)
+            session.debugger_enabled = False
         session.pause_requested = False
 
 
@@ -463,6 +496,7 @@ class WorkerSession:
         self.preexisting_pause = False
         self.pause_requested = False
         self.debugger_enabled = False
+        self.capture_note = ""
         self.detached = False
         self.next_id = 1
         self.responses = {}
@@ -523,6 +557,8 @@ class Inspector:
         self.worker_limit = False
         self.worker_notes = []
         self.captured_workers = 0
+        self.capture_note = ""
+        self.sampling_notes = []
         try:
             nonce = base64.b64encode(os.urandom(16)).decode("ascii")
             request = ("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -672,6 +708,8 @@ class Inspector:
         except (CaptureError, OSError, ValueError, TypeError) as error:
             self.worker_notes.append("Worker stacks unavailable: " + str(error))
         sections = [debugger_stack(self, "Node Inspector: main JavaScript thread", deadline)]
+        if self.capture_note:
+            self.sampling_notes.append("Main thread: " + self.capture_note)
         # Resume the main thread promptly rather than holding it stopped while
         # potentially slower worker captures consume the rest of the deadline.
         resume_debugger(self, min(deadline, time.monotonic() + 0.5))
@@ -682,7 +720,10 @@ class Inspector:
             heading = "Worker %s%s" % (worker.worker_id, " (" + worker.title + ")" if worker.title else "")
             try:
                 sections.append(debugger_stack(worker, heading, min(deadline - 0.3, time.monotonic() + 1.0)))
-                self.captured_workers += 1
+                if worker.capture_note:
+                    self.sampling_notes.append(heading + ": " + worker.capture_note)
+                else:
+                    self.captured_workers += 1
             except (CaptureError, OSError, ValueError, TypeError) as error:
                 self.worker_notes.append(heading + ": " + str(error))
             try:
@@ -753,10 +794,13 @@ def capture(request):
     capture_deadline = started + CAPTURE_SECONDS
     final_deadline = capture_deadline + CLEANUP_SECONDS
     result = {"runtime": "node", "tool": "Node Inspector", "supported": True,
-              "success": False, "message": "", "text": "", "choice_required": False}
+              "success": False, "message": "", "text": "", "choice_required": False,
+              "fallback_safe": True}
     target = None
     session = None
     enabled_by_us = False
+    activation_requested = False
+    previous_listeners = set()
     cleanup_notes = []
     cleanup_failed = False
     try:
@@ -766,27 +810,36 @@ def capture(request):
             if request.get("enable_inspector") is not True:
                 result.update(choice_required=True, message="No Inspector listener owned by this Node process was found. Choose whether to enable Inspector for this capture or use llnode instead.")
                 return result
+            previous_listeners = {listener["inode"] for listener in target.listeners()}
             target.enable()
-            enabled_by_us = True
+            activation_requested = True
             while not endpoints:
                 remaining(capture_deadline)
                 endpoints = discover(target, capture_deadline)
                 if not endpoints:
                     time.sleep(min(0.05, remaining(capture_deadline)))
         session = connect_matching(target, endpoints, capture_deadline)
+        enabled_by_us = activation_requested and session.listener["inode"] not in previous_listeners
         result["text"] = session.capture(target, capture_deadline)
-        result["success"] = not session.worker_notes
+        result["success"] = not session.worker_notes and (not session.capture_note or session.captured_workers > 0)
         if session.worker_notes:
             result["message"] = "Captured main-thread JavaScript stacks; worker capture was partial. " + session.worker_notes[0]
         elif session.captured_workers:
-            result["message"] = "Captured JavaScript stacks for the main thread and %d worker%s." % (session.captured_workers, "" if session.captured_workers == 1 else "s")
+            prefix = "the main thread and " if not session.capture_note else ""
+            result["message"] = "Captured JavaScript stacks for %s%d worker%s." % (prefix, session.captured_workers, "" if session.captured_workers == 1 else "s")
+        elif session.capture_note:
+            result["message"] = session.capture_note
         else:
             result["message"] = "Captured main-thread JavaScript stacks."
+        if session.sampling_notes and result["success"]:
+            result["message"] += " Some threads did not reach a JavaScript pause point; see the capture notes."
         if session.preexisting_pause:
             result["message"] += " The process was already paused; this session did not resume it."
+        if activation_requested and not enabled_by_us:
+            result["message"] += " The Inspector listener already existed and was left enabled."
     except (CaptureError, OSError, ValueError, UnicodeError, TypeError, KeyError) as error:
         result["message"] = str(error) or "Node Inspector capture failed"
-        if enabled_by_us and session is None:
+        if activation_requested and session is None:
             result["message"] += " Inspector activation was requested, but no verified session became available (the configured port may be occupied)."
     finally:
         # Cleanup has its own reserve, even after the capture deadline. Never
@@ -849,9 +902,13 @@ def capture(request):
                 except (CaptureError, OSError, ValueError, TypeError):
                     cleanup_failed = True
                     cleanup_notes.insert(0, "Could not verify Inspector was disabled. Its listener may remain enabled; older ESM runtimes or a busy event loop can prevent automatic closure.")
-        elif enabled_by_us:
+        elif activation_requested:
             cleanup_failed = True
             cleanup_notes.append("Could not verify Inspector was disabled. No verified session was available for cleanup; its listener may remain enabled.")
+        if cleanup_failed:
+            # Native fallback must not attach another debugger while resume or
+            # Inspector cleanup from this attempt remains uncertain.
+            result["fallback_safe"] = False
         if cleanup_notes:
             cleanup_text = " ".join(cleanup_notes)
             if cleanup_failed:
@@ -874,7 +931,8 @@ def main():
         # stdout belongs solely to the native observer protocol, including
         # unexpected parser/platform failures. Never emit a Python traceback.
         result = {"runtime": "node", "tool": "Node Inspector", "supported": True,
-                  "success": False, "choice_required": False, "text": "", "message": str(error)}
+                  "success": False, "choice_required": False, "fallback_safe": False,
+                  "text": "", "message": str(error)}
     encoded = json.dumps(result, ensure_ascii=True, separators=(",", ":")).encode("ascii")
     while len(encoded) + 1 > OUTPUT_LIMIT and result.get("text"):
         result["text"] = result["text"][:max(0, int(len(result["text"]) * (OUTPUT_LIMIT - 2048) / len(encoded)) - 128)]

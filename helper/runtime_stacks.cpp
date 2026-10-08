@@ -198,6 +198,22 @@ Json script_stacks(const Json& request) {
         const auto data = Json::parse(result.output, nullptr, false);
         if (result.exit_code != 0 || !data.is_object())
             throw std::runtime_error("The Inspector client could not complete the request: " + result.output);
+        if (!data.value("success", false) && !data.value("choice_required", false) &&
+            data.value("fallback_safe", false)) {
+            // Discovery/capture failures can fall back, but never attach a
+            // second debugger when Inspector could not confirm its cleanup.
+            Json fallbackRequest = request;
+            fallbackRequest["backend"] = "llnode";
+            fallbackRequest.erase("enable_inspector");
+            const auto diagnostic = data.value("message", "Inspector capture failed");
+            auto fallback = script_stacks(fallbackRequest);
+            fallback["inspector_error"] = diagnostic;
+            fallback["fallback"] = true;
+            fallback["text"] = "Node Inspector: " + diagnostic + "\n\n" + data.value("text", "") +
+                "\n\nllnode fallback\n" + fallback.value("text", "");
+            fallback["message"] = "Inspector failed; tried llnode. " + fallback.value("message", "");
+            return fallback;
+        }
         return data;
     }
 
