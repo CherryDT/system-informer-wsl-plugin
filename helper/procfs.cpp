@@ -792,6 +792,79 @@ Json process_stacks(const Json& request) {
         backtrace = "python t = next(t for t in gdb.selected_inferior().threads() if t.ptid[1] == " +
             std::to_string(tid) + "); t.switch(); gdb.execute('bt 64')";
     }
+    auto annotate_frames = [](const std::string& output, const std::string& maps_before,
+                              const std::string& maps_after) {
+        // Keep GDB's source and ELF/minimal-symbol names. Where symbols are
+        // absent, add the mapped file and a file offset (not an ELF virtual RVA).
+        // Only use mappings unchanged across attachment: the process resumes
+        // before the second snapshot, so a newly mapped file may be unrelated
+        // to the captured PC. This also avoids attributing frames after exec.
+        std::set<std::string> previous_mappings;
+        std::istringstream previous_lines(maps_before);
+        std::string line;
+        while (std::getline(previous_lines, line)) previous_mappings.insert(line);
+
+        struct Mapping { uint64_t start, end, offset; std::string path; };
+        std::vector<Mapping> mappings;
+        std::istringstream map_lines(maps_after);
+        while (std::getline(map_lines, line)) {
+            if (!previous_mappings.count(line)) continue;
+            std::istringstream fields(line);
+            std::string range, permissions, offset, device, inode, path;
+            if (!(fields >> range >> permissions >> offset >> device >> inode)) continue;
+            std::getline(fields >> std::ws, path);
+            const auto dash = range.find('-');
+            if (path.empty() || path.front() != '/' || dash == std::string::npos) continue;
+            try {
+                mappings.push_back({std::stoull(range.substr(0, dash), nullptr, 16),
+                    std::stoull(range.substr(dash + 1), nullptr, 16), std::stoull(offset, nullptr, 16), path});
+            } catch (const std::exception&) { }
+        }
+
+        std::istringstream stack_lines(output);
+        std::string annotated;
+        while (std::getline(stack_lines, line)) {
+            // Parse only a backtrace's leading frame number and PC. Searching
+            // arbitrary hexadecimal text could mistake an argument or warning
+            // address for the instruction pointer.
+            const auto frame_end = line.find_first_not_of("0123456789", 1);
+            if (line.size() > 1 && line.front() == '#' && frame_end > 1 &&
+                frame_end != std::string::npos && (line[frame_end] == ' ' || line[frame_end] == '\t')) {
+                const auto address_start = line.find_first_not_of(" \t", frame_end);
+                if (address_start != std::string::npos && line.compare(address_start, 2, "0x") == 0) {
+                    try {
+                        size_t consumed = 0;
+                        const auto address = std::stoull(line.substr(address_start), &consumed, 16);
+                        const auto address_end = address_start + consumed;
+                        const bool complete_address = consumed > 2 && (address_end == line.size() ||
+                            line[address_end] == ' ' || line[address_end] == '\t');
+                        for (const auto& mapping : mappings) {
+                            if (!complete_address || address < mapping.start || address >= mapping.end ||
+                                mapping.offset > std::numeric_limits<uint64_t>::max() - (address - mapping.start))
+                                continue;
+                            std::ostringstream location;
+                            location << "[" << mapping.path << " file+0x" << std::hex <<
+                                (mapping.offset + address - mapping.start) << "]";
+                            const auto function_start = line.find_first_not_of(" \t", address_end);
+                            if (function_start != std::string::npos && line.compare(function_start, 5, "in ??") == 0 &&
+                                (function_start + 5 == line.size() || line[function_start + 5] == ' ' ||
+                                 line[function_start + 5] == '('))
+                                line.replace(function_start + 3, 2, location.str());
+                            else
+                                line += " " + location.str();
+                            break;
+                        }
+                    } catch (const std::exception&) { }
+                }
+            }
+            if (annotated.size() + line.size() + 1 > 512 * 1024) {
+                annotated += "[Annotated output truncated]\n";
+                break;
+            }
+            annotated += line + "\n";
+        }
+        return annotated;
+    };
     auto capture = [&](bool minimal_symbols) {
         // --readnever skips DWARF while retaining ELF minimal symbols, including
         // exported functions. Shared-library loading stays enabled for libc and
@@ -817,8 +890,12 @@ Json process_stacks(const Json& request) {
         // GDB cannot attach through a pidfd. Recheck each numeric attachment,
         // including a retry, without claiming this closes the PID-reuse race.
         require_identity(identity);
+        const auto maps_before = read_text(proc_path(identity.pid, "maps"), 8 * 1024 * 1024);
         auto result = run_command(arguments, 15000, 256 * 1024);
         require_identity(identity);
+        const auto maps_after = read_text(proc_path(identity.pid, "maps"), 8 * 1024 * 1024);
+        require_identity(identity);
+        result.output = annotate_frames(result.output, maps_before, maps_after);
         return result;
     };
     auto primary = capture(false);
@@ -836,47 +913,7 @@ Json process_stacks(const Json& request) {
         message = "GDB encountered a debug-information error. Retried with ELF minimal symbols; "
             "exported function and module names remain available, but source lines and reliable DWARF unwinding may be unavailable.";
 
-        // Preserve useful module context even for stripped frames named '??'.
-        // This is a mapped-file offset, not a promise about an ELF virtual RVA.
-        struct Mapping { uint64_t start, end, offset; std::string path; };
-        std::vector<Mapping> mappings;
-        std::istringstream map_lines(read_text(proc_path(identity.pid, "maps"), 8 * 1024 * 1024));
-        std::string line;
-        while (std::getline(map_lines, line)) {
-            std::istringstream fields(line);
-            std::string range, permissions, offset, device, inode, path;
-            if (!(fields >> range >> permissions >> offset >> device >> inode)) continue;
-            std::getline(fields >> std::ws, path);
-            const auto dash = range.find('-');
-            if (path.empty() || path.front() != '/' || dash == std::string::npos) continue;
-            try {
-                mappings.push_back({std::stoull(range.substr(0, dash), nullptr, 16),
-                    std::stoull(range.substr(dash + 1), nullptr, 16), std::stoull(offset, nullptr, 16), path});
-            } catch (const std::exception&) { }
-        }
-        std::istringstream stack_lines(result.output);
-        std::string annotated;
-        while (std::getline(stack_lines, line)) {
-            const auto address_start = line.find("0x");
-            if (!line.empty() && line.front() == '#' && address_start != std::string::npos) {
-                try {
-                    const auto address = std::stoull(line.substr(address_start), nullptr, 16);
-                    for (const auto& mapping : mappings) if (address >= mapping.start && address < mapping.end) {
-                        std::ostringstream location;
-                        location << " [" << mapping.path << " file+0x" << std::hex <<
-                            (mapping.offset + address - mapping.start) << "]";
-                        line += location.str();
-                        break;
-                    }
-                } catch (const std::exception&) { }
-            }
-            if (annotated.size() + line.size() + 1 > 512 * 1024) {
-                annotated += "[Annotated output truncated]\n";
-                break;
-            }
-            annotated += line + "\n";
-        }
-        output = message + "\n\nMinimal-symbol backtrace\n" + annotated +
+        output = message + "\n\nMinimal-symbol backtrace\n" + result.output +
             "\nOriginal GDB diagnostics\n" + primary.output;
     }
     if (result.timed_out) {
