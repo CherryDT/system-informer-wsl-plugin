@@ -70,7 +70,7 @@ Every process includes `pid`, `ppid`, `start_ticks`, `name`, `state`, `threads`,
 | `cgroup` | `cgroup`, `is_service`, `service_unit`, `service_scope` |
 | `exe` | `exe`, `runtime` |
 | `cwd` | `cwd` |
-| `suspension` | `stopped_threads`, `is_suspended`, `is_partially_suspended` when task enumeration succeeds |
+| `suspension` | `stopped_threads`, `is_suspended`, `is_partially_suspended` when thread state can be established |
 | `elf32` | `is_32bit` when `detect_32bit:true` and the executable's ELF class can be read |
 | `loadavg` | Top-level `loadavg` text |
 | `pressure` | Top-level CPU, memory and I/O `pressure` text, where available |
@@ -83,9 +83,11 @@ the process environment. `is_service` recognizes `.service` cgroup path
 components, including user services. `service_unit` is the deepest `.service`
 component and `service_scope` is `"user"` below a `user@UID.service` manager,
 otherwise `"system"`; both are empty when no service is found. The manager itself
-is a system service. Suspension examines task states `T`/`t`;
-fully suspended requires a complete enumeration matching the process thread
-count. An unreadable or changing task list does not establish full suspension.
+is a system service. Suspension examines task states `T`/`t`. For a process with
+one thread, the existing process stat supplies that thread's state without a
+task-directory scan. For multithreaded processes, fully suspended requires a
+complete enumeration matching the process thread count. An unreadable or changing
+task list does not establish full suspension.
 ELF detection pins a regular executable and validates ELF magic and byte 4
 (`EI_CLASS`); unknown is represented by an absent `is_32bit`, not false.
 
@@ -115,7 +117,13 @@ for graph history and lifecycle tracking, then requests visible metadata on
 return. Unrequested metadata may be retained for the same PID/start-time identity;
 requested-but-unavailable metadata must clear the previous value. This avoids
 making a changed executable or credential appear current because of old cache
-contents. Sampling follows the host automatic-refresh setting.
+contents. Sampling follows the host automatic-refresh setting. The Windows
+`EnableBackgroundCapture` setting defaults to 1. With it set to 0, the controller
+rejects requests for inactive distributions, closes their observer clients, and
+stops discovery while the WSL tab or host is hidden/minimized. Inspector and
+Find handles requests follow the same policy. Reopening the selected distro
+reconnects and refreshes; uncaptured graph intervals remain gaps. This is client
+policy rather than a wire-protocol request, and never shuts down a distro.
 
 ### `details` (`pid`, `start_ticks`)
 
@@ -177,12 +185,23 @@ text is capped at 256 KiB. These limits keep detail responses below the Windows
 transport limit even when paths contain characters requiring JSON escapes.
 A partial final environment value is omitted instead of presenting it as complete.
 
-### `find_handles` (`query`)
+### `find_handles` (`query`, optional `enumerate`, `case_sensitive`)
 
 Searches open descriptors and file mappings across the selected distro's visible
-PID namespace. `query` must be 1–1024 UTF-8 bytes. ASCII case-insensitive substring
-matching applies to paths and process names; an exact decimal PID matches every
-resource in that process. No shell, `lsof`, or target-file open is used.
+PID namespace. `query` must be 1–1024 UTF-8 bytes. Matching applies only to the
+resource's `path`, never the process name, command line, or PID. No shell, `lsof`,
+or target-file open is used.
+
+`enumerate` and `case_sensitive` default to false. With `enumerate:false`, the
+helper uses a literal byte-substring prefilter, folding ASCII case unless
+`case_sensitive:true`. Case-insensitive paths containing non-ASCII bytes are
+retained for authoritative Unicode matching on Windows. `enumerate:true` skips
+the prefilter and returns candidates for native regex or other matching that
+cannot safely be reproduced in the helper. The Windows client applies the native
+search control's matcher to returned paths, including case sensitivity and
+regular expressions. It does not substitute a Linux regex dialect. Queries
+using case-insensitive non-ASCII text, regex, or uncertain native option state
+request enumeration; an invalid expression is rejected before the request.
 
 Returns `{results,processes_scanned,inaccessible_processes,truncated}`. Each result
 contains `pid`, `start_ticks`, `process`, `handle`, `type`, and `path`. A handle is
@@ -195,11 +214,15 @@ before publishing that process's rows; later inspections must also validate it.
 `inaccessible_processes` counts processes whose FD directory could not be opened.
 
 The scan checks a five-second monotonic deadline between procfs operations, caps
-results at 10,000 and encoded rows at 8 MiB, and caps a process map file at 4 MiB.
+returned candidates at 10,000 and encoded rows at 8 MiB, and caps a process map
+file at 4 MiB.
 It sets `truncated` when a limit prevents full collection. This is a cooperative
 scan deadline; the Windows transport independently enforces its request timeout.
-The UI's Cancel detaches the request mailbox and ignores a late result. It does
-not kill the shared observer or interfere with another inspector; a request
+An incomplete result can omit matches, even if the final Windows filter finds
+none among the candidates. Searches begin only on an explicit Search action.
+The UI's Cancel, query edits, and option changes detach the request mailbox and
+ignore a late result. Cancellation does not kill the shared observer or
+interfere with another inspector; a request
 already running completes under its scan/transport limits. Closing the dialog
 also detaches the mailbox before draining posted replies.
 
@@ -251,8 +274,9 @@ at 12 MiB and reports `connections_truncated:true` when full.
 
 ### `signal` (`pid`, `start_ticks`, `signal`)
 
-Allows only SIGTERM (15), SIGKILL (9), SIGSTOP (19), SIGCONT (18), SIGUSR1 (10), and
-SIGUSR2 (12), SIGHUP (1), and SIGWINCH (28) on supported WSL x86-64/ARM64 Linux targets. Returns `{sent:true}`.
+Allows only SIGTERM (15), SIGINT (2), SIGKILL (9), SIGSTOP (19), SIGCONT (18),
+SIGUSR1 (10), SIGUSR2 (12), SIGHUP (1), and SIGWINCH (28) on supported WSL
+x86-64/ARM64 Linux targets. Returns `{sent:true}`.
 A successful return means the kernel accepted the signal, not that the process
 has already exited. Refresh to observe the resulting state.
 
@@ -377,6 +401,14 @@ The client allows a 12-second capture phase plus up to 2 seconds for cleanup,
 with a 20-second observer command timeout and a 35-second Windows request
 deadline. Captured text is limited to 512 KiB.
 
+For a main or worker thread paused by this capture, an exact singleton
+`processTimers` frame triggers short resampling: resume, wait 10 ms, then pause
+the same session again. Retries share a 200 ms budget clipped by the existing
+capture deadline with 150 ms reserved for cleanup. The first nonempty non-timer
+stack is kept; otherwise the latest actual timer stack remains in the output.
+Threads already paused before capture are never resumed for resampling. A retry
+that cannot reach a pause point uses the existing pending-pause cancellation.
+
 If an Inspector attempt fails and cleanup is safe, the observer tries llnode
 automatically. That response sets `fallback:true`, includes the original failure
 as `inspector_error`, and retains both diagnostics in `text`. If Inspector
@@ -488,6 +520,14 @@ Journal tab. Each of the four command outputs has a 128 KiB display limit with
 a visible truncation marker. Failed/inactive status is valid detail output.
 Journal permission failures appear in `journal`.
 
+For bare templates (`name` ending in `@.service`), the helper does not call
+runtime `systemctl show` or `status`. It obtains the unit definition with `cat`,
+the installed startup state with `list-unit-files`, and recent journal entries
+for the instance pattern (for example, `getty@*.service`). `overview.is_template:true`
+identifies this response; its other fields explain that there is no runtime
+instance or PID, and specifiers remain unexpanded. `text` contains the template
+explanation and unit definition. This path makes three commands instead of four.
+
 ### `service_action` (`name`, `action`)
 
 Allows `start`, `stop`, `restart`, `reload`, `enable`, or `disable`. Names must be
@@ -495,6 +535,8 @@ valid `.service` unit identifiers, never shell syntax. Returns `{accepted:true,
 message}` after systemctl accepts the request. Start/stop jobs are queued with
 `--no-block`; refresh to inspect completion or failure. Enable/disable changes
 boot activation and does not imply an immediate start/stop.
+Bare templates reject start/stop/restart/reload: those require a named instance.
+Enable/disable remain allowed and follow systemd's template installation rules.
 
 System tools run from trusted `/usr/bin` or `/bin` paths with explicit argv and
 a minimal environment. Caller PATH, bus-address, loader, and pager overrides are
