@@ -57,6 +57,7 @@ struct ProcessSample
 struct GraphSample
 {
     FILETIME timestamp{};
+    bool missing = false;
     double cpu = 0, topCpu = 0, interval = 0;
     unsigned cpus = 1;
     uint64_t memoryTotal = 0, memoryAvailable = 0, largestRss = 0;
@@ -90,7 +91,8 @@ struct View
     int page = 0;
     bool active = false, paused = false, pending = false, failed = false;
     bool forceRefresh = false, refreshAfterPending = false;
-    bool foreground = false;
+    bool foreground = false, captureSuspended = false;
+    ULONGLONG lastGraphTick = 0;
     bool collectConnections = false, collectServices = false;
     bool refreshServiceMetadata = true;
     ULONGLONG lastRefresh = 0;
@@ -164,7 +166,7 @@ void selectPage(View &view, int page);
 // Snapshot state, filtering and table presentation.
 void clearDistro(View &view);
 void updateButtons(View &view);
-void render(View &view);
+void render(View &view, uintptr_t changed = 0);
 void updateSnapshot(View &view, const Json &data);
 std::string connectionKey(const Json &connection);
 

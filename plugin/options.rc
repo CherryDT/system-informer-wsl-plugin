@@ -1,23 +1,24 @@
 #include <windows.h>
 #include "options.h"
 
-IDD_WSL_OPTIONS DIALOGEX 0, 0, 275, 251
+IDD_WSL_OPTIONS DIALOGEX 0, 0, 275, 270
 STYLE DS_SETFONT | DS_FIXEDSYS | DS_CONTROL | WS_CHILD
 FONT 8, "MS Shell Dlg", 400, 0, 1
 BEGIN
-    GROUPBOX "Monitoring", IDC_WSL_GENERAL_GROUP, 7, 7, 261, 110
+    GROUPBOX "Monitoring", IDC_WSL_GENERAL_GROUP, 7, 7, 261, 129
     LTEXT "Process CPU percentage:", IDC_WSL_CPU_LABEL, 14, 20, 220, 10
     COMBOBOX IDC_WSL_CPU_MODE, 14, 33, 247, 70, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     CONTROL "Use Node Inspector for JS stacks without asking", IDC_WSL_NODE_INSPECTOR, "Button", BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP, 14, 53, 247, 20
     CONTROL "Detect 32-bit processes", IDC_WSL_DETECT_32BIT, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 76, 247, 14
-    LTEXT "Refresh speed and automatic updates follow the main View menu.", IDC_WSL_REFRESH_NOTE, 14, 95, 247, 16
+    CONTROL "Enable background capture", IDC_WSL_BACKGROUND_CAPTURE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 94, 247, 14
+    LTEXT "Refresh speed and automatic updates follow the main View menu.", IDC_WSL_REFRESH_NOTE, 14, 114, 247, 16
 
-    GROUPBOX "Explorer paths", IDC_WSL_PATH_GROUP, 7, 124, 261, 99
-    LTEXT "WSL 2 distribution:", IDC_WSL_DISTRO_LABEL, 14, 137, 230, 10
-    COMBOBOX IDC_WSL_DISTRO, 14, 150, 247, 70, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT "Windows prefix (blank uses the normal WSL share):", IDC_WSL_PREFIX_LABEL, 14, 170, 247, 10
-    EDITTEXT IDC_WSL_PREFIX, 14, 183, 172, 14, ES_AUTOHSCROLL | WS_TABSTOP
-    PUSHBUTTON "Apply prefix", IDC_WSL_APPLY_PREFIX, 191, 182, 70, 16
-    LTEXT "Example: U:\\ maps /home/user to U:\\home\\user.", IDC_WSL_PREFIX_HINT, 14, 203, 247, 14
-    LTEXT "", IDC_WSL_OPTIONS_STATUS, 7, 229, 261, 18, SS_NOPREFIX
+    GROUPBOX "Explorer paths", IDC_WSL_PATH_GROUP, 7, 143, 261, 99
+    LTEXT "WSL 2 distribution:", IDC_WSL_DISTRO_LABEL, 14, 156, 230, 10
+    COMBOBOX IDC_WSL_DISTRO, 14, 169, 247, 70, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT "Windows prefix (blank uses the normal WSL share):", IDC_WSL_PREFIX_LABEL, 14, 189, 247, 10
+    EDITTEXT IDC_WSL_PREFIX, 14, 202, 172, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    PUSHBUTTON "Apply prefix", IDC_WSL_APPLY_PREFIX, 191, 201, 70, 16
+    LTEXT "Example: U:\\ maps /home/user to U:\\home\\user.", IDC_WSL_PREFIX_HINT, 14, 222, 247, 14
+    LTEXT "", IDC_WSL_OPTIONS_STATUS, 7, 248, 261, 18, SS_NOPREFIX
 END

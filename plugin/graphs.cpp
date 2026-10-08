@@ -41,6 +41,8 @@ std::wstring describe(const GraphSample &sample, bool memory)
     swprintf_s(stamp, L"%04u-%02u-%02u %02u:%02u:%02u.%03u", time.wYear, time.wMonth, time.wDay, time.wHour,
                time.wMinute, time.wSecond, time.wMilliseconds);
     std::wstring text = stamp;
+    if (sample.missing)
+        return text + L"\nCapture was disabled.";
     if (memory)
     {
         text += L"\nVM memory used: " + number(value(sample, true), 3) + L"%\n";
@@ -197,8 +199,10 @@ LRESULT CALLBACK graphProc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
         };
         for (size_t i = 0; i < samples.size(); ++i)
         {
+            if (samples[i].missing)
+                continue;
             const auto p = point(i);
-            if (i)
+            if (i && !samples[i - 1].missing)
                 LineTo(dc, p.x, p.y);
             else
                 MoveToEx(dc, p.x, p.y, nullptr);
@@ -208,11 +212,14 @@ LRESULT CALLBACK graphProc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
             const auto p = point(state->hover);
             MoveToEx(dc, p.x, 1, nullptr);
             LineTo(dc, p.x, r.bottom - 1);
-            auto brush = CreateSolidBrush(color);
-            auto oldBrush = SelectObject(dc, brush);
-            Ellipse(dc, p.x - 3, p.y - 3, p.x + 4, p.y + 4);
-            SelectObject(dc, oldBrush);
-            DeleteObject(brush);
+            if (!samples[state->hover].missing)
+            {
+                auto brush = CreateSolidBrush(color);
+                auto oldBrush = SelectObject(dc, brush);
+                Ellipse(dc, p.x - 3, p.y - 3, p.x + 4, p.y + 4);
+                SelectObject(dc, oldBrush);
+                DeleteObject(brush);
+            }
         }
         SelectObject(dc, originalPen);
         DeleteObject(curve);
@@ -222,7 +229,7 @@ LRESULT CALLBACK graphProc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
         RECT label = r;
         InflateRect(&label, -scale(window, 5), -scale(window, 3));
         std::wstring caption = state->memory ? L"WSL VM memory used" : L"Distro CPU";
-        if (!samples.empty())
+        if (!samples.empty() && !samples.back().missing)
         {
             caption += L"  " + number(value(samples.back(), state->memory)) + L"%";
             if (state->memory)

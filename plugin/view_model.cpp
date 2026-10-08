@@ -70,6 +70,7 @@ void clearDistro(View &v)
     v.bootId.clear();
     v.graphSamples.clear();
     v.graphSequence = 0;
+    v.lastGraphTick = 0;
     v.snapshot = Json();
     v.sockets = Json();
     v.units = Json();
@@ -93,16 +94,19 @@ void updateButtons(View &v)
     EnableWindow(v.settings, TRUE);
     EnableWindow(v.exportButton, !v.table().rows.empty());
 }
-void render(View &v)
+void render(View &v, uintptr_t changed)
 {
     v.cpuPercentOfTotal = readSetting(L"CpuPercentOfTotal", 1) != 0;
     const double cpuDivisor =
         v.cpuPercentOfTotal && v.snapshot.is_object() ? std::max(1.0, v.snapshot.value("cpus", 1.0)) : 1.0;
     std::vector<Row> rows;
     const auto query = lower(windowText(v.search));
-    if (v.snapshot.contains("processes"))
+    if ((!changed || changed == SnapshotTag) && v.snapshot.contains("processes"))
     {
-        auto items = v.snapshot["processes"].get<std::vector<Json>>();
+        const auto &items = v.snapshot["processes"];
+        const bool detect32Bit = readSetting(L"Detect32BitProcesses", 0) != 0;
+        const double hz = std::max(1.0, v.snapshot.value("clock_ticks", 100.0));
+        rows.reserve(items.size());
         const bool tree = SendMessageW(v.tree, BM_GETCHECK, 0, 0) == BST_CHECKED;
         const bool showSmallCpu = WslHostIntegerSetting(L"ShowCpuBelow001") != 0;
         const auto precision = static_cast<int>(std::min(6ul, WslHostIntegerSetting(L"MaxPrecisionUnit")));
@@ -113,7 +117,6 @@ void render(View &v)
                                                     WslHostIntegerSetting(L"SortRootProcesses")));
         for (const auto &p : items)
         {
-            const double hz = std::max(1.0, v.snapshot.value("clock_ticks", 100.0));
             auto cpuTime = [&](const char *key) {
                 return p.contains(key) ? number(p[key].get<double>() / hz) + L" s" : L"";
             };
@@ -178,7 +181,7 @@ void render(View &v)
                      text(p, "involuntary_switches"),
                      text(p, "seccomp"),
                      p.contains("no_new_privs") ? (p.value("no_new_privs", false) ? L"Yes" : L"No") : L"",
-                     (readSetting(L"Detect32BitProcesses", 0) && p.contains("is_32bit"))
+                     (detect32Bit && p.contains("is_32bit"))
                          ? (p.value("is_32bit", false) ? L"32-bit" : L"64-bit")
                          : L"",
                      cpuTime("user_ticks"),
@@ -186,7 +189,8 @@ void render(View &v)
                      text(p, "policy")},
                     p,
                     key};
-            row.numeric = {{ProcessCpu, cpu},
+            row.numeric = {{ProcessAge, static_cast<double>(age)},
+                           {ProcessCpu, cpu},
                            {ProcessRss, p.value("rss_bytes", 0.0)},
                            {ProcessRead, v.readRate[key]},
                            {ProcessWrite, v.writeRate[key]}};
@@ -198,7 +202,6 @@ void render(View &v)
                                                                         {ProcessReadChars, "read_chars"},
                                                                         {ProcessWriteChars, "write_chars"}})
                 row.numeric[field.first] = p.value(field.second, 0.0);
-            row.numeric[ProcessAge] = static_cast<double>(age);
             row.data["_cpu_percent"] = cpu;
             row.data["_read_rate"] = v.readRate[key];
             row.data["_write_rate"] = v.writeRate[key];
@@ -242,15 +245,18 @@ void render(View &v)
         v.processes.replace(
             std::move(rows),
             [query, ownOnly, hideSystem, uid = v.defaultUid](const Row &row) {
+                // A root process started through sudo belongs to Elevated,
+                // independently of whether either highlighting color is enabled.
                 const bool system = row.data.value("euid", row.data.value("uid", -1)) == 0 &&
                                     !row.data.value("sudo_root", false);
-                return (!hideSystem || !system) && (!ownOnly ||
+                return (!hideSystem || !system) &&
+                       (!ownOnly ||
                         (uid && row.data.contains("euid") && row.data.value("euid", uint32_t(-1)) == *uid)) &&
                        matches(row, query);
             },
             !v.snapshot.value("processes_truncated", false));
     }
-    if (v.sockets.contains("connections"))
+    if ((!changed || changed == ConnectionsTag) && v.sockets.contains("connections"))
     {
         rows.clear();
         bool onlyListeners = SendMessageW(v.listeners, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -279,7 +285,7 @@ void render(View &v)
             !v.sockets.value("connections_truncated", false) &&
                 v.sockets.value("inaccessible_processes", 0) == 0);
     }
-    if (v.units.contains("services"))
+    if ((!changed || changed == ServicesTag) && v.units.contains("services"))
     {
         rows.clear();
         for (const auto &s : v.units["services"])
@@ -365,9 +371,18 @@ void updateSnapshot(View &v, const Json &data)
     // another process's command line, credentials or highlighting metadata.
     std::map<std::string, Json> prior;
     if (v.snapshot.contains("processes"))
-        for (const auto &process : v.snapshot["processes"])
-            prior.emplace(processKey(process), process);
+        for (auto &process : v.snapshot["processes"])
+        {
+            auto key = processKey(process);
+            prior.emplace(std::move(key), std::move(process));
+        }
     v.snapshot = data;
+    std::set<std::string> requested;
+    for (const auto &field : data.value("fields", Json::array()))
+        requested.insert(field.get<std::string>());
+    if (requested.count("user") || requested.count("sudo"))
+        requested.insert("status");
+    const bool allFields = !data.contains("fields");
     for (auto &process : v.snapshot["processes"])
     {
         auto previous = prior.find(processKey(process));
@@ -376,18 +391,11 @@ void updateSnapshot(View &v, const Json &data)
             Json merged = std::move(previous->second);
             // Requested-but-unavailable fields must become unknown, not retain
             // a pre-exec image/credential value. Unrequested fields are cached.
-            const Json fields = data.value("fields", Json::array());
-            std::set<std::string> requested;
-            for (const auto &field : fields)
-                requested.insert(field.get<std::string>());
-            const bool allFields = !data.contains("fields");
             auto dropGroup = [&](const char *group, std::initializer_list<const char *> keys) {
                 for (const auto key : keys)
                     if (allFields || requested.count(group) || requested.count(key))
                         merged.erase(key);
             };
-            if (requested.count("user") || requested.count("sudo"))
-                requested.insert("status");
             dropGroup("status", {"uid", "euid", "gid", "egid", "status_accessible", "tracer_pid",
                                  "voluntary_switches", "involuntary_switches", "seccomp", "no_new_privs",
                                  "capabilities", "swap_bytes", "is_own"});
@@ -408,6 +416,7 @@ void updateSnapshot(View &v, const Json &data)
     double cpus = std::max(1.0, data.value("cpus", 1.0));
     if (elapsed > 0)
     {
+        v.lastGraphTick = GetTickCount64();
         graph.cpu = total / cpus;
         graph.cpus = static_cast<unsigned>(cpus);
         graph.memoryTotal = data.value("memory_total", 0ull);

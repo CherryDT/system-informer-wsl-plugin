@@ -114,7 +114,8 @@ std::wstring windowsPath(const std::wstring &distro, const std::wstring &linuxPa
     size_t begin = 1;
     // Standard WSL drive mounts refer to Windows volumes directly, even when
     // ordinary Linux paths use a custom per-distro Explorer prefix.
-    const bool mountedDrive = path.size() >= 6 && path.compare(0, 5, L"/mnt/") == 0 &&
+    const bool mountedDrive =
+        path.size() >= 6 && path.compare(0, 5, L"/mnt/") == 0 &&
         ((path[5] >= L'a' && path[5] <= L'z') || (path[5] >= L'A' && path[5] <= L'Z')) &&
         (path.size() == 6 || path[6] == L'/');
     if (mountedDrive)
@@ -127,9 +128,12 @@ std::wstring windowsPath(const std::wstring &distro, const std::wstring &linuxPa
     {
         prefix = distroPrefix(distro);
         if (!validPrefix(prefix))
-            throw std::runtime_error("The registry path override is invalid. Correct it in WSL Tools settings.");
-        if (prefix.empty()) prefix = L"\\\\wsl.localhost\\" + distro + L"\\";
-        if (prefix.back() != L'\\') prefix += L'\\';
+            throw std::runtime_error(
+                "The registry path override is invalid. Correct it in WSL Tools settings.");
+        if (prefix.empty())
+            prefix = L"\\\\wsl.localhost\\" + distro + L"\\";
+        if (prefix.back() != L'\\')
+            prefix += L'\\';
     }
     std::wstring tail;
     while (begin <= path.size())
@@ -216,25 +220,26 @@ void layoutOptions(HWND window)
         place(GetDlgItem(window, id), units.left, units.top, bounds.right - units.left - units.right,
               units.bottom);
     };
-    position(IDC_WSL_GENERAL_GROUP, 7, 7, 7, 110);
+    position(IDC_WSL_GENERAL_GROUP, 7, 7, 7, 129);
     position(IDC_WSL_CPU_LABEL, 14, 20, 14, 10);
     position(IDC_WSL_CPU_MODE, 14, 33, 14, 70);
     position(IDC_WSL_NODE_INSPECTOR, 14, 53, 14, 20);
     position(IDC_WSL_DETECT_32BIT, 14, 76, 14, 14);
-    position(IDC_WSL_REFRESH_NOTE, 14, 95, 14, 16);
-    position(IDC_WSL_PATH_GROUP, 7, 124, 7, 99);
-    position(IDC_WSL_DISTRO_LABEL, 14, 137, 14, 10);
-    position(IDC_WSL_DISTRO, 14, 150, 14, 70);
-    position(IDC_WSL_PREFIX_LABEL, 14, 170, 14, 10);
-    position(IDC_WSL_PREFIX, 14, 183, 89, 14);
-    RECT button{0, 182, 70, 16};
+    position(IDC_WSL_BACKGROUND_CAPTURE, 14, 94, 14, 14);
+    position(IDC_WSL_REFRESH_NOTE, 14, 114, 14, 16);
+    position(IDC_WSL_PATH_GROUP, 7, 143, 7, 99);
+    position(IDC_WSL_DISTRO_LABEL, 14, 156, 14, 10);
+    position(IDC_WSL_DISTRO, 14, 169, 14, 70);
+    position(IDC_WSL_PREFIX_LABEL, 14, 189, 14, 10);
+    position(IDC_WSL_PREFIX, 14, 202, 89, 14);
+    RECT button{0, 201, 70, 16};
     MapDialogRect(window, &button);
     RECT margin{14, 0, 0, 0};
     MapDialogRect(window, &margin);
     place(GetDlgItem(window, IDC_WSL_APPLY_PREFIX), bounds.right - margin.left - button.right, button.top,
           button.right, button.bottom);
-    position(IDC_WSL_PREFIX_HINT, 14, 203, 14, 14);
-    position(IDC_WSL_OPTIONS_STATUS, 7, 229, 7, 18);
+    position(IDC_WSL_PREFIX_HINT, 14, 222, 14, 14);
+    position(IDC_WSL_OPTIONS_STATUS, 7, 248, 7, 18);
 }
 
 INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
@@ -254,6 +259,8 @@ INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                        readSetting(L"UseNodeInspectorWithoutAsking", 0) ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(window, IDC_WSL_DETECT_32BIT,
                        readSetting(L"Detect32BitProcesses", 0) ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(window, IDC_WSL_BACKGROUND_CAPTURE,
+                       readSetting(L"EnableBackgroundCapture", 1) ? BST_CHECKED : BST_UNCHECKED);
         SendDlgItemMessageW(window, IDC_WSL_PREFIX, EM_SETLIMITTEXT, 32760, 0);
         try
         {
@@ -314,6 +321,13 @@ INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             {
                 writeSetting(L"Detect32BitProcesses", IsDlgButtonChecked(window, id) == BST_CHECKED ? 1 : 0);
                 optionsStatus(window, L"32-bit detection preference saved.");
+                return TRUE;
+            }
+            if (id == IDC_WSL_BACKGROUND_CAPTURE && event == BN_CLICKED)
+            {
+                writeSetting(L"EnableBackgroundCapture",
+                             IsDlgButtonChecked(window, id) == BST_CHECKED ? 1 : 0);
+                optionsStatus(window, L"Background capture preference saved.");
                 return TRUE;
             }
             if (id == IDC_WSL_PREFIX && event == EN_CHANGE)

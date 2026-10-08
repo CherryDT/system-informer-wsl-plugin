@@ -8,10 +8,13 @@
 #include <mutex>
 #include <thread>
 
-namespace wsl {
-namespace {
+namespace wsl
+{
+namespace
+{
 
-struct Job {
+struct Job
+{
     std::wstring distro;
     Json request;
     std::shared_ptr<Mailbox> mailbox;
@@ -29,8 +32,20 @@ std::atomic<bool> cancellationRequested{true};
 // Accessed under queueMutex. Shared ownership keeps cancellation safe while
 // the worker finishes a request or removes a disconnected client from its map.
 std::shared_ptr<Client> activeClient;
+std::wstring activeDistro;
+bool backgroundCapture = true, captureVisible = false;
+std::wstring captureDistro;
+std::atomic<bool> discoveryPaused{false};
 
-std::wstring helperPath() {
+bool captureAllowed(const std::wstring &distro, const std::string &operation)
+{
+    return backgroundCapture || (captureVisible && (operation == "discover" || distro == captureDistro));
+}
+constexpr auto CapturePaused =
+    "Capture is paused. Open this distribution in the WSL tab, or enable background capture in WSL options.";
+
+std::wstring helperPath()
+{
     std::wstring path(32768, L'\0');
     const DWORD size = GetModuleFileNameW(instance, path.data(), static_cast<DWORD>(path.size()));
     if (!size || size >= path.size())
@@ -39,8 +54,10 @@ std::wstring helperPath() {
     return path.substr(0, path.find_last_of(L"\\/")) + L"\\wsl-observer";
 }
 
-void deliver(const std::shared_ptr<Mailbox>& mailbox, std::unique_ptr<Reply> reply) {
-    if (!mailbox) return;
+void deliver(const std::shared_ptr<Mailbox> &mailbox, std::unique_ptr<Reply> reply)
+{
+    if (!mailbox)
+        return;
     // Window teardown takes the same lock before clearing its HWND, then drains
     // queued replies. A worker can therefore never post after that final drain.
     std::lock_guard<std::mutex> lock(mailbox->gate);
@@ -49,52 +66,88 @@ void deliver(const std::shared_ptr<Mailbox>& mailbox, std::unique_ptr<Reply> rep
         reply.release();
 }
 
-void run() {
+void run()
+{
     std::map<std::wstring, std::shared_ptr<Client>> clients;
-    for (;;) {
+    for (;;)
+    {
         Job job;
         {
             std::unique_lock<std::mutex> lock(queueMutex);
             ready.wait(lock, [] { return stopping || !jobs.empty(); });
-            if (stopping) break;
+            if (stopping)
+                break;
             job = std::move(jobs.front());
             jobs.pop_front();
         }
         const auto operation = job.request.value("op", "");
-        if (operation == "disconnect") {
+        if (operation == "capture_policy")
+        {
+            // Also discard clients cancelled by a hide followed immediately by
+            // a show: the current policy may already allow capture again.
+            clients.clear();
+            continue;
+        }
+        if (operation == "disconnect")
+        {
             clients.erase(job.distro);
             continue;
         }
-        if (!job.mailbox || !job.mailbox->window.load()) continue;
+        if (!job.mailbox || !job.mailbox->window.load())
+            continue;
 
         auto reply = std::make_unique<Reply>();
         reply->tag = job.tag;
-        try {
-            if (operation == "discover") {
+        try
+        {
+            {
+                std::lock_guard<std::mutex> lock(queueMutex);
+                if (!captureAllowed(job.distro, operation))
+                    throw std::runtime_error(CapturePaused);
+            }
+            if (operation == "discover")
+            {
                 reply->data = Json::array();
-                for (const auto& distro : runningDistros([] { return cancellationRequested.load(); }))
+                for (const auto &distro :
+                     runningDistros([] { return cancellationRequested.load() || discoveryPaused.load(); }))
                     reply->data.push_back(utf8(distro.name));
-            } else {
-                auto& client = clients[job.distro];
+            }
+            else
+            {
+                auto &client = clients[job.distro];
                 // Installation is the explicit action that may replace a
                 // terminal missing-component connection with a fresh one.
-                if (operation == "install_component") client.reset();
-                if (!client) client = std::make_shared<Client>(job.distro, helperPath());
+                if (operation == "install_component")
+                    client.reset();
+                if (!client)
+                    client = std::make_shared<Client>(job.distro, helperPath());
                 {
                     std::lock_guard<std::mutex> lock(queueMutex);
-                    if (stopping) break;
+                    if (stopping)
+                        break;
+                    if (!captureAllowed(job.distro, operation))
+                    {
+                        clients.erase(job.distro);
+                        throw std::runtime_error(CapturePaused);
+                    }
+                    activeDistro = job.distro;
                     activeClient = client;
                 }
                 const auto timeout = operation == "service_details" || operation == "service_action" ||
-                    operation == "stacks" || operation == "script_stacks"
-                    ? std::chrono::seconds(35) : std::chrono::seconds(20);
-                reply->data = operation == "install_component"
-                    ? client->installComponent() : client->request(job.request, timeout);
+                                             operation == "stacks" || operation == "script_stacks"
+                                         ? std::chrono::seconds(35)
+                                         : std::chrono::seconds(20);
+                reply->data = operation == "install_component" ? client->installComponent()
+                                                               : client->request(job.request, timeout);
             }
-        } catch (const ComponentMissing& error) {
+        }
+        catch (const ComponentMissing &error)
+        {
             reply->componentMissing = true;
             reply->error = error.what();
-        } catch (const std::exception& error) {
+        }
+        catch (const std::exception &error)
+        {
             reply->error = error.what();
             // A valid remote error leaves the connection usable. A transport
             // failure leaves Client terminal until an explicit disconnect;
@@ -103,7 +156,9 @@ void run() {
         {
             std::lock_guard<std::mutex> lock(queueMutex);
             activeClient.reset();
-            if (stopping) break;
+            activeDistro.clear();
+            if (stopping)
+                break;
         }
         deliver(job.mailbox, std::move(reply));
     }
@@ -114,33 +169,44 @@ void run() {
 
 } // namespace
 
-void startController() {
+void startController()
+{
     // Serialize start/join separately from the queue lock, which the worker
     // needs while exiting. Concurrent start cannot revive a stopping worker.
     std::lock_guard<std::mutex> lifecycle(lifecycleMutex);
     std::lock_guard<std::mutex> lock(queueMutex);
-    if (worker.joinable()) return;
+    if (worker.joinable())
+        return;
     stopping = false;
     cancellationRequested = false;
-    try {
+    try
+    {
         worker = std::thread(run);
-    } catch (...) {
+    }
+    catch (...)
+    {
         stopping = true;
         cancellationRequested = true;
         throw;
     }
 }
 
-void submit(const std::wstring& distro, Json request, std::shared_ptr<Mailbox> mailbox, uintptr_t tag) {
+void submit(const std::wstring &distro, Json request, std::shared_ptr<Mailbox> mailbox, uintptr_t tag)
+{
     std::string rejection;
     {
         std::lock_guard<std::mutex> lock(queueMutex);
-        if (stopping) rejection = "WSL Tools is shutting down.";
+        if (stopping)
+            rejection = "WSL Tools is shutting down.";
+        else if (!captureAllowed(distro, request.value("op", "")))
+            rejection = CapturePaused;
         else if (jobs.size() >= MaximumQueuedRequests)
             rejection = "Too many WSL requests are waiting. Wait for the current operation, then try again.";
-        else jobs.push_back({distro, std::move(request), mailbox, tag});
+        else
+            jobs.push_back({distro, std::move(request), mailbox, tag});
     }
-    if (!rejection.empty()) {
+    if (!rejection.empty())
+    {
         auto reply = std::make_unique<Reply>();
         reply->tag = tag;
         reply->error = std::move(rejection);
@@ -150,35 +216,85 @@ void submit(const std::wstring& distro, Json request, std::shared_ptr<Mailbox> m
     ready.notify_one();
 }
 
-void disconnect(const std::wstring& distro) {
+void setCapturePolicy(bool background, bool visible, const std::wstring &distro)
+{
+    std::deque<Job> cancelled;
     {
         std::lock_guard<std::mutex> lock(queueMutex);
-        if (stopping) return;
+        if (backgroundCapture == background && captureVisible == visible && captureDistro == distro)
+            return;
+        const bool previouslyBackground = backgroundCapture;
+        backgroundCapture = background;
+        captureVisible = visible;
+        captureDistro = distro;
+        discoveryPaused = !background && !visible;
+        if (stopping || (background && previouslyBackground))
+            return;
+        for (auto it = jobs.begin(); it != jobs.end();)
+        {
+            const auto op = it->request.value("op", "");
+            if (op == "capture_policy")
+                it = jobs.erase(it);
+            else if (op != "disconnect" && !captureAllowed(it->distro, op))
+            {
+                cancelled.push_back(std::move(*it));
+                it = jobs.erase(it);
+            }
+            else
+                ++it;
+        }
+        if (activeClient && !captureAllowed(activeDistro, "snapshot"))
+            activeClient->close();
+        // The worker owns idle clients. Give its cleanup priority over new work.
+        jobs.push_front({{}, {{"op", "capture_policy"}}, nullptr, 0});
+    }
+    for (const auto &job : cancelled)
+    {
+        auto reply = std::make_unique<Reply>();
+        reply->tag = job.tag;
+        reply->error = CapturePaused;
+        deliver(job.mailbox, std::move(reply));
+    }
+    ready.notify_one();
+}
+
+void disconnect(const std::wstring &distro)
+{
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        if (stopping)
+            return;
         // Preserve previously requested actions, but discard old polling work.
         // Coalesce control markers too: repeated reconnect clicks cannot create
         // an unbounded queue. Control markers have priority over the request cap
         // so a busy queue can always release a connection.
-        jobs.erase(std::remove_if(jobs.begin(), jobs.end(), [&](const Job& job) {
-            const auto operation = job.request.value("op", "");
-            return job.distro == distro && (operation == "snapshot" || operation == "connections" ||
-                operation == "services" || operation == "disconnect");
-        }), jobs.end());
+        jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
+                                  [&](const Job &job) {
+                                      const auto operation = job.request.value("op", "");
+                                      return job.distro == distro &&
+                                             (operation == "snapshot" || operation == "connections" ||
+                                              operation == "services" || operation == "disconnect");
+                                  }),
+                   jobs.end());
         jobs.push_back({distro, {{"op", "disconnect"}}, nullptr, 0});
     }
     ready.notify_one();
 }
 
-void stopController() {
+void stopController()
+{
     std::lock_guard<std::mutex> lifecycle(lifecycleMutex);
     {
         std::lock_guard<std::mutex> lock(queueMutex);
         stopping = true;
         cancellationRequested = true;
         jobs.clear();
-        if (activeClient) activeClient->close();
+        if (activeClient)
+            activeClient->close();
     }
     ready.notify_one();
-    if (worker.joinable()) worker.join();
+    if (worker.joinable())
+        worker.join();
     std::lock_guard<std::mutex> lock(queueMutex);
     activeClient.reset();
 }

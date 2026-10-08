@@ -36,6 +36,70 @@ bool contentVisible(const View &v)
     HWND host = GetAncestor(v.window, GA_ROOT);
     return v.active && IsWindowVisible(v.window) && IsWindowVisible(host) && !IsIconic(host);
 }
+// This runs on the UI thread and never waits for WSL. The controller wakes or
+// cancels its worker independently, including requests from open inspectors.
+void updateCaptureState(View &v)
+{
+    const bool visible = contentVisible(v);
+    const bool background = readSetting(L"EnableBackgroundCapture", 1) != 0;
+    setCapturePolicy(background, visible, v.selectedDistro);
+    const bool suspended = !background && !visible;
+    const auto now = GetTickCount64();
+    if (suspended != v.captureSuspended)
+    {
+        v.captureSuspended = suspended;
+        ++v.epoch;
+        v.pending = false;
+        v.refreshAfterPending = false;
+        v.previous.clear();
+        v.previousTime = 0;
+        if (suspended)
+        {
+            v.lastGraphTick = now;
+            // One empty slot separates adjacent traces even for a brief hide.
+            GraphSample missing;
+            missing.missing = true;
+            GetSystemTimeAsFileTime(&missing.timestamp);
+            v.graphSamples.push_back(missing);
+            ++v.graphSequence;
+            if (v.graphSamples.size() > 120)
+                v.graphSamples.pop_front();
+            status(v, L"Background capture is disabled. Capture resumes when this WSL tab is visible.");
+        }
+        else
+        {
+            v.failed = v.componentMissing;
+            v.forceRefresh = true;
+            v.refreshServiceMetadata = true;
+        }
+    }
+    if (suspended && v.lastGraphTick)
+    {
+        const auto interval = std::max(1ul, WslHostRefreshInterval());
+        const auto count = (now - v.lastGraphTick) / interval;
+        if (count)
+        {
+            FILETIME stamp{};
+            GetSystemTimeAsFileTime(&stamp);
+            ULARGE_INTEGER time{};
+            time.LowPart = stamp.dwLowDateTime;
+            time.HighPart = stamp.dwHighDateTime;
+            for (uint64_t i = std::min<uint64_t>(count, 120); i > 0; --i)
+            {
+                GraphSample missing;
+                missing.missing = true;
+                ULARGE_INTEGER slot = time;
+                slot.QuadPart -= (i - 1) * interval * 10000ull;
+                missing.timestamp = {slot.LowPart, slot.HighPart};
+                v.graphSamples.push_back(missing);
+                if (v.graphSamples.size() > 120)
+                    v.graphSamples.pop_front();
+            }
+            v.graphSequence += count;
+            v.lastGraphTick += count * interval;
+        }
+    }
+}
 Json mergeIdentitySnapshot(const Json &previous, const Json &incoming, const char *arrayName)
 {
     if (!incoming.value("identities_only", false) || !previous.contains(arrayName))
@@ -129,6 +193,9 @@ bool queueVisibleServices(View &v)
 } // namespace
 void refresh(View &v)
 {
+    updateCaptureState(v);
+    if (v.captureSuspended)
+        return;
     if ((v.paused && !v.forceRefresh) || v.pending || v.failed)
         return;
     if (v.selectedDistro.empty())
@@ -242,7 +309,8 @@ void switchPage(View &v)
 }
 void manualRefresh(View &v)
 {
-    if (v.pending)
+    updateCaptureState(v);
+    if (v.captureSuspended || v.pending)
         return;
     if (v.failed)
         disconnect(v.selectedDistro);
@@ -449,6 +517,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         layout(*v);
         SetTimer(window, 1, 500, nullptr);
         startController();
+        updateCaptureState(*v);
         return 0;
     }
     case WM_GETFONT:
@@ -471,6 +540,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         layout(*v);
         return 0;
     case WM_TIMER: {
+        updateCaptureState(*v);
         const bool foreground = contentVisible(*v);
         if (foreground != v->foreground)
         {
@@ -619,6 +689,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
     }
     case ReplyMessage: {
         std::unique_ptr<Reply> reply(reinterpret_cast<Reply *>(lparam));
+        updateCaptureState(*v);
         if ((reply->tag >> 16) != v->epoch)
             return 0;
         v->pending = false;
@@ -741,7 +812,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                     layout(*v);
                 }
                 updateSnapshot(*v, reply->data);
-                render(*v);
+                render(*v, SnapshotTag);
                 if (contentVisible(*v) && v->page == 0 && !v->newProcess.empty() &&
                     WslHostIntegerSetting(L"ScrollToNewProcesses"))
                 {
@@ -768,10 +839,9 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                     queue(*v,
                           {{"op", "connections"},
                            {"identities_only", !contentVisible(*v) || v->page != 1},
-                           {"resolve_names",
-                            contentVisible(*v) && v->page == 1 &&
-                                WslHostIntegerSetting(L"EnableNetworkResolve") &&
-                                v->connections.isColumnVisible(9)}},
+                           {"resolve_names", contentVisible(*v) && v->page == 1 &&
+                                                 WslHostIntegerSetting(L"EnableNetworkResolve") &&
+                                                 v->connections.isColumnVisible(9)}},
                           ConnectionsTag);
                     return 0;
                 }
@@ -781,14 +851,14 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             else if (tag == ConnectionsTag)
             {
                 v->sockets = mergeIdentitySnapshot(v->sockets, reply->data, "connections");
-                render(*v);
+                render(*v, ConnectionsTag);
                 if (v->collectServices && queueVisibleServices(*v))
                     return 0;
             }
             else if (tag == ServicesTag)
             {
                 v->units = mergeIdentitySnapshot(v->units, reply->data, "services");
-                render(*v);
+                render(*v, ServicesTag);
                 if (!v->units.value("available", true))
                 {
                     status(*v, text(v->units, "message", L"systemd is unavailable in this distribution."));
@@ -890,6 +960,7 @@ extern "C" void WslSetActive(BOOL active)
         return;
     auto &v = *mainView;
     v.active = active != FALSE;
+    updateCaptureState(v);
     if (v.active)
     {
         v.failed = false;
@@ -902,8 +973,8 @@ extern "C" void WslSetActive(BOOL active)
             status(v, L"Automatic refresh is off. Use View > Refresh (F5) to update.");
         refresh(v);
     }
-    // Keep the existing connection and sample identities/graphs in the
-    // background. Returning to WSL immediately requests visible metadata.
+    // With background capture enabled, inactive pages retain graph history
+    // and process identities. Otherwise updateCaptureState releases the helper.
 }
 extern "C" void WslShutdown(void)
 {
