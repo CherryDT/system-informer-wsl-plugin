@@ -67,7 +67,7 @@ Every process includes `pid`, `ppid`, `start_ticks`, `name`, `state`, `threads`,
 | `sudo` | Status fields and `sudo_root` |
 | `command` | `command` |
 | `io` | `io_accessible`, `read_bytes`, `write_bytes`, `read_chars`, `write_chars`, `syscr`, `syscw`, `cancelled_write_bytes` |
-| `cgroup` | `cgroup`, `is_service` |
+| `cgroup` | `cgroup`, `is_service`, `service_unit`, `service_scope` |
 | `exe` | `exe`, `runtime` |
 | `cwd` | `cwd` |
 | `suspension` | `stopped_threads`, `is_suspended`, `is_partially_suspended` when task enumeration succeeds |
@@ -80,7 +80,10 @@ group names above. `runtime` is `"node"`, `"python"`, `"java"`, or empty when
 unrecognized. `is_own` compares effective UID with `default_uid`. `sudo_root`
 requires effective UID 0 and a nonzero numeric `SUDO_UID` from up to 256 KiB of
 the process environment. `is_service` recognizes `.service` cgroup path
-components, including user services. Suspension examines task states `T`/`t`;
+components, including user services. `service_unit` is the deepest `.service`
+component and `service_scope` is `"user"` below a `user@UID.service` manager,
+otherwise `"system"`; both are empty when no service is found. The manager itself
+is a system service. Suspension examines task states `T`/`t`;
 fully suspended requires a complete enumeration matching the process thread
 count. An unreadable or changing task list does not establish full suspension.
 ELF detection pins a regular executable and validates ELF magic and byte 4
@@ -107,7 +110,7 @@ come from local `/etc/passwd`; other UIDs remain numeric, avoiding network name
 services. Command lines are capped at 16 KiB per process.
 
 The Windows view selects groups from visible or sorted columns and enabled
-highlighting. It keeps cheap identity/CPU/RSS samples while hidden or minimized
+highlighting, applicable filters, and service-unit tooltips. It keeps cheap identity/CPU/RSS samples while hidden or minimized
 for graph history and lifecycle tracking, then requests visible metadata on
 return. Unrequested metadata may be retained for the same PID/start-time identity;
 requested-but-unavailable metadata must clear the previous value. This avoids
@@ -200,7 +203,7 @@ not kill the shared observer or interfere with another inspector; a request
 already running completes under its scan/transport limits. Closing the dialog
 also detaches the mailbox before draining posted replies.
 
-### `connections` (optional `pid`, `start_ticks`, `identities_only`)
+### `connections` (optional `pid`, `start_ticks`, `identities_only`, `resolve_names`)
 
 Returns `connections`, `connections_truncated`, `inaccessible_processes`, `tables_read`,
 `network_namespace`, and `coverage`.
@@ -216,6 +219,21 @@ With `identities_only:true`, rows omit `process` and `state`; all socket and own
 identity fields remain. The response echoes `identities_only`. This avoids
 sending display-only metadata for hidden views. The FD and network-table scans
 are still necessary to establish socket lifetimes and ownership.
+
+With `resolve_names:true` and `identities_only:false`, each row also has
+`remote_hostname`, empty when unknown. The helper validates numeric IPv4/IPv6
+addresses and uses `getent hosts` through the trusted command runner, without a
+shell. IPv4-mapped IPv6 shares its IPv4 cache key. At most one uncached lookup
+runs per request, with a 500 ms command timeout and 4 KiB output limit. Successful
+names are cached for 300 seconds and failures for 60 seconds, up to 1,024 entries.
+Unspecified/multicast addresses, invalid answers, missing `getent`, and resolver
+failures produce no name. No lookups run for identity-only requests. The Windows
+client requests names only for a visible Network view when the host's
+`EnableNetworkResolve` is enabled and the hostname column is visible. Hiding the
+column disables lookups even when that column remains the sort key.
+
+The Windows `HideWaitingConnections` setting filters PID 0 and TCP `CLOSE_WAIT`
+rows in main and process-detail tables; it does not change the helper response.
 
 Socket ownership is joined from visible `/proc/PID/fd` entries. Shared sockets
 have one row for each owning process; duplicate FDs within a process are collapsed.
@@ -255,7 +273,12 @@ If GDB reports a DWARF/split-DWARF reader error or an internal debugger failure,
 the helper retries once with `--readnever` and the executable supplied through
 `--se`. This retains ELF minimal symbols and shared-library lookup, including
 exported function names, while skipping symbolic DWARF debug information. The
-fallback also appends module/file-offset annotations and a shared-library list.
+fallback also appends a shared-library list. Both ordinary and fallback captures
+annotate frame PCs with mapped-file paths and file offsets, replacing `??` when
+possible while retaining GDB symbol names and source locations. An annotation is
+used only when the complete mapping line is identical before and after capture;
+anonymous or changed mappings remain unannotated. Offsets are file offsets, not
+ELF virtual addresses or inferred function offsets.
 `fallback:true` and `message` disclose the retry, and the original diagnostics are
 preserved beneath the fallback trace. Missing DWARF unwind information can make
 these traces shorter or less reliable; the result is not advertised as a fully
@@ -413,30 +436,44 @@ Debugger tools attach by numeric PID. The helper checks PID/start-time identity
 and the executable before and after capture, but this cannot eliminate the narrow
 PID-reuse race during attachment.
 
-### `services` (optional `identities_only`)
+### `services` (optional `identities_only`, `include_pids`, `refresh_metadata`)
 
-Returns `{available,services,message?}`. Each service has `name`, `description`,
-`load`, `active`, `sub`, and `enabled` (unit-file state, such as `enabled`,
-`disabled`, `static`, `masked`, or `unknown`). Loaded units and installed service
-unit files are merged by name. Installed units that are not loaded have
-`load:"not loaded"`, `active:"inactive"`, and `sub:"dead"`; their description is
-empty until systemd loads them. Template and alias unit files are retained. When systemd is
-not running, `available:false` is a normal result.
+Returns `available`, `services`, `message`, `identities_only`, `include_pids`,
+`pids_complete`, and `services_truncated` when systemd is available. Each service
+has `name`, `description`, `load`, `active`, `sub`, and `enabled` (unit-file state,
+such as `enabled`, `disabled`, `static`, `masked`, or `unknown`). Loaded units and
+installed service unit files are merged by name. Installed units that are not
+loaded have `load:"not loaded"`, `active:"inactive"`, and `sub:"dead"`; their
+description is empty until systemd loads them. Template and alias unit files are
+retained. When systemd is not running, `{available:false,services:[],message}` is
+a normal result.
 
-With `identities_only:true`, service rows contain only `name`, and the response
-echoes the flag. Both unit enumerations remain necessary to include loaded
-transient units and unloaded installed unit files. The client retains earlier
-properties by name and reloads them immediately when the view becomes visible.
+`include_pids:true` adds `pid` (systemd MainPID) and `start_ticks` for navigation.
+The helper obtains state and MainPID together in one `systemctl show` request
+for loaded service units, then checks the process start time. Zero values mean
+that no live identity was established. `pids_complete` describes the MainPID
+query, not whether every service has a running process. If that query fails,
+ordinary unit enumeration can still return the services with a warning.
 
-The helper prefers systemctl JSON output and falls back to parsing its stable
-leading columns using C locale, no legend, full names, and plain output. A failed
-unit-file query preserves loaded-unit results and adds a warning in `message`.
-On old systemd versions, the two queries and their fallbacks can take up to
-20 seconds total.
+Installed unit-file/startup metadata is cached for 30 seconds. A failed refresh
+retains previous metadata, reports an incomplete collection, and retries after
+five seconds. `refresh_metadata:true` bypasses the cache; successful enable or
+disable actions invalidate it. Loaded-unit state is collected on every request.
+The helper prefers systemctl JSON output where applicable and falls back to its
+stable leading columns with C locale, no legend, full names, and plain output.
+The encoded service array has a 12 MiB budget. `services_truncated:true` also
+marks incomplete loaded-unit or installed-unit enumeration, so clients must not
+interpret absent rows as removed.
+
+With `identities_only:true`, service rows contain only `name`; `include_pids` is
+forced false. This protocol mode remains available, but the Windows client does
+not poll Services in the background. It requests services only when the Services
+subtab is visible in the active WSL tab and the host is neither minimized nor
+hidden. Reopening Services or manually refreshing requests fresh metadata.
 
 ### `service_details` (`name`)
 
-Returns `{text,overview}`. `overview` has the string fields `name`, `description`,
+Returns `{text,journal,overview}`. `overview` has the string fields `name`, `description`,
 `load`, `active`, `sub`, `enabled`, `main_pid`, `fragment_path`, `exec_start`,
 `user`, `group`, `restarts`, `result`, `active_since`, `memory_current`, and
 `tasks_current`. These retain systemd property values, including unknown or
@@ -445,9 +482,11 @@ unlimited markers; unavailable properties are empty. Each overview value has a
 without another subprocess.
 
 `text` contains systemctl status, all properties, unit file contents and
-drop-ins, and the last 100 journal entries. Each of the four text sections has a
-128 KiB display limit with a visible truncation marker. Failed/inactive status is valid detail
-output. Journal permission failures are included in the detail text.
+drop-ins. Status uses `--lines=0` so it does not duplicate recent logs. `journal`
+contains the last 100 journal entries (`short-iso` format) for the separate
+Journal tab. Each of the four command outputs has a 128 KiB display limit with
+a visible truncation marker. Failed/inactive status is valid detail output.
+Journal permission failures appear in `journal`.
 
 ### `service_action` (`name`, `action`)
 
