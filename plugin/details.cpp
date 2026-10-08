@@ -900,30 +900,45 @@ void layout(Inspector &state)
 {
     RECT rect{};
     GetClientRect(state.window, &rect);
-    int gap = scale(state.window, 12);
-    int buttonHeight = scale(state.window, 23);
+    const int pageMargin = scale(state.window, 12);
+    const int toolbarMargin = scale(state.window, 4);
+    const int toolbarGap = scale(state.window, 4);
+    const int buttonHeight = scale(state.window, 21);
     int width = rect.right - rect.left;
     int height = rect.bottom - rect.top;
-    int buttonsY = gap;
-    int x = gap;
-    auto button = [&](HWND handle, int logicalWidth) {
-        int buttonWidth = scale(state.window, logicalWidth);
+    int buttonsY = toolbarMargin;
+    int x = toolbarMargin;
+    HDC dc = GetDC(state.window);
+    HGDIOBJ previousFont = SelectObject(dc, state.uiFont ? state.uiFont : font);
+    auto button = [&](HWND handle) {
+        int length = GetWindowTextLengthW(handle);
+        std::wstring label(static_cast<size_t>(length) + 1, L'\0');
+        GetWindowTextW(handle, label.data(), length + 1);
+        label.resize(static_cast<size_t>(length));
+        SIZE textSize{};
+        GetTextExtentPoint32W(dc, label.c_str(), length, &textSize);
+        // Fit each caption to the ordinary dialog font. The grid font is
+        // intentionally reserved for rows and tooltips, not toolbar buttons.
+        int buttonWidth =
+            std::max(scale(state.window, 58), static_cast<int>(textSize.cx) + scale(state.window, 20));
         place(handle, x, buttonsY, buttonWidth, buttonHeight);
-        x += buttonWidth + scale(state.window, 6);
+        x += buttonWidth + toolbarGap;
     };
-    button(state.refresh, 78);
-    button(state.copy, 110);
-    button(state.copyAll, 80);
-    button(state.save, 80);
+    button(state.refresh);
+    button(state.copy);
+    button(state.copyAll);
+    button(state.save);
     int contextualX = x;
-    button(state.open, 130);
-    button(state.path, 122);
+    button(state.open);
+    button(state.path);
     x = contextualX;
-    button(state.value, 100);
+    button(state.value);
     x = contextualX;
-    button(state.captureStack, 175);
-    int contentY = buttonsY + buttonHeight + gap;
-    RECT body{gap, contentY, width - gap, height - gap};
+    button(state.captureStack);
+    SelectObject(dc, previousFont);
+    ReleaseDC(state.window, dc);
+    int contentY = buttonsY + buttonHeight + toolbarGap;
+    RECT body{pageMargin, contentY, width - pageMargin, height - pageMargin};
     // The tab frame never moves when changing pages. Search and status belong
     // inside that frame, like native Threads/Modules/Handles property pages.
     place(state.tabs, body.left, body.top, body.right - body.left, body.bottom - body.top);
