@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.24)
+project(WslTools VERSION 0.1.0 LANGUAGES C CXX RC)
+if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "Build the plugin with the Visual Studio x64 toolchain; use scripts/build-windows.ps1.")
+endif()
+
+set(SYSTEM_INFORMER_SDK "${CMAKE_SOURCE_DIR}/.deps/sdk" CACHE PATH "Prepared System Informer SDK")
+if(NOT EXISTS "${SYSTEM_INFORMER_SDK}/include/phdk.h")
+    message(FATAL_ERROR "Prepare the SDK first using scripts/prepare-sdk.ps1.")
+endif()
+
+file(GLOB PLUGIN_SOURCES CONFIGURE_DEPENDS "plugin/*.cpp" "plugin/*.c" "plugin/*.rc")
+list(FILTER PLUGIN_SOURCES EXCLUDE REGEX "/preview\\.cpp$")
+add_library(WslTools SHARED ${PLUGIN_SOURCES})
+target_compile_features(WslTools PRIVATE cxx_std_17)
+set_property(TARGET WslTools PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+target_compile_definitions(WslTools PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+target_compile_options(WslTools PRIVATE /W4 /utf-8 $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+target_include_directories(WslTools SYSTEM PRIVATE "${SYSTEM_INFORMER_SDK}/include" "${CMAKE_SOURCE_DIR}/vendor")
+target_link_libraries(WslTools PRIVATE "${SYSTEM_INFORMER_SDK}/lib/SystemInformer.lib"
+    ntdll comctl32 uxtheme shell32 shlwapi advapi32 ole32 user32 gdi32 comdlg32)
+set_target_properties(WslTools PROPERTIES PREFIX "" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dist")
