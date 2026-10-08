@@ -132,6 +132,11 @@ void render(View &v)
             auto optionalBytes = [&](const char *field) {
                 return p.contains(field) ? bytes(p[field].get<uint64_t>()) : L"";
             };
+            const auto age = static_cast<uint64_t>(
+                std::max(0.0, v.snapshot.value("uptime_seconds", 0.0) - p.value("start_ticks", 0.0) / hz));
+            wchar_t ageText[64]{};
+            swprintf_s(ageText, L"%llu:%02llu:%02llu:%02llu", age / 86400, age / 3600 % 24, age / 60 % 60,
+                       age % 60);
             std::wstring name = text(p, "name");
             Row row{{name,
                      text(p, "pid"),
@@ -151,9 +156,7 @@ void render(View &v)
                      text(p, "tty"),
                      text(p, "nice"),
                      text(p, "priority"),
-                     number(std::max(0.0, v.snapshot.value("uptime_seconds", 0.0) -
-                                              p.value("start_ticks", 0.0) / hz)) +
-                         L" s",
+                     ageText,
                      optionalBytes("virtual_bytes"),
                      text(p, "session"),
                      text(p, "pgrp"),
@@ -195,6 +198,7 @@ void render(View &v)
                                                                         {ProcessReadChars, "read_chars"},
                                                                         {ProcessWriteChars, "write_chars"}})
                 row.numeric[field.first] = p.value(field.second, 0.0);
+            row.numeric[ProcessAge] = static_cast<double>(age);
             row.data["_cpu_percent"] = cpu;
             row.data["_read_rate"] = v.readRate[key];
             row.data["_write_rate"] = v.writeRate[key];
