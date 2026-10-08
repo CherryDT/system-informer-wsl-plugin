@@ -50,7 +50,9 @@ Returns:
 
 - `processes`: objects with `pid`, `ppid`, `start_ticks`, `name`, `state`, `user`,
   `uid`, `threads`, `cpu_ticks`, `rss_bytes`, `virtual_bytes`, `read_bytes`,
-  `write_bytes`, `io_accessible`, `status_accessible`, `command`, and `exe`.
+  `write_bytes`, `io_accessible`, `status_accessible`, `command`, `exe`, and
+  `runtime`. `runtime` is `"node"`, `"python"`, `"java"`, or an empty string
+  when the resolved executable is not a recognized runtime.
 - `processes_truncated`: true if the encoded process array reached its 12 MiB budget.
 - `monotonic_ms`: helper monotonic time, sampled at the end of collection.
 - `uptime_seconds`, `memory_total`, `memory_available`, `cpus`, `clock_ticks`, `boot_id`.
@@ -75,7 +77,7 @@ blocks on network name services. Command lines are capped at 16 KiB per process.
 
 Returns:
 
-- `overview`: current process snapshot fields, plus `cwd`, `cgroup`,
+- `overview`: current process snapshot fields (including `runtime`), plus `cwd`, `cgroup`,
   `capabilities` (effective, permitted, inheritable, bounding, and ambient masks),
   `seccomp` (`Disabled`, `Strict`, or `Filter`), and `no_new_privs` (`Yes` or `No`).
   Missing status fields remain empty; numeric fields retain snapshot types.
@@ -177,6 +179,68 @@ directories, debuginfod disabled, an empty `DEBUGINFOD_URLS`, a clean environmen
 working directory. No caller-provided GDB commands are accepted. The batch ends
 with an explicit detach; on timeout the debugger process group is terminated,
 which releases ptrace ownership. It does not send SIGCONT to the target itself.
+
+### `script_stacks` (`pid`, `start_ticks`)
+
+Captures runtime-level stacks using tools installed by the distro administrator;
+the observer does not install them. Runtime selection is based on the basename of
+the resolved `/proc/PID/exe`, never the command line or script name:
+
+- `node` and `nodejs` select Node.js. The helper uses LLDB with a compatible
+  `llnode.so` plugin from a trusted plugin location. LLDB and llnode must be
+  installed by the user; llnode must be built for that LLDB version and support
+  the target Node/V8 version. Build llnode as a normal user, then have an
+  administrator place the root-owned, non-group/world-writable plugin at
+  `/usr/local/lib/llnode/llnode.so`, `/usr/lib/lldb/plugins/llnode.so`,
+  `/usr/local/lib/node_modules/llnode/llnode.so`, or
+  `/usr/lib/node_modules/llnode/llnode.so`. Never run npm as root. See the
+  [llnode installation instructions](https://github.com/nodejs/llnode#install-instructions).
+- `python`, `python2`, `python3`, and versioned/debug/free-threaded CPython
+  executable names select Python. The helper uses a trusted, root-owned
+  `py-spy` in `/usr/local/bin` or `/usr/bin`. It dumps all Python thread stacks
+  without local variable values. See [py-spy](https://github.com/benfred/py-spy).
+  PyPy is not recognized.
+- `java` selects a JVM. The helper uses `jcmd` beside the target JVM's `java`
+  executable, so it matches that target's JDK. It runs `jcmd PID Thread.print -l`
+  with the JVM's effective UID and GID, even though the observer runs as root.
+  The full matching JDK is needed when a custom JRE does not include `jcmd`.
+  See Oracle's [`jcmd` reference](https://docs.oracle.com/en/java/javase/21/docs/specs/man/jcmd.html).
+
+Shell/npm wrappers, PyPy, renamed executables, and embedded runtimes do not
+automatically match. A recognized runtime can still return `supported:false`
+when its required debugger is missing or untrusted. A present debugger that is
+incompatible may instead return `supported:true` and an unsuccessful, partial
+capture. For example,
+LLDB 18 with llnode 4 does not reliably decode JavaScript names for Node.js 22;
+the result may contain partial V8 data and native addresses rather than useful
+JavaScript frames.
+
+The response data contains `runtime`, `supported`, `success`, `text`, and
+`message`. When the capture tool is available it also contains `tool`,
+`timed_out`, and `exit_code`. Those tool and process-result fields are omitted
+when no capture tool can be selected. `supported` means the runtime and required
+tool are available for an attempt; it does not promise complete symbols or a
+successful attach. A completed attempt can have `success:false` while returning
+partial diagnostic text. Missing tools return `supported:false`, `success:false`,
+empty `text`, and an installation or compatibility explanation in `message`.
+
+```json
+{"id":4,"op":"script_stacks","pid":123,"start_ticks":4567}
+{"id":4,"ok":true,"data":{"runtime":"python","tool":"py-spy","supported":true,"success":true,"timed_out":false,"exit_code":0,"message":"Captured Python thread stacks. Local variable values are not collected.","text":"Thread 123: ..."}}
+```
+
+Captures are explicit because debugger attachment may pause the target briefly;
+JVM attachment may request a safepoint. There is no automatic Node inspector,
+runtime signal, or periodic capture. The helper checks PID/start-time identity
+and the executable immediately before and after the command, but debugger tools
+attach by numeric PID, leaving a narrow PID-reuse race during attachment. Each
+capture has a 15-second deadline and a 512 KiB output limit. Node.js capture is
+limited to 256 OS threads and 64 frames per thread, and does not provide
+asynchronous promise/task history. Python captures all Python threads but no
+locals. Java `Thread.print -l` includes locks, but traditional thread dumps do
+not show every unmounted virtual thread. Ptrace restrictions, disabled JVM
+attachment, missing symbols, or runtime/tool version mismatches can make a
+capture incomplete or unavailable.
 
 ### `services`
 

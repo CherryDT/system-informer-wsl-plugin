@@ -3,6 +3,7 @@
 #include "json.hpp"
 #include <cstdint>
 #include <string>
+#include <optional>
 #include <vector>
 
 namespace observer {
@@ -18,6 +19,10 @@ struct ProcessStat {
     int pid = 0, ppid = 0, threads = 0;
     std::string name, state;
     uint64_t start_ticks = 0, cpu_ticks = 0, virtual_bytes = 0, rss_bytes = 0;
+};
+struct CommandCredentials {
+    uint32_t uid;
+    uint32_t gid;
 };
 struct CommandResult {
     int exit_code = -1;
@@ -38,9 +43,17 @@ Json snapshot();
 Json process_details(const Json& request);
 Json send_signal(const Json& request);
 Json process_stacks(const Json& request);
+std::string runtime_for_executable(std::string executable);
+Json script_stacks(const Json& request);
+// Resolve only administrator-installed tools. Java may additionally use a
+// target-owned JDK after dropping to that target's exact effective credentials.
+std::string trusted_command_path(const std::string& path, uint32_t owner = 0);
+std::string find_command(const std::string& name);
 Json connections(const Json& request);
 CommandResult run_command(const std::vector<std::string>& arguments, int timeout_ms = 5000,
-    size_t output_limit = 2 * 1024 * 1024);
+    size_t output_limit = 2 * 1024 * 1024,
+    std::optional<CommandCredentials> credentials = std::nullopt,
+    const std::string& java_tool = {});
 Json services();
 Json service_details(const Json& request);
 Json service_action(const Json& request);

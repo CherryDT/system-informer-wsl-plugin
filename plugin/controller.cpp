@@ -85,7 +85,8 @@ void run() {
                     if (stopping) break;
                     activeClient = client;
                 }
-                const auto timeout = operation == "service_details" || operation == "service_action" || operation == "stacks"
+                const auto timeout = operation == "service_details" || operation == "service_action" ||
+                    operation == "stacks" || operation == "script_stacks"
                     ? std::chrono::seconds(35) : std::chrono::seconds(20);
                 reply->data = operation == "install_component"
                     ? client->installComponent() : client->request(job.request, timeout);

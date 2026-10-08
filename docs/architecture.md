@@ -32,11 +32,16 @@ The observer runs as root when launched. It is a short-lived process tied to the
 - `procfs.cpp`: process snapshots, details, identities and pidfd signaling.
 - `network.cpp`: TCP/UDP/Unix parsing and socket-inode ownership.
 - `services.cpp`: validated systemd/GDB commands, bounded output and child cleanup.
+- `runtime_stacks.cpp`: executable-based runtime detection and bounded Node.js, CPython and JVM stack capture.
 - `observer.hpp`: internal data and function declarations.
 
 The static executable reads procfs directly. It uses a local `/etc/passwd` lookup with numeric fallback rather than NSS or network directory lookups. Some procfs information is inherently racy: a process can exit while its files are read. Identity checks distinguish that from a replacement process.
 
 Signal operations open a pidfd, validate the requested start time against the live task, then use `pidfd_send_signal`. They do not fall back to `kill(pid)`. Service commands use an allowlisted verb and a validated service name, absolute executable paths and an explicit environment. No user-supplied string becomes a shell program.
+
+Runtime stack capture is a separate explicit operation. The helper classifies the resolved `/proc/PID/exe` basename and uses only trusted installed tools: LLDB with a version-matched `llnode` plugin for Node.js, `py-spy` for CPython, or the `jcmd` sibling of the target JVM's matching JDK. It never enables a Node inspector, sends runtime signals, or installs debugger packages. Java's `jcmd` child runs with the target process's effective UID and GID even though the observer itself runs as root. Captures have a 15-second deadline and 512 KiB output limit. Process identity and executable are checked before and after the capture; the tools attach by numeric PID, so this does not eliminate the narrow PID-reuse race during attachment.
+
+The process snapshot and detail overview include a `runtime` classification based on the resolved executable basename. The inspector uses the refreshed overview value to add, rename, or remove the runtime-specific Stacks tab while retaining the native GDB Stacks page. Command lines and script names are deliberately not used for runtime detection.
 
 ## Accounting
 

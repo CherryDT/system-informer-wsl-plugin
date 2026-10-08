@@ -18,7 +18,7 @@ case "$(uname -m)" in
 esac
 mkdir -p -- "$build_dir" "$output_dir"
 objects=()
-for module in main procfs network services; do
+for module in main procfs network services runtime_stacks; do
     object="$build_dir/$module.o"
     "$compiler" -std=c++17 -pthread -O2 -Wall -Wextra -Wpedantic \
         -I"$project_dir/vendor" -c "$project_dir/helper/$module.cpp" -o "$object"
@@ -32,7 +32,7 @@ fi
 # against compatible modified runtime libraries without rebuilding its source.
 mkdir -p "$output_dir/relink" "$output_dir/licenses"
 install -m 0644 "${objects[@]}" "$output_dir/relink/"
-printf '%s\n' 'Relink on x86-64 Linux with: g++ -static -pthread main.o procfs.o network.o services.o -o wsl-observer' \
+printf '%s\n' 'Relink on x86-64 Linux with: g++ -static -pthread main.o procfs.o network.o services.o runtime_stacks.o -o wsl-observer' \
     'A compatible modified libc/libstdc++ can be selected using your compiler sysroot and library search flags.' \
     'Observer source and the normal build recipe are included in the project repository.' > "$output_dir/relink/README.txt"
 for notice in /usr/share/doc/libc6/copyright /usr/share/doc/gcc-*/copyright; do

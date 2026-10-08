@@ -74,6 +74,7 @@ Json process_json(const ProcessStat& stat, const std::map<uid_t, std::string>& u
     std::replace(command.begin(), command.end(), '\0', ' ');
     if (!command.empty() && command.back() == ' ') command.pop_back();
     const auto io = read_text(proc_path(stat.pid, "io"));
+    const auto executable = read_link(proc_path(stat.pid, "exe"));
     return {{"pid", stat.pid}, {"ppid", stat.ppid}, {"start_ticks", stat.start_ticks},
             {"name", stat.name}, {"state", stat.state}, {"user", user},
             {"status_accessible", !status.empty()},
@@ -82,7 +83,7 @@ Json process_json(const ProcessStat& stat, const std::map<uid_t, std::string>& u
             {"read_bytes", field_value(io, "read_bytes:")},
             {"write_bytes", field_value(io, "write_bytes:")},
             {"io_accessible", !io.empty()}, {"command", command},
-            {"exe", read_link(proc_path(stat.pid, "exe"))}};
+            {"exe", executable}, {"runtime", runtime_for_executable(executable)}};
 }
 }
 

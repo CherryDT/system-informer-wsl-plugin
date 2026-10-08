@@ -5,6 +5,11 @@
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <cstdlib>
+#include <grp.h>
+#include <sys/stat.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #include <map>
 #include <poll.h>
@@ -31,15 +36,51 @@ std::string checked_output(const CommandResult& result) {
 bool systemd_available() { return access("/run/systemd/system", F_OK) == 0; }
 }
 
-CommandResult run_command(const std::vector<std::string>& arguments, int timeout_ms, size_t output_limit) {
-    if (arguments.empty() || (arguments[0] != "systemctl" && arguments[0] != "journalctl" && arguments[0] != "gdb"))
+std::string trusted_command_path(const std::string& path, uint32_t owner) {
+    // Resolve symlinks once, then execute that canonical path. Check every
+    // component so a writable directory cannot substitute privileged code.
+    char* resolved = realpath(path.c_str(), nullptr);
+    if (!resolved) return {};
+    const std::string canonical(resolved);
+    free(resolved);
+    std::string current = canonical;
+    bool file = true;
+    for (;;) {
+        struct stat metadata{};
+        if (lstat(current.c_str(), &metadata) != 0 ||
+            (metadata.st_uid != 0 && metadata.st_uid != owner) ||
+            (metadata.st_mode & (S_IWGRP | S_IWOTH)) ||
+            (file ? !S_ISREG(metadata.st_mode) : !S_ISDIR(metadata.st_mode))) return {};
+        if (current == "/") break;
+        file = false;
+        const auto slash = current.find_last_of('/');
+        current = slash == 0 ? "/" : current.substr(0, slash);
+    }
+    return canonical;
+}
+
+std::string find_command(const std::string& name) {
+    if (name.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") != std::string::npos) return {};
+    for (const auto* directory : {"/usr/local/bin/", "/usr/bin/", "/bin/"}) {
+        const auto path = trusted_command_path(std::string(directory) + name);
+        if (!path.empty() && access(path.c_str(), X_OK) == 0) return path;
+    }
+    return {};
+}
+
+CommandResult run_command(const std::vector<std::string>& arguments, int timeout_ms, size_t output_limit,
+    std::optional<CommandCredentials> credentials, const std::string& java_tool) {
+    if (arguments.empty() || (arguments[0] != "systemctl" && arguments[0] != "journalctl" &&
+        arguments[0] != "gdb" && arguments[0] != "lldb" && arguments[0] != "py-spy" && arguments[0] != "jcmd"))
         throw std::runtime_error("Unsupported system command");
     std::string executable;
-    for (const auto* directory : {"/usr/bin/", "/bin/"}) {
-        const auto candidate = std::string(directory) + arguments[0];
-        if (access(candidate.c_str(), X_OK) == 0) { executable = candidate; break; }
+    if (!java_tool.empty()) {
+        if (arguments[0] != "jcmd" || !credentials) throw std::runtime_error("Invalid Java tool request");
+        executable = trusted_command_path(java_tool, credentials->uid);
+    } else {
+        executable = find_command(arguments[0]);
     }
-    if (executable.empty()) throw std::runtime_error(arguments[0] + " is not installed");
+    if (executable.empty()) throw std::runtime_error(arguments[0] + " is not installed in a trusted location");
 
     // A process stuck in an uninterruptible kernel wait may outlive SIGKILL.
     // Reap it on the next command instead of blocking the entire transport.
@@ -60,8 +101,11 @@ CommandResult run_command(const std::vector<std::string>& arguments, int timeout
     std::vector<char*> argv;
     for (const auto& argument : arguments) argv.push_back(const_cast<char*>(argument.c_str()));
     argv.push_back(nullptr);
-    std::vector<std::string> environment{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C",
+    std::vector<std::string> environment{"PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C",
         "SYSTEMD_COLORS=0", "SYSTEMD_URLIFY=0", "SYSTEMD_PAGER=cat", "DEBUGINFOD_URLS=", "HOME=/"};
+    // Without this, llnode can silently replace undecodable JS frames with
+    // native addresses and still return success. The caller filters diagnostics.
+    if (arguments[0] == "lldb") environment.push_back("LLNODE_DEBUG=true");
     std::vector<char*> envp;
     for (auto& entry : environment) envp.push_back(entry.data());
     envp.push_back(nullptr);
@@ -73,6 +117,18 @@ CommandResult run_command(const std::vector<std::string>& arguments, int timeout
         if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0 ||
             dup2(pipes[1], STDOUT_FILENO) < 0 || dup2(pipes[1], STDERR_FILENO) < 0) _exit(126);
         close(null_fd); close(pipes[0]); close(pipes[1]);
+        const rlimit no_core{0, 0};
+        if (setrlimit(RLIMIT_CORE, &no_core) != 0 || prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) _exit(126);
+        if (credentials) {
+            // HotSpot's attach protocol checks both effective UID and GID.
+            // Drop supplementary groups and all saved IDs before executing any
+            // target-owned JDK tool; never run that code with root privileges.
+            if (geteuid() == 0) {
+                if (setgroups(0, nullptr) != 0 ||
+                    setresgid(credentials->gid, credentials->gid, credentials->gid) != 0 ||
+                    setresuid(credentials->uid, credentials->uid, credentials->uid) != 0) _exit(126);
+            } else if (geteuid() != credentials->uid || getegid() != credentials->gid) _exit(126);
+        }
         execve(executable.c_str(), argv.data(), envp.data());
         _exit(127);
     }
