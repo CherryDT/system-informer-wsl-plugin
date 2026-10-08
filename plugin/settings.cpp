@@ -108,15 +108,28 @@ std::wstring windowsPath(const std::wstring &distro, const std::wstring &linuxPa
         path.compare(path.size() - deleted.size(), deleted.size(), deleted) == 0)
         throw std::runtime_error(
             "This file has been deleted. Its descriptor may remain open, but Explorer cannot locate it.");
-    std::wstring prefix = distroPrefix(distro);
-    if (!validPrefix(prefix))
-        throw std::runtime_error("The registry path override is invalid. Correct it in WSL Tools settings.");
-    if (prefix.empty())
-        prefix = L"\\\\wsl.localhost\\" + distro + L"\\";
-    if (prefix.back() != L'\\')
-        prefix += L'\\';
-    std::wstring tail;
+    std::wstring prefix;
     size_t begin = 1;
+    // Standard WSL drive mounts refer to Windows volumes directly, even when
+    // ordinary Linux paths use a custom per-distro Explorer prefix.
+    const bool mountedDrive = path.size() >= 6 && path.compare(0, 5, L"/mnt/") == 0 &&
+        ((path[5] >= L'a' && path[5] <= L'z') || (path[5] >= L'A' && path[5] <= L'Z')) &&
+        (path.size() == 6 || path[6] == L'/');
+    if (mountedDrive)
+    {
+        wchar_t drive = path[5] >= L'a' ? path[5] - (L'a' - L'A') : path[5];
+        prefix = std::wstring(1, drive) + L":\\";
+        begin = path.size() == 6 ? 6 : 7;
+    }
+    else
+    {
+        prefix = distroPrefix(distro);
+        if (!validPrefix(prefix))
+            throw std::runtime_error("The registry path override is invalid. Correct it in WSL Tools settings.");
+        if (prefix.empty()) prefix = L"\\\\wsl.localhost\\" + distro + L"\\";
+        if (prefix.back() != L'\\') prefix += L'\\';
+    }
+    std::wstring tail;
     while (begin <= path.size())
     {
         auto end = path.find(L'/', begin);
