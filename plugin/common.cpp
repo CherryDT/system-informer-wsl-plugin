@@ -264,7 +264,7 @@ void Table::selectKey(const std::string &key)
 }
 void Table::order()
 {
-    if (sortColumn < 0 || static_cast<size_t>(sortColumn) >= columns.size())
+    if (ancestryOrder || sortColumn < 0 || static_cast<size_t>(sortColumn) >= columns.size())
         return;
     const auto column = static_cast<size_t>(sortColumn);
     std::stable_sort(rows.begin(), rows.end(), [&](const Row &a, const Row &b) {
@@ -319,8 +319,26 @@ void Table::replace(std::vector<Row> next)
     if (previous.size() > rows.size())
         InvalidateRect(window, nullptr, FALSE);
 }
+void Table::setAncestryOrder(bool enabled)
+{
+    if (ancestryOrder == enabled)
+        return;
+    ancestryOrder = enabled;
+    HWND header = ListView_GetHeader(window);
+    for (size_t i = 0; i < columns.size(); ++i)
+    {
+        HDITEMW item{};
+        item.mask = HDI_FORMAT;
+        Header_GetItem(header, static_cast<int>(i), &item);
+        item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+        if (!enabled && static_cast<int>(i) == sortColumn)
+            item.fmt |= descending ? HDF_SORTDOWN : HDF_SORTUP;
+        Header_SetItem(header, static_cast<int>(i), &item);
+    }
+}
 void Table::sort(int column)
 {
+    setAncestryOrder(false);
     std::string key = selected() ? selected()->key : "";
     descending = sortColumn == column ? !descending : columns[column].numeric;
     sortColumn = column;

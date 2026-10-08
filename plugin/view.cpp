@@ -32,13 +32,8 @@ void refresh(View &v)
         queue(v, {{"op", "discover"}}, DiscoverTag);
         return;
     }
-    queue(v,
-          {{"op", v.page == 0   ? "snapshot"
-                  : v.page == 1 ? "connections"
-                                : "services"}},
-          v.page == 0   ? SnapshotTag
-          : v.page == 1 ? ConnectionsTag
-                        : ServicesTag);
+    // Keep graphs live in every inner view, then refresh that view's rows.
+    queue(v, {{"op", "snapshot"}}, SnapshotTag);
 }
 namespace
 {
@@ -50,13 +45,13 @@ void layout(View &v)
     RECT rect{};
     GetClientRect(v.window, &rect);
     auto s = [&](int x) { return scale(v.window, x); };
-    int width = rect.right, height = rect.bottom, pad = s(10), line = s(28), gap = s(8);
+    int width = rect.right, height = rect.bottom, pad = 0, line = s(28), gap = s(8);
     int combo = std::max(s(130), std::min(s(300), width - s(340)));
     place(v.distro, pad, pad, combo, s(300));
     place(v.refresh, pad + combo + gap, pad, s(86), line);
     place(v.pause, pad + combo + gap + s(94), pad, s(86), line);
     place(v.settings, pad + combo + gap + s(188), pad, s(88), line);
-    const bool showChart = v.page == 0 && height >= s(600);
+    const bool showChart = true;
     const int chartSpace = showChart ? s(54) : 0;
     ShowWindow(v.graph, showChart ? SW_SHOW : SW_HIDE);
     ShowWindow(v.memoryGraph, showChart ? SW_SHOW : SW_HIDE);
@@ -83,7 +78,9 @@ void layout(View &v)
 }
 void switchPage(View &v)
 {
-    v.page = TabCtrl_GetCurSel(v.tabs);
+    const int tab = TabCtrl_GetCurSel(v.tabs);
+    v.page = tab == 1 ? 2 : tab == 2 ? 1 : 0;
+    SetWindowTextW(v.inspect, v.page == 1 ? L"Go to process" : L"Inspect...");
     ShowWindow(v.processes.window, v.page == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.connections.window, v.page == 1 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.services.window, v.page == 2 ? SW_SHOW : SW_HIDE);
@@ -144,8 +141,10 @@ LRESULT CALLBACK graphProc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
     auto oldFont = SelectObject(dc, font);
     RECT label = r;
     InflateRect(&label, -scale(window, 5), -scale(window, 3));
-    DrawTextW(dc, memory ? L"WSL VM memory used" : L"Distro CPU", -1, &label,
-              DT_LEFT | DT_TOP | DT_SINGLELINE);
+    std::wstring caption = memory ? L"WSL VM memory used" : L"Distro CPU";
+    if (!samples.empty())
+        caption += L"  " + number(samples.back()) + L"%";
+    DrawTextW(dc, caption.c_str(), -1, &label, DT_LEFT | DT_TOP | DT_SINGLELINE);
     HPEN border = CreatePen(PS_SOLID, 1, dark ? RGB(100, 100, 100) : GetSysColor(COLOR_3DSHADOW));
     auto oldPen = SelectObject(dc, border);
     auto oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -241,13 +240,13 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             control(window, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, DistroCombo);
         v->refresh = control(window, L"BUTTON", L"Refresh", WS_TABSTOP, RefreshButton);
         v->pause = control(window, L"BUTTON", L"Pause", WS_TABSTOP, PauseButton);
-        v->settings = control(window, L"BUTTON", L"Settings…", WS_TABSTOP, SettingsButton);
+        v->settings = control(window, L"BUTTON", L"Settings...", WS_TABSTOP, SettingsButton);
         v->graph = control(window, L"WslTools.Graph", L"CPU history", 0, 0);
         SetWindowLongPtrW(v->graph, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(v));
         v->memoryGraph = control(window, L"WslTools.Graph", L"VM memory history", 0, 0);
         SetWindowLongPtrW(v->memoryGraph, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(v));
         v->tabs = control(window, WC_TABCONTROLW, L"Views", WS_TABSTOP, ViewTabs);
-        for (auto label : {L"Processes", L"Connections", L"Services"})
+        for (auto label : {L"Processes", L"Services", L"Network"})
         {
             TCITEMW item{};
             item.mask = TCIF_TEXT;
@@ -291,13 +290,13 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                             {L"Startup", 100},
                             {L"Load", 100},
                             {L"Description", 500}});
-        v->inspect = control(window, L"BUTTON", L"Inspect…", WS_TABSTOP, InspectButton);
-        v->actions = control(window, L"BUTTON", L"Actions ▾", WS_TABSTOP, ActionsButton);
-        v->exportButton = control(window, L"BUTTON", L"Export view…", WS_TABSTOP, ExportButton);
-        v->status = control(
-            window, L"STATIC",
-            L"Monitoring starts when this tab is selected. Stopped distros are not started intentionally.",
-            SS_LEFT, 0);
+        v->inspect = control(window, L"BUTTON", L"Inspect...", WS_TABSTOP, InspectButton);
+        v->actions = control(window, L"BUTTON", L"Actions", WS_TABSTOP, ActionsButton);
+        v->exportButton = control(window, L"BUTTON", L"Export view...", WS_TABSTOP, ExportButton);
+        v->status = control(window, L"STATIC",
+                            L"Monitoring starts when this tab is selected. Stopped distros are not "
+                            L"started intentionally.",
+                            SS_LEFT, 0);
         for (HWND child : {v->distro, v->refresh, v->pause, v->settings, v->tabs, v->search, v->listeners,
                            v->tree, v->processes.window, v->connections.window, v->services.window,
                            v->inspect, v->actions, v->exportButton})
@@ -500,6 +499,22 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             {
                 updateSnapshot(*v, reply->data);
                 render(*v);
+                if (v->page == 0 && !v->pendingSelection.empty())
+                {
+                    v->processes.selectKey(v->pendingSelection);
+                    int index = ListView_GetNextItem(v->processes.window, -1, LVNI_SELECTED);
+                    if (index >= 0)
+                        ListView_EnsureVisible(v->processes.window, index, FALSE);
+                    else
+                        status(*v, L"The socket owner has exited. Refresh the connections view.");
+                    v->pendingSelection.clear();
+                }
+                if (v->page != 0)
+                {
+                    queue(*v, {{"op", v->page == 1 ? "connections" : "services"}},
+                          v->page == 1 ? ConnectionsTag : ServicesTag);
+                    return 0;
+                }
             }
             else if (tag == ConnectionsTag)
             {
@@ -566,6 +581,11 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
     return DefWindowProcW(window, message, wparam, lparam);
 }
 } // namespace
+void selectPage(View &view, int page)
+{
+    TabCtrl_SetCurSel(view.tabs, page == 1 ? 2 : page == 2 ? 1 : 0);
+    switchPage(view);
+}
 } // namespace wsl::ui
 
 extern "C" HWND WslCreateView(HWND parent, HINSTANCE dll)

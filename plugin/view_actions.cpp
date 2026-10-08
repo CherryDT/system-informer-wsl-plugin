@@ -26,10 +26,18 @@ void inspect(View &v)
             errorBox(v.window, L"The socket owner's identity is unavailable. Refresh the connections view.");
             return;
         }
-        Json owner = {{"pid", pid},
-                      {"start_ticks", row->data["start_ticks"]},
-                      {"name", row->data.value("process", "")}};
-        openDetails(v.window, v.selectedDistro, owner);
+        v.pendingSelection = std::to_string(pid) + ":" + row->data["start_ticks"].dump();
+        WslClearGlobalSearch();
+        SetWindowTextW(v.search, L"");
+        selectPage(v, 0);
+        v.processes.selectKey(v.pendingSelection);
+        int index = ListView_GetNextItem(v.processes.window, -1, LVNI_SELECTED);
+        if (index >= 0)
+        {
+            ListView_EnsureVisible(v.processes.window, index, FALSE);
+            v.pendingSelection.clear();
+        }
+        SetFocus(v.processes.window);
     }
 }
 void action(View &v, int id)
@@ -173,8 +181,7 @@ void menu(View &v, POINT point)
     if (!v.table().selected())
         return;
     HMENU popup = CreatePopupMenu();
-    AppendMenuW(popup, MF_STRING, Inspect,
-                v.page == 1 ? L"Inspect owning process\tEnter" : L"Inspect…\tEnter");
+    AppendMenuW(popup, MF_STRING, Inspect, v.page == 1 ? L"Go to process\tEnter" : L"Inspect…\tEnter");
     AppendMenuW(popup, MF_STRING, CopyRow, L"Copy row\tCtrl+C");
     if (v.page == 0)
     {

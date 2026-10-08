@@ -84,6 +84,7 @@ void render(View &v)
         auto items = v.snapshot["processes"].get<std::vector<Json>>();
         std::map<int, int> depths;
         const bool tree = SendMessageW(v.tree, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        v.processes.setAncestryOrder(tree);
         // Preserve ancestry order before filtering; a missing or exiting parent
         // must not hide its surviving children. Table sorting is disabled here.
         if (tree)
@@ -111,7 +112,6 @@ void render(View &v)
             for (auto &p : v.snapshot["processes"])
                 if (!visited.count(p.value("pid", 0)))
                     items.push_back(p);
-            v.processes.sortColumn = -1;
         }
         for (const auto &p : items)
         {

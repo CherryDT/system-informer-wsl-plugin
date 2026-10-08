@@ -1195,8 +1195,8 @@ void createControls(Inspector &state)
     SetWindowLongPtrW(state.tabs, GWL_EXSTYLE,
                       GetWindowLongPtrW(state.tabs, GWL_EXSTYLE) | WS_EX_CONTROLPARENT);
     SetWindowSubclass(state.tabs, tabPageProc, 2, reinterpret_cast<DWORD_PTR>(window));
-    const wchar_t *processNames[] = {L"Overview", L"Open files",  L"Modules", L"Environment",
-                                     L"Threads",  L"Connections", L"Stacks",  L"Details"};
+    const wchar_t *processNames[] = {L"Overview", L"Open files", L"Modules", L"Environment",
+                                     L"Threads",  L"Network",    L"Stacks",  L"Details"};
     const wchar_t *serviceNames[] = {L"Overview", L"Details"};
     for (int i = 0; i < (state.isService ? 2 : PageCount); ++i)
     {
@@ -1386,7 +1386,10 @@ void openInspector(HWND owner, std::unique_ptr<Inspector> state)
         return;
     }
     std::wstring title = state->isService ? wide(state->service) : cell(state->process, "name");
-    title += L" — " + state->distro + (state->isService ? L" service" : L" process");
+    if (state->isService)
+        title += L" — " + state->distro + L" service";
+    else
+        title += L" (" + cell(state->process, "pid") + L" @ " + state->distro + L")";
     // WM_NCDESTROY owns the state as soon as WM_NCCREATE has accepted it.
     Inspector *raw = state.get();
     HWND window = CreateWindowExW(WS_EX_CONTROLPARENT, InspectorClass, title.c_str(),

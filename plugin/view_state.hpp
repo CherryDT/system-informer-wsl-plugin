@@ -65,6 +65,7 @@ struct View
     std::string bootId;
     std::wstring selectedDistro;
     std::wstring statistics;
+    std::string pendingSelection;
     // Replies from earlier distro selections or disconnected sessions are ignored.
     unsigned epoch = 1;
     int page = 0;
@@ -81,6 +82,7 @@ std::wstring windowText(HWND window);
 void status(View &view, const std::wstring &message);
 void queue(View &view, Json request, uintptr_t tag);
 void refresh(View &view);
+void selectPage(View &view, int page);
 
 // Snapshot state, filtering and table presentation.
 void clearDistro(View &view);

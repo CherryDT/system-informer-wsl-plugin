@@ -83,6 +83,7 @@ class Table
     void create(HWND parent, int id, std::vector<Column> definitions, int defaultSort = -1,
                 bool defaultDescending = false);
     void saveLayout() const;
+    void setAncestryOrder(bool enabled);
     void replace(std::vector<Row> next);
     void sort(int column);
     bool notify(NMHDR *hdr);
@@ -93,6 +94,7 @@ class Table
 
   private:
     std::wstring settingsPrefix;
+    bool ancestryOrder = false;
     void order();
 };
 } // namespace wsl
@@ -107,3 +109,5 @@ extern "C" COLORREF WslDialogBackground(void);
 extern "C" COLORREF WslDialogText(void);
 extern "C" BOOL WslHasGlobalSearch(void);
 extern "C" BOOL WslMatchesGlobalSearch(PCWSTR text);
+
+extern "C" void WslClearGlobalSearch(void);

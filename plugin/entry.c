@@ -56,7 +56,9 @@ HFONT WslGetHostFont(void)
 HFONT WslCreateUiFont(HWND window)
 {
     LONG dpi = (LONG)GetDpiForWindow(window);
-    HFONT result = PhCreateApplicationFont(dpi ? dpi : 96);
+    // PhCreateApplicationFont returns a reference-counted font wrapper in
+    // this SDK, not a GDI HFONT. Win32 controls need the raw handle factory.
+    HFONT result = PhCreateFontHandle(L"Microsoft Sans Serif", 8, FW_NORMAL, DEFAULT_PITCH, dpi ? dpi : 96);
     HFONT stock = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     if (!result || result == stock)
     {
@@ -110,6 +112,23 @@ BOOL WslMatchesGlobalSearch(PCWSTR text)
         return TRUE;
     PhInitializeStringRef(&value, text ? text : L"");
     return ToolStatus->WordMatch(&value);
+}
+
+void WslClearGlobalSearch(void)
+{
+    HWND search, rebar;
+    HWND mainWindow = ViewWindow ? GetAncestor(ViewWindow, GA_ROOT) : NULL;
+    if (!mainWindow) return;
+    if (!ToolStatus || !ToolStatus->GetSearchMatchHandle()) return;
+    // ToolStatus v2 exposes matching but no text setter. Its native search edit
+    // is a direct child of the main window (or its rebar when reparented).
+    search = FindWindowExW(mainWindow, NULL, WC_EDIT, NULL);
+    if (!search)
+    {
+        rebar = FindWindowExW(mainWindow, NULL, REBARCLASSNAME, NULL);
+        if (rebar) search = FindWindowExW(rebar, NULL, WC_EDIT, NULL);
+    }
+    if (search) SetWindowTextW(search, L"");
 }
 
 static VOID NTAPI SearchChanged(PVOID parameter, PVOID context)
