@@ -99,6 +99,7 @@ struct Inspector
     bool connectionsLoaded = false;
     bool stacksLoaded = false;
     bool runtimeStacksLoaded = false;
+    std::wstring nativeCapture, runtimeCapture;
     bool nodeChoiceOffered = false;
     Json runtimeRequest;
     Operation pending = Operation::ProcessDetails;
@@ -792,6 +793,12 @@ void layout(Inspector &state)
             place(table.window, body.left, body.top, body.right - body.left, body.bottom - body.top);
 }
 
+void showCaptureProgress(HWND pane)
+{
+    SetWindowTextW(pane, L"Capturing...");
+    RedrawWindow(pane, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+}
+
 void queueRuntimeCapture(Inspector &state, Json request)
 {
     // Retain the exact identity for a possible Node backend choice. A later
@@ -802,6 +809,7 @@ void queueRuntimeCapture(Inspector &state, Json request)
     state.page = RuntimeStacksPage;
     TabCtrl_SetCurSel(state.tabs, tabFromPage(state, RuntimeStacksPage));
     showPage(state);
+    showCaptureProgress(state.runtimeStacks);
     submit(state.distro, std::move(request), state.mailbox, ++state.requestTag);
 }
 
@@ -873,6 +881,7 @@ void captureStacks(Inspector &state)
     state.page = StacksPage;
     TabCtrl_SetCurSel(state.tabs, tabFromPage(state, StacksPage));
     showPage(state);
+    showCaptureProgress(state.stacks);
     submit(state.distro, std::move(request), state.mailbox, ++state.requestTag);
 }
 
@@ -1171,10 +1180,19 @@ void loadStacks(Inspector &state, const Json &data)
     }
     else
         state.stacksNotice = message.empty() ? L"Stack capture complete." : message;
+    if ((!supported || timeout || failed) && state.stacksLoaded)
+    {
+        state.stacksNotice += L" The previous capture is still displayed.";
+        SetWindowTextW(state.stacks, state.nativeCapture.c_str());
+        return;
+    }
     if (output.empty())
     {
         if (state.stacksLoaded)
+        {
             state.stacksNotice += L" The previous capture is still displayed.";
+            SetWindowTextW(state.stacks, state.nativeCapture.c_str());
+        }
         else
             SetWindowTextW(state.stacks, editText(state.stacksNotice).c_str());
         return;
@@ -1182,7 +1200,11 @@ void loadStacks(Inspector &state, const Json &data)
     if (timeout || failed)
         output = state.stacksNotice + L"\r\n\r\n" + output;
     SetWindowTextW(state.stacks, editText(output).c_str());
-    state.stacksLoaded = true;
+    if (supported && !timeout && !failed)
+    {
+        state.nativeCapture = editText(output);
+        state.stacksLoaded = true;
+    }
 }
 
 void loadRuntimeStacks(Inspector &state, const Json &data)
@@ -1200,7 +1222,10 @@ void loadRuntimeStacks(Inspector &state, const Json &data)
         // Keep a successful capture intact when tooling becomes unavailable or
         // attachment fails. Initial failures show the diagnostic in the page.
         if (state.runtimeStacksLoaded)
+        {
             state.runtimeStacksNotice += L" The previous capture is still displayed.";
+            SetWindowTextW(state.runtimeStacks, state.runtimeCapture.c_str());
+        }
         else
         {
             std::wstring diagnostic = state.runtimeStacksNotice;
@@ -1214,13 +1239,17 @@ void loadRuntimeStacks(Inspector &state, const Json &data)
     {
         state.runtimeStacksNotice = L"The diagnostic tool returned no stack output.";
         if (state.runtimeStacksLoaded)
+        {
             state.runtimeStacksNotice += L" The previous capture is still displayed.";
+            SetWindowTextW(state.runtimeStacks, state.runtimeCapture.c_str());
+        }
         else
             SetWindowTextW(state.runtimeStacks, state.runtimeStacksNotice.c_str());
         return;
     }
     state.runtimeStacksNotice = message.empty() ? L"Runtime stack capture complete." : message;
-    SetWindowTextW(state.runtimeStacks, editText(output).c_str());
+    state.runtimeCapture = editText(output);
+    SetWindowTextW(state.runtimeStacks, state.runtimeCapture.c_str());
     state.runtimeStacksLoaded = true;
 }
 
@@ -1266,7 +1295,10 @@ bool chooseNodeBackend(Inspector &state, const Json &data)
         state.runtimeStacksNotice =
             FAILED(result) ? L"Could not open the capture method chooser." : L"Capture canceled.";
         if (state.runtimeStacksLoaded)
+        {
             state.runtimeStacksNotice += L" The previous capture is still displayed.";
+            SetWindowTextW(state.runtimeStacks, state.runtimeCapture.c_str());
+        }
         else
         {
             std::wstring text = state.runtimeStacksNotice + L"\r\n\r\n" + runtimeStackIntro(state);
@@ -1334,6 +1366,10 @@ void loadReply(Inspector &state, const Reply &reply)
                                      : state.hasData;
         notice = hadData ? L"Refresh failed (displayed data may be stale): " : L"Could not load details: ";
         notice += wide(reply.error);
+        if (runtimeStacks && hadData)
+            SetWindowTextW(state.runtimeStacks, state.runtimeCapture.c_str());
+        else if (stacks && hadData)
+            SetWindowTextW(state.stacks, state.nativeCapture.c_str());
         if (!network && !hadData)
             SetWindowTextW(runtimeStacks ? state.runtimeStacks
                            : stacks      ? state.stacks
@@ -1516,6 +1552,7 @@ void syncRuntimeTab(Inspector &state, const Json &data)
     // A capture from the previous interpreter is not a valid cache for the new one.
     state.runtime = std::move(runtime);
     state.runtimeStacksLoaded = false;
+    state.runtimeCapture.clear();
     state.runtimeStacksNotice.clear();
     if (state.runtimeStacks)
     {
