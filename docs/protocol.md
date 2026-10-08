@@ -44,37 +44,75 @@ Returns `protocol`, `helper_version`, `boot_id`, `uid`, `cpus` (online logical C
 `clock_ticks` (ticks per second), `systemd` (whether systemd is running), and
 `gdb` (whether GDB is installed in a trusted system binary directory).
 
-### `snapshot`
+### `snapshot` (optional `fields`, `detect_32bit`, `default_uid`, `pid`, `start_ticks`)
 
-Returns:
+A `fields` string array selects optional process metadata. Omitting it requests
+all normal metadata for protocol-1 compatibility; an empty array requests only
+inexpensive `/proc/PID/stat` data and VM graph counters. The response echoes
+`fields` when supplied. `detect_32bit` defaults to false and must additionally be
+true before an executable is read for its ELF class. `default_uid` is the distro's
+configured default user UID, supplied by the Windows client; it defaults to -1
+(unknown). Optional `pid` and `start_ticks` restrict collection to a validated
+process identity.
 
-- `processes`: objects with `pid`, `ppid`, `start_ticks`, `name`, `state`, `user`,
-  `uid`, `threads`, `cpu_ticks`, `rss_bytes`, `virtual_bytes`, `read_bytes`,
-  `write_bytes`, `io_accessible`, `status_accessible`, `tracer_pid`,
-  `is_service`, `command`, `exe`, and `runtime`. `tracer_pid` comes from
-  `/proc/PID/status`; `is_service` is true when the process cgroup is in
-  `/system.slice/` and contains a `.service` unit. `runtime` is `"node"`,
-  `"python"`, `"java"`, or an empty string when the resolved executable is not
-  a recognized runtime.
-- `processes_truncated`: true if the encoded process array reached its 12 MiB budget.
+Every process includes `pid`, `ppid`, `start_ticks`, `name`, `state`, `threads`,
+`cpu_ticks`, `rss_bytes`, `virtual_bytes`, `nice`, `priority`, `pgrp`, `session`,
+`tty_nr`, decoded `tty`, `no_tty`, `minor_faults`, `major_faults`, `processor`,
+`policy`, `user_ticks`, and `kernel_ticks`. Optional groups are:
+
+| `fields` entry | Added process fields |
+| --- | --- |
+| `status` | `uid`, `euid`, `gid`, `egid`, `status_accessible`, `is_own`, `tracer_pid`, `voluntary_switches`, `involuntary_switches`, `swap_bytes`, `seccomp`, `no_new_privs`, `capabilities` |
+| `user` | Status fields and effective-user `user` name |
+| `sudo` | Status fields and `sudo_root` |
+| `command` | `command` |
+| `io` | `io_accessible`, `read_bytes`, `write_bytes`, `read_chars`, `write_chars`, `syscr`, `syscw`, `cancelled_write_bytes` |
+| `cgroup` | `cgroup`, `is_service` |
+| `exe` | `exe`, `runtime` |
+| `cwd` | `cwd` |
+| `suspension` | `stopped_threads`, `is_suspended`, `is_partially_suspended` when task enumeration succeeds |
+| `elf32` | `is_32bit` when `detect_32bit:true` and the executable's ELF class can be read |
+| `loadavg` | Top-level `loadavg` text |
+| `pressure` | Top-level CPU, memory and I/O `pressure` text, where available |
+
+Individual field aliases are accepted for several groups; clients should use the
+group names above. `runtime` is `"node"`, `"python"`, `"java"`, or empty when
+unrecognized. `is_own` compares effective UID with `default_uid`. `sudo_root`
+requires effective UID 0 and a nonzero numeric `SUDO_UID` from up to 256 KiB of
+the process environment. `is_service` recognizes `.service` cgroup path
+components, including user services. Suspension examines task states `T`/`t`;
+fully suspended requires a complete enumeration matching the process thread
+count. An unreadable or changing task list does not establish full suspension.
+ELF detection pins a regular executable and validates ELF magic and byte 4
+(`EI_CLASS`); unknown is represented by an absent `is_32bit`, not false.
+
+The response also includes:
+
+- `processes` and `processes_truncated` (the encoded array has a 12 MiB budget).
 - `monotonic_ms`: helper monotonic time, sampled at the end of collection.
 - `uptime_seconds`, `memory_total`, `memory_available`, `cpus`, `clock_ticks`, `boot_id`.
   Memory and pressure values describe the shared WSL VM, not just this distro.
-- `loadavg`: Linux load-average text; `pressure`: CPU, memory, and I/O pressure
-  text, where the kernel provides it.
 
 `cpu_ticks` is user plus system CPU time for this process, excluding reaped child
 CPU time. Compute one-core usage as
 `100 * delta(cpu_ticks) / clock_ticks / delta(seconds)`. Dividing by `cpus` gives
 a fraction of the guest's capacity. Neither value is host VM CPU attribution.
 Negative deltas, a changed boot ID, or a changed process identity reset the sample.
-RSS and virtual memory are byte counts, and I/O counters are cumulative byte
-counts. Missing I/O permission produces `io_accessible:false` with zero counters. An
-unreadable status file produces `status_accessible:false`, user `unknown`, and
-UID 4294967295 instead of incorrectly reporting root.
+RSS and virtual memory are byte counts, and I/O counters are cumulative.
+Missing I/O permission produces `io_accessible:false` with zero counters.
+Unreadable status produces `status_accessible:false`, user `unknown` when
+requested, and UID/GID 4294967295 instead of incorrectly reporting root.
 Short-lived processes may disappear during collection and are omitted. Usernames
-come from the local `/etc/passwd`; other UIDs remain numeric, so inspection never
-blocks on network name services. Command lines are capped at 16 KiB per process.
+come from local `/etc/passwd`; other UIDs remain numeric, avoiding network name
+services. Command lines are capped at 16 KiB per process.
+
+The Windows view selects groups from visible or sorted columns and enabled
+highlighting. It keeps cheap identity/CPU/RSS samples while hidden or minimized
+for graph history and lifecycle tracking, then requests visible metadata on
+return. Unrequested metadata may be retained for the same PID/start-time identity;
+requested-but-unavailable metadata must clear the previous value. This avoids
+making a changed executable or credential appear current because of old cache
+contents. Sampling follows the host automatic-refresh setting.
 
 ### `details` (`pid`, `start_ticks`)
 
@@ -87,20 +125,38 @@ Returns:
 - `summary`: human-readable status, I/O counters, cgroups, resource limits,
   namespace IDs, executable path, and current working directory. Status includes
   UIDs/GIDs, capability masks, seccomp state, and other kernel-provided fields.
-- `files`: `{fd,target,flags}`. `flags` is the original octal `/proc` flag string.
-  Targets may be paths, sockets, pipes, anonymous handles, or deleted paths.
+- `files`: `{fd,target,flags,flags_text,inherited}`. `flags` is the original octal
+  `/proc` flag string; `flags_text` contains symbolic names and a hexadecimal value
+  (or `Unknown`). `inherited` means known flags without `O_CLOEXEC`, an exec-survival
+  approximation rather than proof of fork inheritance. Targets may be paths,
+  sockets, pipes, anonymous handles, or deleted paths.
 - `modules`: verified ELF executable/shared-object images that have an executable
   mapping. One object is returned per device/inode identity, with `path`, `base`,
-  `end`, `size_bytes`/`mapped_bytes`, `device`, `inode`, `identity`, and `deleted`.
+  `end`, `size_bytes`/`mapped_bytes`, `device`, `inode`, `identity`, `deleted`,
+  `main_module`, `native_module`, `known_library`, and `mapped_module`. The main
+  image matches `/proc/PID/exe` by device/inode. Native recognizes default loaders
+  under standard library paths; Known libraries are other libraries there.
+  `mapped_module` is currently false: ordinary mapped files belong in Memory,
+  and ELF ASLR is not evidence of Windows-style image relocation.
   Addresses are hexadecimal strings. The mapped size sums the image's mapped
   segments and excludes gaps; it is not the base-to-end address range.
 - `memory`: every parsed VMA from `/proc/PID/maps`, with `start`, `end`,
-  `size_bytes`, `permissions`, `offset`, `path`, `device`, `inode`, and `deleted`.
+  `size_bytes`, `permissions`, `offset`, `path`, `device`, `inode`, `deleted`,
+  `private_pages`, `system_pages`, and `execute_pages`. Private means a private
+  anonymous/heap/stack mapping; system recognizes kernel-provided `[vdso]`,
+  `[vvar]`, `[vsyscall]` and `[vvar_vclock]`; execute follows the `x` permission.
+  No Windows CFG-page classification is inferred.
   It includes anonymous/JIT mappings, bracketed kernel mappings such as `[heap]`
   and `[vdso]`, and mapped files that are not verified ELF modules. Empty `path`
   represents an anonymous mapping. Addresses and offsets are hexadecimal strings.
-- `environment`: `{name,value}` pairs. Ordering and duplicate names are retained.
-- `threads`: `{tid,name,state,wchan}` entries.
+- `environment`: `{name,value,scope}`. Ordering and duplicate names are retained.
+  Scope is `system` for an exact literal name/value match from the target root
+  `/etc/environment`, then `user` for exact account `USER`, `LOGNAME`, `HOME` or
+  `SHELL` matches, otherwise `process`. Shell expansions are not evaluated. These
+  are matching baselines, not evidence of where a value was inherited.
+- `threads`: `{tid,name,state,wchan,wait_kind}` entries. Wait kind is `suspended`,
+  `delay`, `alert` (futex), `queue`, `executive`, `user_request`, or empty. These
+  descriptive Linux wait-channel analogues are not Windows wait-reason IDs.
 - `files_accessible`, `modules_accessible`, `memory_accessible`: availability
   indicators. `modules_unverified` counts executable mapped files that could not
   be checked as ELF images. `module_classification_note` explains what appears
@@ -118,7 +174,33 @@ text is capped at 256 KiB. These limits keep detail responses below the Windows
 transport limit even when paths contain characters requiring JSON escapes.
 A partial final environment value is omitted instead of presenting it as complete.
 
-### `connections` (optional `pid`, `start_ticks`)
+### `find_handles` (`query`)
+
+Searches open descriptors and file mappings across the selected distro's visible
+PID namespace. `query` must be 1–1024 UTF-8 bytes. ASCII case-insensitive substring
+matching applies to paths and process names; an exact decimal PID matches every
+resource in that process. No shell, `lsof`, or target-file open is used.
+
+Returns `{results,processes_scanned,inaccessible_processes,truncated}`. Each result
+contains `pid`, `start_ticks`, `process`, `handle`, `type`, and `path`. A handle is
+a decimal FD, `cwd`, `exe`, `root`, or a hexadecimal mapping address. Types are
+`File`, `Socket`, `Pipe`, `Anonymous inode`, `Working directory`, `Executable`,
+`Root directory`, `Executable mapping`, and `Mapped file`. Search mapping types
+come from map permissions, not ELF verification. Repeated segments are grouped
+by type, device/inode and path within a process. PID/start time is checked again
+before publishing that process's rows; later inspections must also validate it.
+`inaccessible_processes` counts processes whose FD directory could not be opened.
+
+The scan checks a five-second monotonic deadline between procfs operations, caps
+results at 10,000 and encoded rows at 8 MiB, and caps a process map file at 4 MiB.
+It sets `truncated` when a limit prevents full collection. This is a cooperative
+scan deadline; the Windows transport independently enforces its request timeout.
+The UI's Cancel detaches the request mailbox and ignores a late result. It does
+not kill the shared observer or interfere with another inspector; a request
+already running completes under its scan/transport limits. Closing the dialog
+also detaches the mailbox before draining posted replies.
+
+### `connections` (optional `pid`, `start_ticks`, `identities_only`)
 
 Returns `connections`, `connections_truncated`, `inaccessible_processes`, `tables_read`,
 `network_namespace`, and `coverage`.
@@ -129,6 +211,11 @@ Each row has `protocol` (`tcp`, `tcp6`, `udp`, `udp6`, or `unix`),
 from the ownership scan; PID 0 uses start time 0. Unix socket addresses are paths (including abstract
 namespace names), with zero ports and an empty remote address. Stream listeners
 use `LISTEN`; bound UDP sockets usually use `UNCONN`.
+
+With `identities_only:true`, rows omit `process` and `state`; all socket and owner
+identity fields remain. The response echoes `identities_only`. This avoids
+sending display-only metadata for hidden views. The FD and network-table scans
+are still necessary to establish socket lifetimes and ownership.
 
 Socket ownership is joined from visible `/proc/PID/fd` entries. Shared sockets
 have one row for each owning process; duplicate FDs within a process are collapsed.
@@ -326,7 +413,7 @@ Debugger tools attach by numeric PID. The helper checks PID/start-time identity
 and the executable before and after capture, but this cannot eliminate the narrow
 PID-reuse race during attachment.
 
-### `services`
+### `services` (optional `identities_only`)
 
 Returns `{available,services,message?}`. Each service has `name`, `description`,
 `load`, `active`, `sub`, and `enabled` (unit-file state, such as `enabled`,
@@ -335,6 +422,11 @@ unit files are merged by name. Installed units that are not loaded have
 `load:"not loaded"`, `active:"inactive"`, and `sub:"dead"`; their description is
 empty until systemd loads them. Template and alias unit files are retained. When systemd is
 not running, `available:false` is a normal result.
+
+With `identities_only:true`, service rows contain only `name`, and the response
+echoes the flag. Both unit enumerations remain necessary to include loaded
+transient units and unloaded installed unit files. The client retains earlier
+properties by name and reloads them immediately when the view becomes visible.
 
 The helper prefers systemctl JSON output and falls back to parsing its stable
 leading columns using C locale, no legend, full names, and plain output. A failed
