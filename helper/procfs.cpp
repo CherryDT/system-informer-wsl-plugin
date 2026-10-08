@@ -187,6 +187,15 @@ std::optional<bool> executable_is_32bit(int pid) {
 }
 
 void suspension_state(Json& result, const ProcessStat& stat) {
+    // A single-threaded process already supplies its only thread's state.
+    // Avoid opening the task directory and rereading stat on every sample.
+    if (stat.threads == 1) {
+        const bool stopped = stat.state == "T" || stat.state == "t";
+        result["stopped_threads"] = stopped ? 1 : 0;
+        result["is_suspended"] = stopped;
+        result["is_partially_suspended"] = false;
+        return;
+    }
     const auto path = proc_path(stat.pid, "task");
     DIR* tasks = opendir(path.c_str());
     if (!tasks) return;
