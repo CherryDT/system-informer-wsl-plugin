@@ -25,6 +25,7 @@ enum Id
     InspectButton,
     ActionsButton,
     ExportButton,
+    InstallButton,
     Inspect = 200,
     CopyRow,
     CopyCommand,
@@ -52,7 +53,8 @@ struct ProcessSample
 struct View
 {
     HWND window{}, distro{}, refresh{}, pause{}, settings{}, search{}, tabs{}, listeners{}, tree{}, inspect{},
-        actions{}, exportButton{}, status{}, graph{}, memoryGraph{};
+        actions{}, exportButton{}, status{}, graph{}, memoryGraph{}, installNotice{}, installButton{},
+        tooltips{};
     Table processes, connections, services;
     std::shared_ptr<Mailbox> mailbox = std::make_shared<Mailbox>();
     Json snapshot, sockets, units;
@@ -70,6 +72,7 @@ struct View
     unsigned epoch = 1;
     int page = 0;
     bool active = false, paused = false, pending = false, failed = false;
+    bool componentMissing = false, cpuPercentOfTotal = false;
     Table &table()
     {
         return page == 0 ? processes : page == 1 ? connections : services;

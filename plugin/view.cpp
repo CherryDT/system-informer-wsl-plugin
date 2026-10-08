@@ -45,36 +45,66 @@ void layout(View &v)
     RECT rect{};
     GetClientRect(v.window, &rect);
     auto s = [&](int x) { return scale(v.window, x); };
-    int width = rect.right, height = rect.bottom, pad = 0, line = s(28), gap = s(8);
-    int combo = std::max(s(130), std::min(s(300), width - s(340)));
-    place(v.distro, pad, pad, combo, s(300));
-    place(v.refresh, pad + combo + gap, pad, s(86), line);
-    place(v.pause, pad + combo + gap + s(94), pad, s(86), line);
-    place(v.settings, pad + combo + gap + s(188), pad, s(88), line);
-    const bool showChart = true;
-    const int chartSpace = showChart ? s(54) : 0;
-    ShowWindow(v.graph, showChart ? SW_SHOW : SW_HIDE);
-    ShowWindow(v.memoryGraph, showChart ? SW_SHOW : SW_HIDE);
-    int graphWidth = (width - 2 * pad - gap) / 2;
-    place(v.graph, pad, s(46), graphWidth, s(44));
-    place(v.memoryGraph, pad + graphWidth + gap, s(46), graphWidth, s(44));
-    place(v.tabs, pad, s(46) + chartSpace, width - 2 * pad, s(28));
-    const bool globalSearch = WslHasGlobalSearch() != FALSE;
-    ShowWindow(v.search, globalSearch ? SW_HIDE : SW_SHOW);
-    if (!globalSearch)
-        place(v.search, pad, s(84) + chartSpace, std::max(s(140), width - s(250)), editHeight(v.window));
-    int optionsY = (globalSearch ? s(46) : s(82)) + chartSpace;
-    place(v.listeners, width - s(230), optionsY, s(210), line);
-    place(v.tree, width - s(230), optionsY, s(210), line);
-    int tableTop = (globalSearch ? s(82) : s(114)) + chartSpace;
+    const int width = rect.right, height = rect.bottom, gap = s(4);
+    const int combo = std::max(s(130), std::min(s(300), width - s(300)));
+    place(v.distro, 0, 0, combo, s(300));
+    // A dropdown's requested height includes its popup. Measure the collapsed
+    // control so adjacent buttons have exactly the same visual height.
+    RECT comboRect{};
+    GetWindowRect(v.distro, &comboRect);
+    const int line = std::max(s(20), static_cast<int>(comboRect.bottom - comboRect.top));
+    place(v.refresh, combo + gap, 0, s(86), line);
+    place(v.pause, combo + gap + s(90), 0, s(86), line);
+    place(v.settings, combo + gap + s(180), 0, s(88), line);
+    const int footerHeight = s(18);
+    const int footerY = height - gap - footerHeight;
+    const int buttonsY = footerY - gap - line;
+    place(v.status, s(2), footerY, width - s(4), footerHeight);
 
-    int bottom = s(78);
+    const bool content = !v.componentMissing;
+    for (HWND child : {v.graph, v.memoryGraph, v.tabs, v.inspect, v.actions, v.exportButton})
+        ShowWindow(child, content ? SW_SHOW : SW_HIDE);
+    ShowWindow(v.processes.window, content && v.page == 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(v.connections.window, content && v.page == 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(v.services.window, content && v.page == 2 ? SW_SHOW : SW_HIDE);
+    ShowWindow(v.tree, content && v.page == 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(v.listeners, content && v.page == 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(v.installNotice, content ? SW_HIDE : SW_SHOW);
+    ShowWindow(v.installButton, content ? SW_HIDE : SW_SHOW);
+    EnableWindow(v.installButton, !v.pending);
+    EnableWindow(v.pause, content);
+    const bool globalSearch = WslHasGlobalSearch() != FALSE;
+    ShowWindow(v.search, content && !globalSearch ? SW_SHOW : SW_HIDE);
+    if (!content)
+    {
+        place(v.installNotice, s(20), line + s(24), std::max(s(200), width - s(40)), s(100));
+        place(v.installButton, s(20), line + s(132), s(160), line);
+        return;
+    }
+    const int graphY = line + gap, graphHeight = s(44);
+    const int graphWidth = (width - gap) / 2;
+    place(v.graph, 0, graphY, graphWidth, graphHeight);
+    place(v.memoryGraph, graphWidth + gap, graphY, width - graphWidth - gap, graphHeight);
+    const int tabsY = graphY + graphHeight + gap;
+    RECT tabItem{};
+    TabCtrl_GetItemRect(v.tabs, 0, &tabItem);
+    const int tabsHeight = tabItem.bottom + s(2);
+    place(v.tabs, 0, tabsY, width, tabsHeight);
+    int tableTop = tabsY + tabsHeight;
+    if (!globalSearch)
+    {
+        place(v.search, 0, tableTop + gap, width, editHeight(v.window));
+        tableTop += gap + editHeight(v.window) + gap;
+    }
     for (auto table : {&v.processes, &v.connections, &v.services})
-        place(table->window, pad, tableTop, width - 2 * pad, height - tableTop - bottom);
-    place(v.inspect, pad, height - s(66), s(112), line);
-    place(v.actions, pad + s(122), height - s(66), s(104), line);
-    place(v.exportButton, pad + s(236), height - s(66), s(114), line);
-    place(v.status, pad, height - s(29), width - 2 * pad, s(24));
+        place(table->window, 0, tableTop, width, std::max(0, buttonsY - gap - tableTop));
+    // Keep controls in the same places on all three pages, even when the
+    // page-specific checkbox is hidden.
+    place(v.tree, width - s(210), buttonsY, s(210), line);
+    place(v.listeners, width - s(230), buttonsY, s(230), line);
+    place(v.inspect, 0, buttonsY, s(112), line);
+    place(v.actions, s(116), buttonsY, s(104), line);
+    place(v.exportButton, s(224), buttonsY, s(114), line);
 }
 void switchPage(View &v)
 {
@@ -293,14 +323,40 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         v->inspect = control(window, L"BUTTON", L"Inspect...", WS_TABSTOP, InspectButton);
         v->actions = control(window, L"BUTTON", L"Actions", WS_TABSTOP, ActionsButton);
         v->exportButton = control(window, L"BUTTON", L"Export view...", WS_TABSTOP, ExportButton);
+        v->installNotice =
+            control(window, L"STATIC",
+                    L"Install the WSL inspection component\r\n\r\n"
+                    L"This distribution needs the WSL Tools observer to display processes, services and "
+                    L"network connections. "
+                    L"Install it as root in /usr/local/lib/system-informer-wsl. "
+                    L"It runs only while connected; future component updates are applied automatically.",
+                    SS_LEFT, 0);
+        v->installButton = control(window, L"BUTTON", L"Install and retry", WS_TABSTOP, InstallButton);
         v->status = control(window, L"STATIC",
                             L"Monitoring starts when this tab is selected. Stopped distros are not "
                             L"started intentionally.",
                             SS_LEFT, 0);
         for (HWND child : {v->distro, v->refresh, v->pause, v->settings, v->tabs, v->search, v->listeners,
                            v->tree, v->processes.window, v->connections.window, v->services.window,
-                           v->inspect, v->actions, v->exportButton})
+                           v->inspect, v->actions, v->exportButton, v->installButton})
             SetWindowSubclass(child, childKeys, 1, reinterpret_cast<DWORD_PTR>(v));
+        v->tooltips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                      WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT,
+                                      CW_USEDEFAULT, CW_USEDEFAULT, window, nullptr, instance, nullptr);
+        auto tip = [&](HWND child, const wchar_t *label) {
+            TOOLINFOW info{sizeof(info)};
+            info.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+            info.hwnd = window;
+            info.uId = reinterpret_cast<UINT_PTR>(child);
+            info.lpszText = const_cast<wchar_t *>(label);
+            SendMessageW(v->tooltips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
+        };
+        tip(v->refresh, L"Refresh and reconnect (F5)");
+        tip(v->pause, L"Pause or resume collection");
+        tip(v->inspect, L"Inspect the selected resource, or go to the socket owner (Enter)");
+        tip(v->actions, L"Actions for the selected resource (Delete offers SIGTERM for a process)");
+        tip(v->exportButton, L"Export the visible rows and columns");
+        tip(v->settings, L"Refresh interval, CPU percentage convention and Explorer path mapping");
         WslApplyTheme(window);
         switchPage(*v);
         layout(*v);
@@ -329,6 +385,8 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         return 0;
     case WM_TIMER: {
         static ULONGLONG last = 0;
+        if (v->cpuPercentOfTotal != (readSetting(L"CpuPercentOfTotal", 0) != 0))
+            render(*v);
         auto now = GetTickCount64();
         auto interval = std::clamp(readSetting(L"RefreshInterval", 2000), 500ul, 60000ul);
         if (now - last >= interval)
@@ -347,6 +405,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             {
                 clearDistro(*v);
                 v->selectedDistro = chosen;
+                layout(*v);
                 refresh(*v);
             }
             return 0;
@@ -358,6 +417,17 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         }
         switch (id)
         {
+        case InstallButton:
+            if (v->componentMissing && !v->pending)
+            {
+                v->paused = false;
+                v->failed = false;
+                SetWindowTextW(v->pause, L"Pause");
+                queue(*v, {{"op", "install_component"}}, InstallTag);
+                EnableWindow(v->installButton, FALSE);
+                status(*v, L"Installing the WSL component as root…");
+            }
+            break;
         case RefreshButton:
             manualRefresh(*v);
             break;
@@ -453,14 +523,41 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         auto tag = reply->tag & 0xffff;
         if (!reply->error.empty())
         {
+            if (reply->componentMissing || tag == InstallTag)
+            {
+                v->componentMissing = true;
+                v->failed = true;
+                layout(*v);
+                if (tag == InstallTag)
+                    errorBox(window, L"Could not install the WSL component.\r\n\r\n" + wide(reply->error));
+                status(*v, tag == InstallTag ? L"Installation failed: " + wide(reply->error)
+                                             : L"Component not installed in " + v->selectedDistro + L".");
+                return 0;
+            }
+            if (tag == ActionTag)
+            {
+                // A refused signal or service action does not necessarily mean
+                // the observer disconnected. Do not retry the action; refresh
+                // its state through the existing connection instead.
+                errorBox(window, wide(reply->error));
+                status(*v, L"Action failed: " + wide(reply->error));
+                refresh(*v);
+                return 0;
+            }
             v->failed = true;
             status(*v, L"Disconnected: " + wide(reply->error) + L"  ·  Press Refresh to reconnect.");
-            if (tag == ActionTag)
-                errorBox(window, wide(reply->error));
             return 0;
         }
         try
         {
+            if (tag == InstallTag)
+            {
+                v->componentMissing = false;
+                v->failed = false;
+                status(*v, L"Component installed. Loading processes…");
+                switchPage(*v);
+                return 0;
+            }
             if (tag == DiscoverTag)
             {
                 auto old = v->selectedDistro;
@@ -478,6 +575,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                 {
                     clearDistro(*v);
                     v->selectedDistro.clear();
+                    layout(*v);
                     v->failed = true;
                     status(*v, L"No running WSL2 distributions. Start a distro, then press Refresh.");
 
@@ -497,6 +595,11 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             }
             else if (tag == SnapshotTag)
             {
+                if (v->componentMissing)
+                {
+                    v->componentMissing = false;
+                    layout(*v);
+                }
                 updateSnapshot(*v, reply->data);
                 render(*v);
                 if (v->page == 0 && !v->pendingSelection.empty())
@@ -566,6 +669,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         return 0;
     }
     case WM_DESTROY:
+        DestroyWindow(v->tooltips);
         KillTimer(window, 1);
         v->mailbox->detach();
         disconnect(v->selectedDistro);
@@ -648,6 +752,11 @@ extern "C" void WslFocusContent(BOOL select)
     using namespace wsl::ui;
     if (!mainView)
         return;
+    if (mainView->componentMissing)
+    {
+        SetFocus(mainView->installButton);
+        return;
+    }
     auto &table = mainView->table();
     SetFocus(table.window);
     if (select && !table.selected() && !table.rows.empty())

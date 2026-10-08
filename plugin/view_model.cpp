@@ -1,4 +1,5 @@
 #include "controller.hpp"
+#include "settings.hpp"
 #include "view_state.hpp"
 #include <algorithm>
 #include <set>
@@ -49,6 +50,7 @@ void clearDistro(View &v)
     ++v.epoch;
     v.pending = false;
     v.failed = false;
+    v.componentMissing = false;
     v.previous.clear();
     v.cpu.clear();
     v.readRate.clear();
@@ -77,6 +79,9 @@ void updateButtons(View &v)
 }
 void render(View &v)
 {
+    v.cpuPercentOfTotal = readSetting(L"CpuPercentOfTotal", 0) != 0;
+    const double cpuDivisor =
+        v.cpuPercentOfTotal && v.snapshot.is_object() ? std::max(1.0, v.snapshot.value("cpus", 1.0)) : 1.0;
     std::vector<Row> rows;
     const auto query = lower(windowText(v.search));
     if (v.page == 0 && v.snapshot.contains("processes"))
@@ -117,7 +122,7 @@ void render(View &v)
         {
             auto key = processKey(p);
             std::wstring name = std::wstring(depths[p.value("pid", 0)] * 2, L' ') + text(p, "name");
-            Row row{{name, text(p, "pid"), text(p, "user"), number(v.cpu[key]),
+            Row row{{name, text(p, "pid"), text(p, "user"), number(v.cpu[key] / cpuDivisor),
                      number(p.value("rss_bytes", 0ull) / 1048576.0), number(v.readRate[key] / 1024.0),
                      number(v.writeRate[key] / 1024.0), text(p, "state"), text(p, "threads"), text(p, "ppid"),
                      text(p, "command")},
@@ -175,8 +180,8 @@ void updateSnapshot(View &v, const Json &data)
         v.memoryHistory.clear();
         v.bootId = boot;
     }
-    // Per-process CPU uses Linux conventions: 100% is one vCPU. The summary
-    // and graph divide the sum by the VM CPU count to show total capacity.
+    // Store raw Linux CPU percentages (100% = one vCPU). The display setting
+    // only scales rendered rows; history always measures total guest capacity.
     double elapsed = v.previousTime ? (now - v.previousTime) / 1000.0 : 0;
     double hz = data.value("clock_ticks", 100.0), total = 0;
     std::map<std::string, ProcessSample> samples;

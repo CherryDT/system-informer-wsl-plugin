@@ -141,11 +141,12 @@ namespace
 enum SettingsControl
 {
     PrefixEdit = 10,
-    IntervalEdit
+    IntervalEdit,
+    CpuMode
 };
 struct SettingsWindow
 {
-    HWND heading{}, edit{}, hint{}, label{}, interval{}, status{}, save{}, cancel{};
+    HWND heading{}, edit{}, hint{}, label{}, interval{}, cpuLabel{}, cpuMode{}, status{}, save{}, cancel{};
     std::wstring distro;
 };
 
@@ -156,14 +157,17 @@ void layoutSettings(HWND window, const SettingsWindow &state)
     int margin = scale(window, 18);
     int width = bounds.right - 2 * margin;
     place(state.heading, margin, margin, width, scale(window, 24));
-    place(state.edit, margin, scale(window, 48), width, scale(window, 28));
+    place(state.edit, margin, scale(window, 48), width, editHeight(window));
     place(state.hint, margin, scale(window, 86), width, scale(window, 50));
     int intervalWidth = scale(window, 138);
-    place(state.label, margin, scale(window, 148), width - intervalWidth - margin, scale(window, 24));
+    place(state.label, margin, scale(window, 144), width - intervalWidth - margin, scale(window, 24));
     place(state.interval, bounds.right - margin - intervalWidth, scale(window, 142), intervalWidth,
-          scale(window, 28));
-    place(state.status, margin, scale(window, 188), width, scale(window, 56));
-    int buttonWidth = scale(window, 94), buttonHeight = scale(window, 30);
+          editHeight(window));
+    place(state.cpuLabel, margin, scale(window, 183), scale(window, 160), scale(window, 22));
+    place(state.cpuMode, margin + scale(window, 170), scale(window, 180), width - scale(window, 170),
+          scale(window, 120));
+    place(state.status, margin, scale(window, 220), width, scale(window, 56));
+    int buttonWidth = scale(window, 94), buttonHeight = scale(window, 23);
     int bottom = bounds.bottom - margin - buttonHeight;
     place(state.save, bounds.right - margin - 2 * buttonWidth - scale(window, 12), bottom, buttonWidth,
           buttonHeight);
@@ -224,7 +228,7 @@ LRESULT CALLBACK settingsProc(HWND window, UINT message, WPARAM wparam, LPARAM l
         SendMessageW(state->edit, EM_SETCUEBANNER, TRUE,
                      reinterpret_cast<LPARAM>(L"Default: \\\\wsl.localhost\\<distribution>\\"));
         state->hint = control(window, L"STATIC",
-                              L"Example: U:\\ maps /home/user to U:\\home\\user.\r\nLeave blank to use "
+                              L"Example: R:\\ maps /home/user to R:\\home\\user.\r\nLeave blank to use "
                               L"\\\\wsl.localhost\\<distribution>\\.",
                               SS_NOPREFIX, 0);
         state->label =
@@ -233,6 +237,11 @@ LRESULT CALLBACK settingsProc(HWND window, UINT message, WPARAM wparam, LPARAM l
         state->interval = control(window, L"EDIT", std::to_wstring(refresh).c_str(),
                                   WS_BORDER | WS_TABSTOP | ES_NUMBER, IntervalEdit);
         SendMessageW(state->interval, EM_SETLIMITTEXT, 5, 0);
+        state->cpuLabel = control(window, L"STATIC", L"Process CPU percentage", SS_NOPREFIX, 0);
+        state->cpuMode = control(window, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, CpuMode);
+        for (auto label : {L"100% = one vCPU (Linux convention)", L"100% = all WSL vCPUs"})
+            SendMessageW(state->cpuMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+        SendMessageW(state->cpuMode, CB_SETCURSEL, readSetting(L"CpuPercentOfTotal", 0) ? 1 : 0, 0);
         state->status =
             control(window, L"STATIC",
                     L"Collectors always run as Linux root. Only the selected running distro is "
@@ -241,7 +250,7 @@ LRESULT CALLBACK settingsProc(HWND window, UINT message, WPARAM wparam, LPARAM l
                     SS_NOPREFIX, 0);
         state->save = control(window, L"BUTTON", L"Save", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK);
         state->cancel = control(window, L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, IDCANCEL);
-        for (HWND child : {state->edit, state->interval, state->save, state->cancel})
+        for (HWND child : {state->edit, state->interval, state->cpuMode, state->save, state->cancel})
             SetWindowSubclass(child, settingsKeys, 1, reinterpret_cast<DWORD_PTR>(window));
         layoutSettings(window, *state);
         WslApplyTheme(window);
@@ -287,7 +296,7 @@ LRESULT CALLBACK settingsProc(HWND window, UINT message, WPARAM wparam, LPARAM l
             std::wstring value = prefix;
             if (!validPrefix(value))
             {
-                errorBox(window, L"Enter an absolute Windows drive path (for example U:\\), a UNC path with "
+                errorBox(window, L"Enter an absolute Windows drive path (for example R:\\), a UNC path with "
                                  L"a server and share (\\\\server\\share\\), or leave the prefix blank.");
                 SetFocus(state->edit);
                 SendMessageW(state->edit, EM_SETSEL, 0, -1);
@@ -307,6 +316,8 @@ LRESULT CALLBACK settingsProc(HWND window, UINT message, WPARAM wparam, LPARAM l
             {
                 setDistroPrefix(state->distro, value);
                 writeSetting(L"RefreshInterval", static_cast<DWORD>(refresh));
+                writeSetting(L"CpuPercentOfTotal",
+                             SendMessageW(state->cpuMode, CB_GETCURSEL, 0, 0) == 1 ? 1 : 0);
                 DestroyWindow(window);
             }
             catch (const std::exception &error)
@@ -344,7 +355,7 @@ void showSettings(HWND owner, const std::wstring &distro)
     auto state = std::make_unique<SettingsWindow>();
     state->distro = distro;
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT bounds{0, 0, scale(owner, 636), scale(owner, 308)};
+    RECT bounds{0, 0, scale(owner, 636), scale(owner, 340)};
     AdjustWindowRectExForDpi(&bounds, style, FALSE, WS_EX_CONTROLPARENT, GetDpiForWindow(owner));
     HWND window = CreateWindowExW(WS_EX_CONTROLPARENT, cls.lpszClassName, L"WSL Tools settings", style,
                                   CW_USEDEFAULT, CW_USEDEFAULT, bounds.right - bounds.left,

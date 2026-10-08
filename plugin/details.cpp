@@ -13,6 +13,9 @@ constexpr size_t ConnectionsTable = ConnectionsPage - 1;
 constexpr int StacksPage = ConnectionsPage + 1;
 constexpr int RawPage = StacksPage + 1;
 constexpr int PageCount = RawPage + 1;
+// Keep model indices stable while presenting the available native property pages
+// in their familiar order. Linux-only views follow the shared Windows pages.
+constexpr std::array<int, PageCount> ProcessPages = {0, 4, 2, 3, 1, ConnectionsPage, StacksPage, RawPage};
 constexpr wchar_t OverviewClass[] = L"WslTools.Overview";
 constexpr int OverviewValueBase = 1000;
 enum class Operation
@@ -53,6 +56,7 @@ struct OverviewField
     const char *key;
     const wchar_t *label;
     bool multiline = false;
+    int visibleLines = 3;
     HWND caption = nullptr;
     HWND value = nullptr;
 };
@@ -62,7 +66,10 @@ struct OverviewField
 struct Inspector
 {
     HWND window = nullptr;
-    HWND banner = nullptr, tabs = nullptr, overview = nullptr, raw = nullptr, status = nullptr;
+    HWND tabs = nullptr, overview = nullptr, raw = nullptr, status = nullptr;
+    HWND tooltips = nullptr;
+    std::wstring tooltipText;
+    bool statusVisible = false;
     HWND lastOverviewEdit = nullptr;
     HWND stacks = nullptr, captureStack = nullptr;
     HFONT uiFont = nullptr, rawFont = nullptr;
@@ -93,6 +100,26 @@ struct Inspector
     std::wstring stacksNotice;
     std::array<bool, ConnectionsPage> available{};
 };
+
+COLORREF inspectorBackground()
+{
+    return WslIsDarkTheme() ? WslDialogBackground() : RGB(255, 255, 255);
+}
+
+int pageFromTab(const Inspector &state, int index)
+{
+    if (state.isService)
+        return index == 1 ? 1 : 0;
+    return index >= 0 && index < PageCount ? ProcessPages[index] : 0;
+}
+
+int tabFromPage(const Inspector &state, int page)
+{
+    if (state.isService)
+        return page == 1 ? 1 : 0;
+    auto position = std::find(ProcessPages.begin(), ProcessPages.end(), page);
+    return position == ProcessPages.end() ? 0 : static_cast<int>(position - ProcessPages.begin());
+}
 
 std::wstring windowText(HWND window)
 {
@@ -153,7 +180,11 @@ void layoutOverview(Inspector &state)
     int fieldHeight = editHeight(state.window);
     int rowGap = scale(state.window, 8);
     auto rowHeight = [&](const OverviewField &field) {
-        return field.multiline ? scale(state.window, 66) : fieldHeight + rowGap;
+        int textHeight = fieldHeight - scale(state.window, 6);
+        // Keep whole text lines inside the thin border; the extra six pixels
+        // cover its edges and the edit control's vertical inset at this DPI.
+        return field.multiline ? field.visibleLines * textHeight + scale(state.window, 6) + rowGap
+                               : fieldHeight + rowGap;
     };
     int margin = scale(state.window, 12);
     int captionWidth = scale(state.window, 150);
@@ -255,7 +286,7 @@ LRESULT CALLBACK overviewProc(HWND window, UINT message, WPARAM wparam, LPARAM l
     case WM_ERASEBKGND: {
         RECT bounds{};
         GetClientRect(window, &bounds);
-        HBRUSH brush = CreateSolidBrush(WslDialogBackground());
+        HBRUSH brush = CreateSolidBrush(inspectorBackground());
         FillRect(reinterpret_cast<HDC>(wparam), &bounds, brush);
         DeleteObject(brush);
         return 1;
@@ -357,13 +388,13 @@ void createOverviewFields(Inspector &state)
                                 {"cgroup", L"Control groups", true},
                                 {"seccomp", L"Seccomp"},
                                 {"no_new_privs", L"No new privileges"},
-                                {"capabilities", L"Capability masks", true}};
+                                {"capabilities", L"Capability masks", true, 6}};
     }
     for (size_t i = 0; i < state.overviewFields.size(); ++i)
     {
         auto &field = state.overviewFields[i];
         field.caption = control(state.overview, WC_STATICW, field.label, SS_LEFT | SS_NOPREFIX, 0);
-        DWORD style = WS_TABSTOP | ES_READONLY;
+        DWORD style = WS_TABSTOP | WS_BORDER | ES_READONLY;
         if (field.multiline)
             style |= ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL;
         else
@@ -410,10 +441,29 @@ void updateInspectorFonts(Inspector &state)
 LRESULT dialogControlColor(HDC dc)
 {
     SetTextColor(dc, WslDialogText());
-    SetBkColor(dc, WslDialogBackground());
+    SetBkColor(dc, inspectorBackground());
     SetBkMode(dc, TRANSPARENT);
-    SetDCBrushColor(dc, WslDialogBackground());
+    SetDCBrushColor(dc, inspectorBackground());
     return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+}
+
+LRESULT CALLBACK inspectorColorsProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR,
+                                     DWORD_PTR)
+{
+    if (message == WM_CTLCOLORSTATIC || message == WM_CTLCOLOREDIT || message == WM_CTLCOLORDLG)
+        return dialogControlColor(reinterpret_cast<HDC>(wparam));
+    if (message == WM_ERASEBKGND)
+    {
+        RECT bounds{};
+        GetClientRect(window, &bounds);
+        HBRUSH brush = CreateSolidBrush(inspectorBackground());
+        FillRect(reinterpret_cast<HDC>(wparam), &bounds, brush);
+        DeleteObject(brush);
+        return 1;
+    }
+    if (message == WM_NCDESTROY)
+        RemoveWindowSubclass(window, inspectorColorsProc, 3);
+    return DefSubclassProc(window, message, wparam, lparam);
 }
 
 // Pages are true children of the native tab. Its clipping keeps themed hover
@@ -488,6 +538,8 @@ std::wstring &operationNotice(Inspector &state, Operation operation)
     return state.notice;
 }
 
+void layout(Inspector &state);
+
 void updateActions(Inspector &state)
 {
     bool pathTab = !state.isService && (state.page == 1 || state.page == 2);
@@ -537,15 +589,17 @@ void updateActions(Inspector &state)
                 message += L" — no entries reported";
         }
     }
-    if (notice.empty() && !state.loading && networkPage)
-        message += L"  •  Current distro network namespace only  •  Blue = listening";
-    if (notice.empty() && !state.loading && state.page == 3)
-        message += L"  •  Ctrl+Shift+C copies the selected value";
-    if (notice.empty() && !state.loading && pathTab)
-        message += L"  •  Enter opens location  •  Ctrl+Shift+C copies path";
-    if (message.empty())
-        message = L"Ctrl+R refresh  •  Ctrl+C copy selection  •  Ctrl+S save this view";
-    SetWindowTextW(state.status, message.c_str());
+    if (state.status)
+    {
+        SetWindowTextW(state.status, message.c_str());
+        bool visible = !message.empty();
+        ShowWindow(state.status, visible ? SW_SHOW : SW_HIDE);
+        if (visible != state.statusVisible)
+        {
+            state.statusVisible = visible;
+            layout(state);
+        }
+    }
 }
 
 void refresh(Inspector &state);
@@ -608,11 +662,10 @@ void layout(Inspector &state)
     RECT rect{};
     GetClientRect(state.window, &rect);
     int gap = scale(state.window, 12);
-    int buttonHeight = scale(state.window, 28);
+    int buttonHeight = scale(state.window, 23);
     int width = rect.right - rect.left;
     int height = rect.bottom - rect.top;
-    place(state.banner, gap, gap, width - gap * 2, scale(state.window, 24));
-    int buttonsY = gap + scale(state.window, 30);
+    int buttonsY = gap;
     int x = gap;
     auto button = [&](HWND handle, int logicalWidth) {
         int buttonWidth = scale(state.window, logicalWidth);
@@ -631,29 +684,34 @@ void layout(Inspector &state)
     x = contextualX;
     button(state.captureStack, 175);
     int contentY = buttonsY + buttonHeight + gap;
-    if (activeTable(state))
-    {
-        int labelWidth = scale(state.window, 43);
-        int clearWidth = scale(state.window, 70);
-        int fieldHeight = editHeight(state.window);
-        int rowHeight = std::max(buttonHeight, fieldHeight);
-        int captionHeight = fieldHeight - scale(state.window, 6);
-        place(state.filterLabel, gap, contentY + (rowHeight - captionHeight) / 2, labelWidth, captionHeight);
-        place(state.filter, gap + labelWidth, contentY + (rowHeight - fieldHeight) / 2,
-              width - gap * 3 - labelWidth - clearWidth, fieldHeight);
-        place(state.clearFilter, width - gap - clearWidth, contentY + (rowHeight - buttonHeight) / 2,
-              clearWidth, buttonHeight);
-        contentY += rowHeight + gap;
-    }
-    int statusHeight = scale(state.window, 23);
-    place(state.status, gap, height - gap - statusHeight, width - 2 * gap, statusHeight);
-    RECT body{gap, contentY, width - gap, height - 2 * gap - statusHeight};
+    RECT body{gap, contentY, width - gap, height - gap};
+    // The tab frame never moves when changing pages. Search and status belong
+    // inside that frame, like native Threads/Modules/Handles property pages.
     place(state.tabs, body.left, body.top, body.right - body.left, body.bottom - body.top);
-    // TabCtrl_AdjustRect returns the native page frame in tab-client coordinates;
-    // all pages are children of the tab, so no screen-coordinate conversion is needed.
     GetClientRect(state.tabs, &body);
     TabCtrl_AdjustRect(state.tabs, FALSE, &body);
     InflateRect(&body, -scale(state.window, 4), -scale(state.window, 4));
+    if (activeTable(state))
+    {
+        int labelWidth = scale(state.window, 43);
+        int clearWidth = scale(state.window, 60);
+        int fieldHeight = editHeight(state.window);
+        int rowHeight = std::max(buttonHeight, fieldHeight);
+        int captionHeight = fieldHeight - scale(state.window, 6);
+        place(state.filterLabel, body.left, body.top + (rowHeight - captionHeight) / 2, labelWidth,
+              captionHeight);
+        place(state.filter, body.left + labelWidth, body.top + (rowHeight - fieldHeight) / 2,
+              body.right - body.left - labelWidth - clearWidth - scale(state.window, 6), fieldHeight);
+        place(state.clearFilter, body.right - clearWidth, body.top + (rowHeight - buttonHeight) / 2,
+              clearWidth, buttonHeight);
+        body.top += rowHeight + scale(state.window, 6);
+    }
+    if (state.statusVisible)
+    {
+        int statusHeight = editHeight(state.window) - scale(state.window, 4);
+        place(state.status, body.left, body.bottom - statusHeight, body.right - body.left, statusHeight);
+        body.bottom -= statusHeight + scale(state.window, 4);
+    }
     place(state.overview, body.left, body.top, body.right - body.left, body.bottom - body.top);
     place(state.raw, body.left, body.top, body.right - body.left, body.bottom - body.top);
     if (state.stacks)
@@ -709,7 +767,7 @@ void captureStacks(Inspector &state)
     state.loading = true;
     state.pending = Operation::Stacks;
     state.page = StacksPage;
-    TabCtrl_SetCurSel(state.tabs, StacksPage);
+    TabCtrl_SetCurSel(state.tabs, tabFromPage(state, StacksPage));
     showPage(state);
     submit(state.distro, std::move(request), state.mailbox, ++state.requestTag);
 }
@@ -1098,7 +1156,8 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         {
             id = CopySelection;
             HWND tabs = GetDlgItem(inspector, Tabs);
-            int page = tabs ? TabCtrl_GetCurSel(tabs) : 0;
+            auto state = reinterpret_cast<Inspector *>(GetWindowLongPtrW(inspector, GWLP_USERDATA));
+            int page = tabs && state ? pageFromTab(*state, TabCtrl_GetCurSel(tabs)) : 0;
             if (shift && page == 3)
                 id = CopyValue;
             else if (shift && (page == 1 || page == 2))
@@ -1165,14 +1224,65 @@ BOOL CALLBACK installShortcuts(HWND child, LPARAM parent)
     return TRUE;
 }
 
+std::wstring tooltipText(const Inspector &state, int id)
+{
+    switch (id)
+    {
+    case Refresh:
+        return state.page == StacksPage && !state.isService
+                   ? L"Capture another stack trace (Ctrl+R). GDB requires confirmation before attaching."
+                   : L"Refresh (Ctrl+R)";
+    case CopySelection:
+        return L"Copy the selected text or row (Ctrl+C)";
+    case CopyAll:
+        return L"Copy all fields or all visible rows";
+    case Save:
+        return L"Save this view (Ctrl+S)";
+    case OpenLocation:
+        return state.page == 0 ? (state.isService ? L"Open the service unit file location"
+                                                  : L"Open the executable location")
+                               : L"Open the selected location (Enter)";
+    case CopyPath:
+        return state.page == 0 ? L"Copy the command line" : L"Copy the selected path (Ctrl+Shift+C)";
+    case CopyValue:
+        return L"Copy the selected environment value (Ctrl+Shift+C)";
+    case CaptureStack:
+        return L"Capture thread stacks with GDB. The process pauses while GDB is attached.";
+    case ClearFilter:
+        return L"Clear the filter";
+    case Filter:
+        return L"Filter all columns in this page (Ctrl+F)";
+    case Status:
+        return windowText(state.status);
+    }
+    return L"";
+}
+
+void createTooltips(Inspector &state)
+{
+    state.tooltips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                     WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT,
+                                     CW_USEDEFAULT, CW_USEDEFAULT, state.window, nullptr, instance, nullptr);
+    if (!state.tooltips)
+        return;
+    SendMessageW(state.tooltips, TTM_SETMAXTIPWIDTH, 0, scale(state.window, 380));
+    for (HWND child : {state.refresh, state.copy, state.copyAll, state.save, state.open, state.path,
+                       state.value, state.captureStack, state.clearFilter, state.filter, state.status})
+    {
+        if (!child)
+            continue;
+        TTTOOLINFOW tool{sizeof(tool)};
+        tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        tool.hwnd = state.window;
+        tool.uId = reinterpret_cast<UINT_PTR>(child);
+        tool.lpszText = LPSTR_TEXTCALLBACKW;
+        SendMessageW(state.tooltips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+    }
+}
+
 void createControls(Inspector &state)
 {
     HWND window = state.window;
-    std::wstring label = state.isService ? wide(state.service) : cell(state.process, "name");
-    if (!state.isService)
-        label += L"  ·  PID " + cell(state.process, "pid");
-    label += L"  ·  " + state.distro;
-    state.banner = control(window, WC_STATICW, label.c_str(), SS_LEFT | SS_NOPREFIX, Banner);
     state.refresh = control(window, WC_BUTTONW, L"&Refresh", BS_PUSHBUTTON | WS_TABSTOP, Refresh);
     state.copy = control(window, WC_BUTTONW, L"&Copy selection", BS_PUSHBUTTON | WS_TABSTOP, CopySelection);
     state.copyAll = control(window, WC_BUTTONW, L"Copy &all", BS_PUSHBUTTON | WS_TABSTOP, CopyAll);
@@ -1182,22 +1292,23 @@ void createControls(Inspector &state)
     state.value = control(window, WC_BUTTONW, L"Copy &value", BS_PUSHBUTTON | WS_TABSTOP, CopyValue);
     state.captureStack =
         control(window, WC_BUTTONW, L"Capture all &stacks…", BS_PUSHBUTTON | WS_TABSTOP, CaptureStack);
-    if (!state.isService)
-    {
-        state.filterLabel = control(window, WC_STATICW, L"Filter:", SS_LEFT, FilterLabel);
-        state.filter = control(window, WC_EDITW, L"", WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, Filter);
-        SendMessageW(state.filter, EM_SETCUEBANNER, TRUE,
-                     reinterpret_cast<LPARAM>(L"Search all columns in this view (Ctrl+F)"));
-        state.clearFilter = control(window, WC_BUTTONW, L"Clear", BS_PUSHBUTTON | WS_TABSTOP, ClearFilter);
-    }
     state.tabs = control(window, WC_TABCONTROLW, L"Detail categories",
                          WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, Tabs);
     SetWindowLongPtrW(state.tabs, GWL_EXSTYLE,
                       GetWindowLongPtrW(state.tabs, GWL_EXSTYLE) | WS_EX_CONTROLPARENT);
     SetWindowSubclass(state.tabs, tabPageProc, 2, reinterpret_cast<DWORD_PTR>(window));
-    const wchar_t *processNames[] = {L"Overview", L"Open files", L"Modules", L"Environment",
-                                     L"Threads",  L"Network",    L"Stacks",  L"Details"};
-    const wchar_t *serviceNames[] = {L"Overview", L"Details"};
+    if (!state.isService)
+    {
+        state.filterLabel = control(state.tabs, WC_STATICW, L"Filter:", SS_LEFT, FilterLabel);
+        state.filter = control(state.tabs, WC_EDITW, L"", WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, Filter);
+        SendMessageW(state.filter, EM_SETCUEBANNER, TRUE,
+                     reinterpret_cast<LPARAM>(L"Search all columns in this view (Ctrl+F)"));
+        state.clearFilter =
+            control(state.tabs, WC_BUTTONW, L"Clear", BS_PUSHBUTTON | WS_TABSTOP, ClearFilter);
+    }
+    const wchar_t *processNames[] = {L"General", L"Threads", L"Modules", L"Environment",
+                                     L"Handles", L"Network", L"Stacks",  L"Details"};
+    const wchar_t *serviceNames[] = {L"General", L"Details"};
     for (int i = 0; i < (state.isService ? 2 : PageCount); ++i)
     {
         TCITEMW item{};
@@ -1245,9 +1356,11 @@ void createControls(Inspector &state)
         for (size_t i = 0; i < state.tables.size(); ++i)
             SetWindowTextW(state.tables[i].window, labels[i]);
     }
-    state.status = control(window, WC_STATICW, L"", SS_LEFT | SS_NOPREFIX, Status);
+    state.status = control(state.tabs, WC_STATICW, L"", SS_LEFT | SS_NOPREFIX, Status);
     EnumChildWindows(window, installShortcuts, reinterpret_cast<LPARAM>(window));
     WslApplyTheme(window);
+    SetWindowSubclass(window, inspectorColorsProc, 3, 0);
+    createTooltips(state);
     updateInspectorFonts(state);
     showPage(state);
     refresh(state);
@@ -1277,7 +1390,7 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
     case WM_ERASEBKGND: {
         RECT bounds{};
         GetClientRect(window, &bounds);
-        HBRUSH brush = CreateSolidBrush(WslDialogBackground());
+        HBRUSH brush = CreateSolidBrush(inspectorBackground());
         FillRect(reinterpret_cast<HDC>(wParam), &bounds, brush);
         DeleteObject(brush);
         return 1;
@@ -1312,9 +1425,16 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
         return 0;
     case WM_NOTIFY: {
         auto *hdr = reinterpret_cast<NMHDR *>(lParam);
+        if (hdr->hwndFrom == state->tooltips && hdr->code == TTN_GETDISPINFOW)
+        {
+            auto info = reinterpret_cast<NMTTDISPINFOW *>(lParam);
+            state->tooltipText = tooltipText(*state, GetDlgCtrlID(reinterpret_cast<HWND>(hdr->idFrom)));
+            info->lpszText = state->tooltipText.data();
+            return 0;
+        }
         if (hdr->hwndFrom == state->tabs && hdr->code == TCN_SELCHANGE)
         {
-            state->page = TabCtrl_GetCurSel(state->tabs);
+            state->page = pageFromTab(*state, TabCtrl_GetCurSel(state->tabs));
             showPage(*state);
             return 0;
         }
@@ -1343,6 +1463,8 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
+        if (state->tooltips)
+            DestroyWindow(state->tooltips);
         for (auto &table : state->tables)
             if (table.window)
                 table.saveLayout();
