@@ -17,11 +17,19 @@ case "$(uname -m)" in
     *) printf 'Unsupported Linux architecture: %s\n' "$(uname -m)" >&2; exit 1 ;;
 esac
 mkdir -p -- "$build_dir" "$output_dir"
+# Embed the Inspector client in the same deployable observer. Keeping Python in
+# its own source file makes the protocol code readable without a runtime sidecar.
+{
+    printf '%s\n' '#pragma once' 'namespace observer {' \
+        'inline constexpr const char NodeInspectorScript[] = R"WSL_INSPECTOR('
+    cat "$project_dir/helper/node_inspector.py"
+    printf '%s\n' ')WSL_INSPECTOR";' '}'
+} > "$build_dir/node_inspector_script.hpp"
 objects=()
 for module in main procfs network services runtime_stacks; do
     object="$build_dir/$module.o"
     "$compiler" -std=c++17 -pthread -O2 -Wall -Wextra -Wpedantic \
-        -I"$project_dir/vendor" -c "$project_dir/helper/$module.cpp" -o "$object"
+        -I"$project_dir/vendor" -I"$build_dir" -c "$project_dir/helper/$module.cpp" -o "$object"
     objects+=("$object")
 done
 if ! "$compiler" -static -pthread "${objects[@]}" -o "$build_dir/wsl-observer"; then

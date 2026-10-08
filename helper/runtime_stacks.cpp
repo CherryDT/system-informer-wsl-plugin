@@ -1,4 +1,5 @@
 #include "observer.hpp"
+#include "node_inspector_script.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -166,6 +167,39 @@ Json script_stacks(const Json& request) {
     const auto executable = read_link(proc_file(identity.pid, "exe"));
     const auto runtime = runtime_for_executable(executable);
     if (runtime.empty()) return unavailable(runtime, "This executable is not a recognized Node.js, CPython or Java runtime.");
+
+    const auto backend = request.value("backend", "auto");
+    if (backend != "auto" && backend != "inspector" && backend != "llnode")
+        throw std::runtime_error("Unknown JavaScript stack capture backend");
+    if (runtime != "node" && backend != "auto")
+        throw std::runtime_error("Backend selection is only available for Node.js stacks");
+    if (runtime == "node" && backend != "llnode") {
+        if (find_command("python3").empty()) {
+            auto response = unavailable(runtime, "Node Inspector capture requires Python 3 in this distribution. "
+                "On Ubuntu/Debian install it with apt install python3. No extra Python packages are required.");
+            response["choice_required"] = true;
+            response["inspector_unavailable"] = true;
+            return response;
+        }
+        const Json configuration{{"pid", identity.pid}, {"start_ticks", identity.start_ticks},
+            {"enable_inspector", backend == "inspector" && request.value("enable_inspector", false)}};
+        // Ship the small stdlib client inside the observer, so updating the
+        // observer also updates Inspector support. Isolated Python ignores user
+        // startup/site packages; only the fixed embedded source is executed.
+        const auto result = run_command({"python3", "-I", "-S", "-c", NodeInspectorScript, configuration.dump()},
+            20000, 2 * 1024 * 1024);
+        require_identity(identity);
+        if (read_link(proc_file(identity.pid, "exe")) != executable)
+            throw std::runtime_error("The process changed executable during capture; reopen its properties");
+        if (result.timed_out)
+            return {{"runtime", "node"}, {"tool", "Node Inspector"}, {"supported", true}, {"success", false},
+                {"text", ""}, {"message", "Inspector capture timed out. The diagnostic client was stopped; "
+                    "check whether the target is paused or its Inspector remains enabled."}};
+        const auto data = Json::parse(result.output, nullptr, false);
+        if (result.exit_code != 0 || !data.is_object())
+            throw std::runtime_error("The Inspector client could not complete the request: " + result.output);
+        return data;
+    }
 
     std::vector<std::string> arguments;
     std::optional<CommandCredentials> credentials;

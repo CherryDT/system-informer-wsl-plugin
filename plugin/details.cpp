@@ -98,6 +98,8 @@ struct Inspector
     bool connectionsLoaded = false;
     bool stacksLoaded = false;
     bool runtimeStacksLoaded = false;
+    bool nodeChoiceOffered = false;
+    Json runtimeRequest;
     Operation pending = Operation::ProcessDetails;
     uintptr_t requestTag = 0;
     int page = 0;
@@ -135,6 +137,25 @@ const wchar_t *runtimeLabel(const Inspector &state)
     if (state.runtime == "python")
         return L"Python";
     return L"Java";
+}
+
+std::wstring runtimeStackIntro(const Inspector &state)
+{
+    std::wstring intro =
+        std::wstring(L"Press Capture ") + runtimeLabel(state) + L" stacks… to collect a stack trace.\r\n\r\n";
+    if (state.runtime == "java")
+        return intro +
+               L"The JVM may briefly pause threads at a safepoint.\r\nRequires jcmd from a matching JDK.";
+    if (state.runtime == "python")
+        return intro + L"The process briefly pauses during capture.\r\nRequires py-spy in this distribution.";
+    return intro + L"The process briefly pauses during capture.\r\nInspector capture requires Python 3; the "
+                   L"fallback requires LLDB + llnode.";
+}
+
+const wchar_t *nativeStackIntro()
+{
+    return L"Press Capture all stacks… to collect native thread stacks.\r\n\r\n"
+           L"The process pauses while GDB is attached.\r\nRequires GDB in this distribution.";
 }
 
 const wchar_t *runtimeExportName(const Inspector &state)
@@ -770,6 +791,19 @@ void layout(Inspector &state)
             place(table.window, body.left, body.top, body.right - body.left, body.bottom - body.top);
 }
 
+void queueRuntimeCapture(Inspector &state, Json request)
+{
+    // Retain the exact identity for a possible Node backend choice. A later
+    // explicit capture builds a fresh automatic request instead of reusing it.
+    state.runtimeRequest = request;
+    state.loading = true;
+    state.pending = Operation::RuntimeStacks;
+    state.page = RuntimeStacksPage;
+    TabCtrl_SetCurSel(state.tabs, tabFromPage(state, RuntimeStacksPage));
+    showPage(state);
+    submit(state.distro, std::move(request), state.mailbox, ++state.requestTag);
+}
+
 void captureRuntimeStacks(Inspector &state)
 {
     if (state.loading || state.isService || state.runtime.empty())
@@ -787,24 +821,10 @@ void captureRuntimeStacks(Inspector &state)
         }
         request[key] = *value;
     }
-    std::wstring prompt = std::wstring(L"Capture ") + runtimeLabel(state) + L" stacks from PID " +
-                          cell(state.process, "pid") + L" in " + state.distro + L"?\r\n\r\n";
-    prompt +=
-        state.runtime == "java"
-            ? L"The JVM diagnostic tool may briefly pause threads at a safepoint."
-            : L"The diagnostic tool may attach to and briefly pause the process while collecting stacks.";
-    if (MessageBoxW(state.window, prompt.c_str(), L"Capture runtime stacks",
-                    MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK)
-        return;
-
     // The runtime hint only controls presentation. The helper revalidates the
     // executable and process identity before choosing a diagnostic tool.
-    state.loading = true;
-    state.pending = Operation::RuntimeStacks;
-    state.page = RuntimeStacksPage;
-    TabCtrl_SetCurSel(state.tabs, tabFromPage(state, RuntimeStacksPage));
-    showPage(state);
-    submit(state.distro, std::move(request), state.mailbox, ++state.requestTag);
+    state.nodeChoiceOffered = false;
+    queueRuntimeCapture(state, std::move(request));
 }
 
 void captureStacks(Inspector &state)
@@ -824,7 +844,6 @@ void captureStacks(Inspector &state)
         }
         request[key] = *value;
     }
-    std::wstring target = L"all threads";
     if (state.page == 4)
     {
         const Row *thread = state.tables[3].selected();
@@ -838,18 +857,10 @@ void captureStacks(Inspector &state)
                 return;
             }
             request["tid"] = *tid;
-            target = L"thread " + cell(thread->data, "tid");
         }
     }
-    std::wstring prompt =
-        L"Attach GDB as root to PID " + cell(state.process, "pid") + L" in " + state.distro +
-        L" and capture " + target +
-        L"?\r\n\r\nGDB pauses the process while attached. The capture has a 15-second time limit.";
-    // Captures are deliberately never triggered by selecting the tab. Every
-    // attach, including Refresh/Ctrl+R on Stacks, requires this confirmation.
-    if (MessageBoxW(state.window, prompt.c_str(), L"Capture process stacks",
-                    MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK)
-        return;
+    // Selecting a stack tab is passive. Capture buttons and Ctrl+R are the
+    // explicit actions that attach; their impact is described in the pane.
     state.loading = true;
     state.pending = Operation::Stacks;
     state.page = StacksPage;
@@ -1206,6 +1217,69 @@ void loadRuntimeStacks(Inspector &state, const Json &data)
     state.runtimeStacksLoaded = true;
 }
 
+bool chooseNodeBackend(Inspector &state, const Json &data)
+{
+    if (state.nodeChoiceOffered)
+    {
+        // An explicit backend must not open the same chooser again if its
+        // retry fails. Keep diagnostics in the page and preserve any capture.
+        loadRuntimeStacks(state, data);
+        return false;
+    }
+    state.nodeChoiceOffered = true;
+    constexpr int EnableInspector = 1001;
+    constexpr int UseLlnode = 1002;
+    const TASKDIALOG_BUTTON buttons[] = {{EnableInspector, L"Enable Inspector"},
+                                         {UseLlnode, L"Use llnode\nMay not work with every node version"}};
+    TASKDIALOGCONFIG config{sizeof(config)};
+    config.hwndParent = state.window;
+    config.hInstance = instance;
+    config.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    config.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    config.pszWindowTitle = L"Capture JavaScript stacks";
+    const bool unavailable = data.value("inspector_unavailable", false);
+    config.pszMainInstruction = unavailable ? L"Inspector requires Python 3" : L"Node Inspector is disabled";
+    config.pszContent = unavailable ? L"Install Python 3 in this distribution, or use llnode." : nullptr;
+    config.cButtons = unavailable ? 1 : static_cast<UINT>(std::size(buttons));
+    config.pButtons = unavailable ? buttons + 1 : buttons;
+    config.nDefaultButton = IDCANCEL;
+    int selected = IDCANCEL;
+    const HWND owner = state.window;
+    const Inspector *expectedState = &state;
+    HRESULT result = TaskDialogIndirect(&config, &selected, nullptr, nullptr);
+    // The task dialog pumps messages. Host shutdown can destroy this inspector
+    // while it is open; do not touch its state again after that nested teardown.
+    if (!IsWindow(owner) ||
+        reinterpret_cast<Inspector *>(GetWindowLongPtrW(owner, GWLP_USERDATA)) != expectedState)
+        return true;
+    if (FAILED(result) || (selected != EnableInspector && selected != UseLlnode))
+    {
+        state.runtimeStacksNotice =
+            FAILED(result) ? L"Could not open the capture method chooser." : L"Capture canceled.";
+        if (state.runtimeStacksLoaded)
+            state.runtimeStacksNotice += L" The previous capture is still displayed.";
+        else
+        {
+            std::wstring text = state.runtimeStacksNotice + L"\r\n\r\n" + runtimeStackIntro(state);
+            SetWindowTextW(state.runtimeStacks, text.c_str());
+        }
+        return false;
+    }
+    Json request = state.runtimeRequest;
+    if (selected == EnableInspector)
+    {
+        request["backend"] = "inspector";
+        request["enable_inspector"] = true;
+    }
+    else
+    {
+        request["backend"] = "llnode";
+        request.erase("enable_inspector");
+    }
+    queueRuntimeCapture(state, std::move(request));
+    return true;
+}
+
 void loadReply(Inspector &state, const Reply &reply)
 {
     if (reply.tag != state.requestTag)
@@ -1216,6 +1290,20 @@ void loadReply(Inspector &state, const Reply &reply)
     const bool runtimeStacks = completed == Operation::RuntimeStacks;
     auto &notice = operationNotice(state, completed);
     state.loading = false;
+    auto choice = reply.data.find("choice_required");
+    if (runtimeStacks && state.runtime == "node" && reply.error.empty() && choice != reply.data.end() &&
+        choice->is_boolean() && choice->get<bool>())
+    {
+        bool queued = chooseNodeBackend(state, reply.data);
+        if (!queued)
+        {
+            ensureConnections(state);
+            updateActions(state);
+        }
+        // A chosen backend owns a new tag and pending operation. This reply
+        // must not overwrite that state or process its choice request as output.
+        return;
+    }
     if (!reply.error.empty())
     {
         // A failed refresh leaves the last successful snapshot available for
@@ -1368,8 +1456,7 @@ BOOL CALLBACK installShortcuts(HWND child, LPARAM parent)
 
 void createRuntimeStackControl(Inspector &state)
 {
-    std::wstring placeholder =
-        std::wstring(L"No ") + runtimeLabel(state) + L" stack captured. Use Capture stacks to collect one.";
+    std::wstring placeholder = runtimeStackIntro(state);
     state.runtimeStacks = control(state.tabs, WC_EDITW, placeholder.c_str(),
                                   WS_TABSTOP | WS_BORDER | WS_VSCROLL | WS_HSCROLL | WS_CLIPSIBLINGS |
                                       ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
@@ -1449,10 +1536,9 @@ std::wstring tooltipText(const Inspector &state, int id)
     {
     case Refresh:
         if (state.page == RuntimeStacksPage && !state.isService)
-            return L"Capture runtime stacks (Ctrl+R). Attachment requires confirmation.";
-        return state.page == StacksPage && !state.isService
-                   ? L"Capture another stack trace (Ctrl+R). GDB requires confirmation before attaching."
-                   : L"Refresh (Ctrl+R)";
+            return L"Capture runtime stacks (Ctrl+R)";
+        return state.page == StacksPage && !state.isService ? L"Capture native thread stacks (Ctrl+R)"
+                                                            : L"Refresh (Ctrl+R)";
     case CopySelection:
         return L"Copy the selected text or row (Ctrl+C)";
     case CopyAll:
@@ -1566,11 +1652,10 @@ void createControls(Inspector &state)
     SendMessageW(state.raw, EM_SETLIMITTEXT, 16 * 1024 * 1024, 0);
     if (!state.isService)
     {
-        state.stacks =
-            control(state.tabs, WC_EDITW, L"No stack captured. Use Capture all stacks… to attach GDB.",
-                    WS_TABSTOP | WS_BORDER | WS_VSCROLL | WS_HSCROLL | WS_CLIPSIBLINGS | ES_MULTILINE |
-                        ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
-                    StackText);
+        state.stacks = control(state.tabs, WC_EDITW, nativeStackIntro(),
+                               WS_TABSTOP | WS_BORDER | WS_VSCROLL | WS_HSCROLL | WS_CLIPSIBLINGS |
+                                   ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                               StackText);
         SendMessageW(state.stacks, EM_SETLIMITTEXT, 16 * 1024 * 1024, 0);
         if (!state.runtime.empty())
             createRuntimeStackControl(state);

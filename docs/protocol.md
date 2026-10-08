@@ -173,7 +173,7 @@ against a pidfd identity: identity is checked immediately before and after, but
 a narrow PID-reuse race remains. A successful post-check does not guarantee an
 atomic snapshot. Do not describe this operation as passive or pidfd-safe.
 
-GDB runs only from `/usr/bin` or `/bin`, with init files and auto-loading disabled,
+GDB runs only from trusted system locations (`/usr/local/bin`, `/usr/bin`, or `/bin`), with init files and auto-loading disabled,
 index-cache writes disabled, thread-debugging libraries restricted to GDB system
 directories, debuginfod disabled, an empty `DEBUGINFOD_URLS`, a clean environment, and `/` as its
 working directory. No caller-provided GDB commands are accepted. The batch ends
@@ -182,65 +182,115 @@ which releases ptrace ownership. It does not send SIGCONT to the target itself.
 
 ### `script_stacks` (`pid`, `start_ticks`)
 
-Captures runtime-level stacks using tools installed by the distro administrator;
-the observer does not install them. Runtime selection is based on the basename of
-the resolved `/proc/PID/exe`, never the command line or script name:
+Captures runtime-level stacks for a process identified by `pid` and `start_ticks`.
+Runtime selection uses the basename of the resolved `/proc/PID/exe`, never the
+command line or script name. The response's `runtime` is `node`, `python`, or
+`java`; unrecognized executables return an empty value. Shell/npm wrappers,
+PyPy, renamed executables, and embedded runtimes do not automatically match.
+Details are refreshed to add, rename, or remove the matching process inspector
+tab after an `exec()` changes the runtime.
 
-- `node` and `nodejs` select Node.js. The helper uses LLDB with a compatible
-  `llnode.so` plugin from a trusted plugin location. LLDB and llnode must be
-  installed by the user; llnode must be built for that LLDB version and support
-  the target Node/V8 version. Build llnode as a normal user, then have an
-  administrator place the root-owned, non-group/world-writable plugin at
-  `/usr/local/lib/llnode/llnode.so`, `/usr/lib/lldb/plugins/llnode.so`,
-  `/usr/local/lib/node_modules/llnode/llnode.so`, or
-  `/usr/lib/node_modules/llnode/llnode.so`. Never run npm as root. See the
-  [llnode installation instructions](https://github.com/nodejs/llnode#install-instructions).
-- `python`, `python2`, `python3`, and versioned/debug/free-threaded CPython
-  executable names select Python. The helper uses a trusted, root-owned
-  `py-spy` in `/usr/local/bin` or `/usr/bin`. It dumps all Python thread stacks
-  without local variable values. See [py-spy](https://github.com/benfred/py-spy).
-  PyPy is not recognized.
-- `java` selects a JVM. The helper uses `jcmd` beside the target JVM's `java`
-  executable, so it matches that target's JDK. It runs `jcmd PID Thread.print -l`
-  with the JVM's effective UID and GID, even though the observer runs as root.
-  The full matching JDK is needed when a custom JRE does not include `jcmd`.
-  See Oracle's [`jcmd` reference](https://docs.oracle.com/en/java/javase/21/docs/specs/man/jcmd.html).
+For Node.js, the optional `backend` field accepts `auto` (default), `inspector`,
+or `llnode`. `enable_inspector:true` is honored only with `backend:"inspector"`;
+it records the user's explicit choice to activate an Inspector that is not
+already listening. With `auto`, a listener owned by the selected process is
+preferred. The helper verifies the socket inode belongs to that process and
+checks the Inspector endpoint's reported PID before capture. It captures the
+main JavaScript thread only, with up to 256 JavaScript frames; worker threads,
+native frames, and asynchronous promise/task history are not included.
 
-Shell/npm wrappers, PyPy, renamed executables, and embedded runtimes do not
-automatically match. A recognized runtime can still return `supported:false`
-when its required debugger is missing or untrusted. A present debugger that is
-incompatible may instead return `supported:true` and an unsuccessful, partial
-capture. For example,
+When `backend` is `auto` or `inspector`, activation was not requested, and no
+Inspector listener was discovered, Node returns `choice_required:true` so the UI can offer **Enable
+Inspector**, **Use llnode**, or **Cancel**. This is a backend choice, not a
+capture confirmation. If Python 3 is missing, the helper also returns
+`inspector_unavailable:true` with an installation explanation; the UI then
+offers **Use llnode** or **Cancel**, without the Inspector activation choice.
+An explicit `backend:"llnode"` request skips Inspector discovery and capture.
+Enabling Inspector uses SIGUSR1 through a pidfd after
+rechecking the selected Node executable and process identity. Before doing so,
+the helper checks command-line arguments and `NODE_OPTIONS` for recognizable
+non-loopback or unverified bind hosts and declines activation if it finds one.
+Runtime changes to `debugPort` and custom signal handlers cannot be inferred from
+`/proc`; the socket and endpoint ownership checks still have to succeed. If two
+processes both request the default port 9229, the second cannot use that occupied
+port and the helper does not attach to the first process by mistake. Configure
+`--inspect-port=0` to let Node choose an available port for each process.
+
+The helper disconnects its own Inspector WebSocket client after capture. If this
+request enabled the listener, it resumes only its own pause, uses
+`Runtime.evaluate` to request `inspector.close()` when that API is available,
+disconnects, and verifies that the listener has disappeared. A pre-existing
+Inspector is left enabled, and a pause that existed before this connection is
+preserved. Cleanup is best-effort; the response `message` reports if Inspector
+closure could not be confirmed. If another client is detected on the temporary
+listener, it is left enabled. A new connection can still race this check; there
+is no atomic close-if-alone operation, so concurrent debuggers should be avoided. Inspector is
+a code-execution interface; keep listeners on loopback. Loopback limits remote
+exposure, but local programs in the distro can still connect. See Node's
+[Inspector API](https://nodejs.org/api/inspector.html), [Inspector options](https://nodejs.org/api/cli.html#--inspectporthostport),
+and [debugging security guidance](https://nodejs.org/learn/getting-started/debugging#security-implications).
+
+The Inspector client is embedded in `wsl-observer` and runs with the distro's
+system Python 3 using `-I -S`. It uses only Python's standard library: no extra
+Python packages or external script deployment are required. If system Python 3
+is unavailable, the `auto`/`inspector` backend returns `choice_required:true`
+and `inspector_unavailable:true` with an installation message; a protocol caller
+can still request `backend:"llnode"` directly.
+The client allows a 12-second capture phase plus up to 2 seconds for cleanup,
+with a 20-second observer command timeout and a 35-second Windows request
+deadline. Captured text is limited to 512 KiB.
+
+The llnode backend uses LLDB and a compatible `llnode.so` plugin. Build llnode
+for the installed LLDB version as a normal user, then have an administrator place
+the root-owned, non-group/world-writable plugin at `/usr/local/lib/llnode/llnode.so`,
+`/usr/lib/lldb/plugins/llnode.so`, `/usr/local/lib/node_modules/llnode/llnode.so`,
+or `/usr/lib/node_modules/llnode/llnode.so`. Never run npm as root. See the
+[llnode installation instructions](https://github.com/nodejs/llnode#install-instructions).
 LLDB 18 with llnode 4 does not reliably decode JavaScript names for Node.js 22;
-the result may contain partial V8 data and native addresses rather than useful
-JavaScript frames.
+fallback output may contain partial V8 data or native addresses.
 
-The response data contains `runtime`, `supported`, `success`, `text`, and
-`message`. When the capture tool is available it also contains `tool`,
-`timed_out`, and `exit_code`. Those tool and process-result fields are omitted
-when no capture tool can be selected. `supported` means the runtime and required
-tool are available for an attempt; it does not promise complete symbols or a
-successful attach. A completed attempt can have `success:false` while returning
-partial diagnostic text. Missing tools return `supported:false`, `success:false`,
-empty `text`, and an installation or compatibility explanation in `message`.
+Python executables `python`, `python2`, `python3`, and versioned/debug/free-threaded
+CPython names select Python. The helper uses a trusted, root-owned `py-spy` in
+`/usr/local/bin` or `/usr/bin`. It dumps all Python thread stacks without local
+variable values. PyPy is not recognized. See [py-spy](https://github.com/benfred/py-spy).
+
+`java` selects a JVM. The helper uses `jcmd` beside the target JVM's `java`, so
+the tool matches that JDK. It executes `jcmd PID Thread.print -l` with the target
+process's effective UID and GID, even though the observer runs as root. Traditional
+thread dumps include locks but not every unmounted virtual thread. The full
+matching JDK is needed if a custom JRE does not include `jcmd`. See Oracle's
+[`jcmd` reference](https://docs.oracle.com/en/java/javase/21/docs/specs/man/jcmd.html).
+
+For Python, Java, native GDB, and Node captures using an existing Inspector, the
+UI performs the requested capture without an extra confirmation dialog. Capture
+buttons and Ctrl+R are explicit actions; stack tabs themselves are passive. A
+Java capture can pause threads at a JVM safepoint. Native GDB, py-spy, and llnode
+can briefly pause the target. Tools and runtime versions must be installed and
+compatible; the plugin does not install them. Ptrace restrictions, disabled JVM
+attachment, or missing debugging metadata can limit or prevent a capture.
+
+The operation's common response data includes `runtime`, `supported`, `success`,
+`text`, and `message`. `tool`, `timed_out`, `exit_code`, `choice_required`, and
+`inspector_unavailable` are conditional on the selected backend and outcome.
+`supported:false` means the requested/default backend cannot run; `choice_required`
+may still offer another backend. A present but incompatible debugger can instead
+return `supported:true`, `success:false`, and partial diagnostics. Node cleanup
+status is currently included in `message` rather than a separate metadata
+object. A tool timeout or output limit can leave a partial capture; the UI
+preserves any earlier successful capture and shows the latest warning.
 
 ```json
 {"id":4,"op":"script_stacks","pid":123,"start_ticks":4567}
-{"id":4,"ok":true,"data":{"runtime":"python","tool":"py-spy","supported":true,"success":true,"timed_out":false,"exit_code":0,"message":"Captured Python thread stacks. Local variable values are not collected.","text":"Thread 123: ..."}}
+{"id":4,"ok":true,"data":{"runtime":"node","tool":"Node Inspector","supported":true,"success":false,"choice_required":true,"message":"No Inspector listener owned by this Node process was found. Choose whether to enable Inspector for this capture or use llnode instead.","text":""}}
+{"id":5,"op":"script_stacks","pid":123,"start_ticks":4567}
+{"id":5,"ok":true,"data":{"runtime":"node","supported":false,"success":false,"choice_required":true,"inspector_unavailable":true,"message":"Node Inspector capture requires Python 3 in this distribution.","text":""}}
+{"id":6,"op":"script_stacks","pid":123,"start_ticks":4567,"backend":"inspector","enable_inspector":true}
+{"id":6,"ok":true,"data":{"runtime":"node","tool":"Node Inspector","supported":true,"success":true,"choice_required":false,"message":"Captured the main JavaScript thread through Node Inspector. The Inspector listener enabled for this capture was closed.","text":"Node Inspector: main JavaScript thread\n\n#0 main at app.js:10:1"}}
 ```
 
-Captures are explicit because debugger attachment may pause the target briefly;
-JVM attachment may request a safepoint. There is no automatic Node inspector,
-runtime signal, or periodic capture. The helper checks PID/start-time identity
-and the executable immediately before and after the command, but debugger tools
-attach by numeric PID, leaving a narrow PID-reuse race during attachment. Each
-capture has a 15-second deadline and a 512 KiB output limit. Node.js capture is
-limited to 256 OS threads and 64 frames per thread, and does not provide
-asynchronous promise/task history. Python captures all Python threads but no
-locals. Java `Thread.print -l` includes locks, but traditional thread dumps do
-not show every unmounted virtual thread. Ptrace restrictions, disabled JVM
-attachment, missing symbols, or runtime/tool version mismatches can make a
-capture incomplete or unavailable.
+Debugger tools attach by numeric PID. The helper checks PID/start-time identity
+and the executable before and after capture, but this cannot eliminate the narrow
+PID-reuse race during attachment.
 
 ### `services`
 
