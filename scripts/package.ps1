@@ -21,7 +21,10 @@ function Copy-PackageFile([string] $Source, [string] $Relative) {
 try {
     foreach ($File in @('WslTools.dll', 'WslTools.pdb', 'wsl-observer')) { Copy-PackageFile "$Dist/$File" $File }
     foreach ($File in @('README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) { Copy-PackageFile "$Root/$File" $File }
-    Copy-PackageFile "$Root/scripts/install.ps1" 'install.ps1'
+    foreach ($File in @('install.ps1', 'uninstall.ps1', 'setup.ps1', 'setup-common.ps1',
+                        'setup-files.ps1', 'setup.cmd', 'uninstall.cmd')) {
+        Copy-PackageFile "$Root/scripts/$File" $File
+    }
     Copy-PackageFile "$Root/vendor/json.LICENSE.MIT" 'licenses/nlohmann-json.LICENSE.MIT'
     Copy-PackageFile "$Root/vendor/json.LICENSE.MIT" 'vendor/json.LICENSE.MIT'
     Copy-PackageFile "$Root/.deps/sdk/LICENSE.txt" 'licenses/SystemInformer.LICENSE.txt'
