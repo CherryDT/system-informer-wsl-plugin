@@ -1,6 +1,7 @@
 #include "controller.hpp"
 #include "settings.hpp"
 #include "host_bridge.h"
+#include "graphs.hpp"
 #include "view_state.hpp"
 #include <algorithm>
 #include <windowsx.h>
@@ -128,68 +129,6 @@ void switchPage(View &v)
     render(v);
     refresh(v);
 }
-LRESULT CALLBACK graphProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
-{
-    if (message != WM_PAINT)
-        return DefWindowProcW(window, message, wparam, lparam);
-    auto v = reinterpret_cast<View *>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    PAINTSTRUCT ps{};
-    HDC dc = BeginPaint(window, &ps);
-    RECT r{};
-    GetClientRect(window, &r);
-    const bool dark = WslIsDarkTheme() != FALSE;
-    HBRUSH background = CreateSolidBrush(dark ? RGB(40, 40, 40) : GetSysColor(COLOR_WINDOW));
-    FillRect(dc, &r, background);
-    DeleteObject(background);
-    HPEN grid = CreatePen(PS_SOLID, 1, dark ? RGB(60, 60, 60) : GetSysColor(COLOR_3DFACE));
-    auto old = SelectObject(dc, grid);
-    for (int i = 1; i < 4; ++i)
-    {
-        MoveToEx(dc, 0, r.bottom * i / 4, nullptr);
-        LineTo(dc, r.right, r.bottom * i / 4);
-    }
-    SelectObject(dc, old);
-    DeleteObject(grid);
-    const bool memory = v && window == v->memoryGraph;
-    static const std::deque<double> emptyHistory;
-    const auto &samples = !v ? emptyHistory : memory ? v->memoryHistory : v->history;
-    if (v && samples.size() > 1)
-    {
-        HPEN line = CreatePen(PS_SOLID, 2, (memory ? RGB(150, 90, 185) : RGB(35, 155, 195)));
-        old = SelectObject(dc, line);
-        for (size_t i = 0; i < samples.size(); ++i)
-        {
-            int x = (static_cast<int>(i) + 120 - static_cast<int>(samples.size())) * (r.right - 2) / 119;
-            int y =
-                r.bottom - 2 - static_cast<int>(std::clamp(samples[i], 0.0, 100.0) * (r.bottom - 4) / 100.0);
-            if (i)
-                LineTo(dc, x, y);
-            else
-                MoveToEx(dc, x, y, nullptr);
-        }
-        SelectObject(dc, old);
-        DeleteObject(line);
-    }
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, dark ? RGB(190, 190, 190) : GetSysColor(COLOR_GRAYTEXT));
-    auto oldFont = SelectObject(dc, font);
-    RECT label = r;
-    InflateRect(&label, -scale(window, 5), -scale(window, 3));
-    std::wstring caption = memory ? L"WSL VM memory used" : L"Distro CPU";
-    if (!samples.empty())
-        caption += L"  " + number(samples.back()) + L"%";
-    DrawTextW(dc, caption.c_str(), -1, &label, DT_LEFT | DT_TOP | DT_SINGLELINE);
-    HPEN border = CreatePen(PS_SOLID, 1, dark ? RGB(100, 100, 100) : GetSysColor(COLOR_3DSHADOW));
-    auto oldPen = SelectObject(dc, border);
-    auto oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    Rectangle(dc, r.left, r.top, r.right, r.bottom);
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen);
-    DeleteObject(border);
-    SelectObject(dc, oldFont);
-    EndPaint(window, &ps);
-    return 0;
-}
 void manualRefresh(View &v)
 {
     if (v.pending)
@@ -273,10 +212,8 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         v->distro =
             control(window, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, DistroCombo);
         v->settings = control(window, L"BUTTON", L"Settings...", WS_TABSTOP, SettingsButton);
-        v->graph = control(window, L"WslTools.Graph", L"CPU history", 0, 0);
-        SetWindowLongPtrW(v->graph, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(v));
-        v->memoryGraph = control(window, L"WslTools.Graph", L"VM memory history", 0, 0);
-        SetWindowLongPtrW(v->memoryGraph, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(v));
+        v->graph = createHistoryGraph(window, *v, false);
+        v->memoryGraph = createHistoryGraph(window, *v, true);
         v->tabs = control(window, WC_TABCONTROLW, L"Views", WS_TABSTOP, ViewTabs);
         for (auto label : {L"Processes", L"Services", L"Network"})
         {
@@ -339,9 +276,9 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                             L"Monitoring starts when this tab is selected. Stopped distros are not "
                             L"started intentionally.",
                             SS_LEFT, 0);
-        for (HWND child : {v->distro, v->settings, v->tabs, v->search, v->listeners,
-                           v->tree, v->processes.window, v->connections.window, v->services.window,
-                           v->exportButton, v->installButton})
+        for (HWND child :
+             {v->distro, v->settings, v->tabs, v->search, v->listeners, v->tree, v->processes.window,
+              v->connections.window, v->services.window, v->exportButton, v->installButton})
             SetWindowSubclass(child, childKeys, 1, reinterpret_cast<DWORD_PTR>(v));
         v->tooltips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
                                       WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -518,7 +455,8 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                 return 0;
             }
             v->failed = true;
-            status(*v, L"Disconnected: " + wide(reply->error) + L"  ·  Use View > Refresh (F5) to reconnect.");
+            status(*v,
+                   L"Disconnected: " + wide(reply->error) + L"  ·  Use View > Refresh (F5) to reconnect.");
             return 0;
         }
         try
@@ -550,7 +488,8 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                     v->selectedDistro.clear();
                     layout(*v);
                     v->failed = true;
-                    status(*v, L"No running WSL2 distributions. Start a distro, then use View > Refresh (F5).");
+                    status(*v,
+                           L"No running WSL2 distributions. Start a distro, then use View > Refresh (F5).");
 
                     updateButtons(*v);
                     return 0;
@@ -677,12 +616,6 @@ extern "C" HWND WslCreateView(HWND parent, HINSTANCE dll)
         font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES};
     InitCommonControlsEx(&controls);
-    WNDCLASSW graph{};
-    graph.hInstance = instance;
-    graph.lpfnWndProc = graphProc;
-    graph.lpszClassName = L"WslTools.Graph";
-    graph.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    RegisterClassW(&graph);
     WNDCLASSW cls{};
     cls.hInstance = instance;
     cls.lpfnWndProc = viewProc;
@@ -708,6 +641,9 @@ extern "C" void WslSetActive(BOOL active)
         v.paused = !WslHostRefreshAutomatically();
         v.forceRefresh = !v.snapshot.is_object();
         v.previousTime = 0;
+        render(v);
+        if (v.paused && !v.forceRefresh)
+            status(v, L"Automatic refresh is off. Use View > Refresh (F5) to update.");
         refresh(v);
     }
     else
@@ -751,7 +687,8 @@ extern "C" void WslHostRefreshChanged(BOOL automatic)
 {
     using namespace wsl;
     using namespace wsl::ui;
-    if (!mainView) return;
+    if (!mainView)
+        return;
     auto &v = *mainView;
     v.paused = !automatic;
     if (v.paused)
@@ -772,5 +709,6 @@ extern "C" void WslHostRefreshChanged(BOOL automatic)
 extern "C" void WslHostRefresh(void)
 {
     using namespace wsl::ui;
-    if (mainView && mainView->active) manualRefresh(*mainView);
+    if (mainView && mainView->active)
+        manualRefresh(*mainView);
 }

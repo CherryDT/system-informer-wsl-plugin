@@ -50,18 +50,28 @@ struct ProcessSample
 {
     uint64_t ticks = 0, read = 0, written = 0;
 };
+struct GraphSample
+{
+    FILETIME timestamp{};
+    double cpu = 0, topCpu = 0, interval = 0;
+    unsigned cpus = 1;
+    uint64_t memoryTotal = 0, memoryAvailable = 0, largestRss = 0;
+    size_t processCount = 0;
+    int topPid = 0, largestRssPid = 0;
+    std::wstring topName, largestRssName;
+};
 struct View
 {
-    HWND window{}, distro{}, settings{}, search{}, tabs{}, listeners{}, tree{}, exportButton{}, status{}, graph{}, memoryGraph{}, installNotice{}, installButton{},
-        tooltips{};
+    HWND window{}, distro{}, settings{}, search{}, tabs{}, listeners{}, tree{}, exportButton{}, status{},
+        graph{}, memoryGraph{}, installNotice{}, installButton{}, tooltips{};
     Table processes, connections, services;
     std::shared_ptr<Mailbox> mailbox = std::make_shared<Mailbox>();
     Json snapshot, sockets, units;
     // Only the current process identities are retained between samples.
     std::map<std::string, ProcessSample> previous;
     std::map<std::string, double> cpu, readRate, writeRate;
-    std::deque<double> history;
-    std::deque<double> memoryHistory;
+    std::deque<GraphSample> graphSamples;
+    uint64_t graphSequence = 0;
     uint64_t previousTime = 0;
     std::string bootId;
     std::wstring selectedDistro;

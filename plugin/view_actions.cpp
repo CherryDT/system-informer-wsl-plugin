@@ -212,8 +212,8 @@ void menu(View &v, POINT point)
     }
     if (!v.table().selectedActionable())
         for (int id : {Inspect, OpenExecutable, Terminate, Kill, Suspend, Resume, Hangup, WindowChanged,
-                       User1, User2, StartService, StopService, RestartService, ReloadService,
-                       EnableService, DisableService, GoToProcess})
+                       User1, User2, StartService, StopService, RestartService, ReloadService, EnableService,
+                       DisableService, GoToProcess})
             EnableMenuItem(popup, id, MF_BYCOMMAND | MF_GRAYED);
     int chosen =
         TrackPopupMenu(popup, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, v.window, nullptr);
