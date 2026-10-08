@@ -1,0 +1,8 @@
+/.deps/
+/build/
+/dist/
+*.user
+*.pdb
+*.obj
+*.ilk
+.vs/
