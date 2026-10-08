@@ -208,6 +208,24 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
         table->trackHover({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
     if (message == WM_MOUSELEAVE)
         table->clearHover();
+    if (message == WM_CONTEXTMENU)
+    {
+        const HWND header = ListView_GetHeader(window);
+        POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        RECT bounds{};
+        GetWindowRect(header, &bounds);
+        const bool keyboard = point.x == -1 && point.y == -1;
+        if (reinterpret_cast<HWND>(wparam) == header ||
+            (!keyboard && PtInRect(&bounds, point)))
+        {
+            if (keyboard)
+                point = {bounds.left + scale(window, 12), (bounds.top + bounds.bottom) / 2};
+            // Header controls also send NM_RCLICK. Handle only the context-menu
+            // message so one right-click cannot open both column and row menus.
+            table->showHeaderMenu(point);
+            return 0;
+        }
+    }
     if (message == WM_NOTIFY)
     {
         auto header = reinterpret_cast<NMHDR *>(lparam);
@@ -216,11 +234,7 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
             if (header->code == NM_CUSTOMDRAW)
                 return table->drawHeader(reinterpret_cast<NMCUSTOMDRAW *>(lparam));
             if (header->code == NM_RCLICK)
-            {
-                const DWORD position = GetMessagePos();
-                table->showHeaderMenu({GET_X_LPARAM(position), GET_Y_LPARAM(position)});
-                return 0;
-            }
+                return 0; // WM_CONTEXTMENU owns the header popup.
             if ((header->code == HDN_BEGINTRACKW || header->code == HDN_BEGINTRACKA) &&
                 !table->isColumnVisible(reinterpret_cast<NMHEADERW *>(lparam)->iItem))
                 return TRUE;
