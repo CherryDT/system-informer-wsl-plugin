@@ -53,6 +53,7 @@ Json script_stacks(const Json& request);
 std::string trusted_command_path(const std::string& path, uint32_t owner = 0);
 std::string find_command(const std::string& name);
 Json connections(const Json& request);
+Json find_handles(const Json& request);
 CommandResult run_command(const std::vector<std::string>& arguments, int timeout_ms = 5000,
     size_t output_limit = 2 * 1024 * 1024,
     std::optional<CommandCredentials> credentials = std::nullopt,

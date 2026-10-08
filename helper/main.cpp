@@ -25,6 +25,7 @@ observer::Json dispatch(const observer::Json& request) {
     const auto operation = request.at("op").get<std::string>();
     if (operation == "hello") return observer::hello();
     if (operation == "snapshot") return observer::snapshot(request);
+    if (operation == "find_handles") return observer::find_handles(request);
     if (operation == "details") return observer::process_details(request);
     if (operation == "connections") return observer::connections(request);
     if (operation == "signal") return observer::send_signal(request);
