@@ -319,8 +319,10 @@ std::vector<std::wstring> registeredWsl2Distros() {
         const LSTATUS next = RegEnumKeyExW(root, index, keyName, &keyLength, nullptr, nullptr, nullptr, nullptr);
         if (next == ERROR_NO_MORE_ITEMS) break;
         if (next != ERROR_SUCCESS) throw winError("Enumerate WSL registration", next);
-        DWORD version = 0, versionBytes = sizeof(version);
-        if (RegGetValueW(root, keyName, L"Version", RRF_RT_REG_DWORD, nullptr, &version, &versionBytes) != ERROR_SUCCESS || version != 2)
+        // Version describes the registration/filesystem schema, not WSL1 vs
+        // WSL2. Microsoft's LXSS_DISTRO_FLAGS_VM_MODE selects the WSL2 VM.
+        DWORD flags = 0, flagsBytes = sizeof(flags);
+        if (RegGetValueW(root, keyName, L"Flags", RRF_RT_REG_DWORD, nullptr, &flags, &flagsBytes) != ERROR_SUCCESS || !(flags & 0x8))
             continue;
         DWORD nameBytes = 0;
         if (RegGetValueW(root, keyName, L"DistributionName", RRF_RT_REG_SZ, nullptr, nullptr, &nameBytes) != ERROR_SUCCESS)
