@@ -138,7 +138,17 @@ void drainReplies(HWND window)
 {
     MSG message{};
     while (PeekMessageW(&message, window, ReplyMessage, ReplyMessage, PM_REMOVE))
+    {
+        // WM_QUIT bypasses PeekMessage's filters. The host posts it while
+        // destroying its main window, before our child view is torn down.
+        // Preserve it so draining replies cannot keep a windowless host alive.
+        if (message.message == WM_QUIT)
+        {
+            PostQuitMessage(static_cast<int>(message.wParam));
+            break;
+        }
         delete reinterpret_cast<Reply *>(message.lParam);
+    }
 }
 
 namespace
