@@ -190,6 +190,20 @@ namespace
 {
 constexpr UINT SaveTableLayout = WM_APP + 82;
 constexpr UINT_PTR HighlightTimer = 0x57534c;
+LRESULT CALLBACK tableHeaderProc(HWND header, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR id,
+                                 DWORD_PTR context)
+{
+    auto table = reinterpret_cast<Table *>(context);
+    // Like TreeNew, track the header itself. Common controls do not reliably
+    // supply CDIS_HOT once its header painting is replaced with custom drawing.
+    if (message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)
+        table->trackHeaderHover({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
+    else if (message == WM_MOUSELEAVE || message == WM_CANCELMODE)
+        table->clearHeaderHover();
+    else if (message == WM_NCDESTROY)
+        RemoveWindowSubclass(header, tableHeaderProc, id);
+    return DefSubclassProc(header, message, wparam, lparam);
+}
 LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR id,
                                  DWORD_PTR context)
 {
@@ -215,8 +229,7 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
         RECT bounds{};
         GetWindowRect(header, &bounds);
         const bool keyboard = point.x == -1 && point.y == -1;
-        if (reinterpret_cast<HWND>(wparam) == header ||
-            (!keyboard && PtInRect(&bounds, point)))
+        if (reinterpret_cast<HWND>(wparam) == header || (!keyboard && PtInRect(&bounds, point)))
         {
             if (keyboard)
                 point = {bounds.left + scale(window, 12), (bounds.top + bounds.bottom) / 2};
@@ -273,7 +286,17 @@ void Table::create(HWND parent, int id, std::vector<Column> definitions, int def
                      WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS | LVS_SINGLESEL, id);
     SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(WslGetHostFont()), TRUE);
     ListView_SetExtendedListViewStyle(window, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER |
-                                                  LVS_EX_HEADERDRAGDROP | LVS_EX_LABELTIP);
+                                                  LVS_EX_HEADERDRAGDROP | LVS_EX_LABELTIP | LVS_EX_INFOTIP);
+    if (HWND tooltip = ListView_GetToolTips(window))
+    {
+        // Match the native grids: ordinary tooltip font, generous reading time,
+        // and a wrapped content tip rather than an unfolding cell label.
+        SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, scale(window, 550));
+        SendMessageW(tooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, MAXSHORT);
+        if (WslHostIntegerSetting(L"EnableInstantTooltips"))
+            SendMessageW(tooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 0);
+        SetWindowLongPtrW(tooltip, GWL_STYLE, GetWindowLongPtrW(tooltip, GWL_STYLE) | TTS_NOPREFIX);
+    }
     std::vector<int> order(columns.size());
     std::vector<bool> seen(columns.size(), false);
     bool validOrder = true;
@@ -311,6 +334,7 @@ void Table::create(HWND parent, int id, std::vector<Column> definitions, int def
         Header_SetItem(ListView_GetHeader(window), sortColumn, &header);
     }
     SetWindowSubclass(window, tableLayoutProc, 1, reinterpret_cast<DWORD_PTR>(this));
+    SetWindowSubclass(ListView_GetHeader(window), tableHeaderProc, 1, reinterpret_cast<DWORD_PTR>(this));
     WslApplyTheme(window);
 }
 
@@ -616,7 +640,12 @@ void Table::selectKey(const std::string &key)
 }
 void Table::order()
 {
-    if (ancestryOrder || sortColumn < 0 || static_cast<size_t>(sortColumn) >= columns.size())
+    if (!ancestryOrder)
+        sortRows(rows);
+}
+void Table::sortRows(std::vector<Row> &items) const
+{
+    if (sortColumn < 0 || static_cast<size_t>(sortColumn) >= columns.size())
         return;
     const auto column = static_cast<size_t>(sortColumn);
     wchar_t decimal[16]{}, separator[16]{};
@@ -631,13 +660,15 @@ void Table::order()
                 value.replace(position, wcslen(decimal), L".");
         return wcstod(value.c_str(), nullptr);
     };
-    std::stable_sort(rows.begin(), rows.end(), [&](const Row &a, const Row &b) {
+    std::stable_sort(items.begin(), items.end(), [&](const Row &a, const Row &b) {
         if (column >= a.cells.size() || column >= b.cells.size())
             return false;
         int comparison;
         if (columns[column].numeric)
         {
-            const double av = numericValue(a.cells[column]), bv = numericValue(b.cells[column]);
+            const auto an = a.numeric.find(column), bn = b.numeric.find(column);
+            const double av = an != a.numeric.end() ? an->second : numericValue(a.cells[column]);
+            const double bv = bn != b.numeric.end() ? bn->second : numericValue(b.cells[column]);
             comparison = av < bv ? -1 : av > bv ? 1 : 0;
         }
         else
@@ -779,11 +810,12 @@ void Table::present()
     if (previous.size() > rows.size())
         InvalidateRect(window, nullptr, FALSE);
 }
-void Table::setAncestryOrder(bool enabled)
+void Table::setAncestryOrder(bool enabled, bool showSort)
 {
-    if (ancestryOrder == enabled)
+    if (ancestryOrder == enabled && ancestrySortIndicator == showSort)
         return;
     ancestryOrder = enabled;
+    ancestrySortIndicator = showSort;
     HWND header = ListView_GetHeader(window);
     for (size_t i = 0; i < columns.size(); ++i)
     {
@@ -791,7 +823,7 @@ void Table::setAncestryOrder(bool enabled)
         item.mask = HDI_FORMAT;
         Header_GetItem(header, static_cast<int>(i), &item);
         item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
-        if (!enabled && static_cast<int>(i) == sortColumn)
+        if ((!enabled || showSort) && static_cast<int>(i) == sortColumn)
             item.fmt |= descending ? HDF_SORTDOWN : HDF_SORTUP;
         Header_SetItem(header, static_cast<int>(i), &item);
     }
@@ -830,6 +862,28 @@ bool Table::notify(NMHDR *hdr)
         size_t row = static_cast<size_t>(info->item.iItem), col = static_cast<size_t>(info->item.iSubItem);
         if ((info->item.mask & LVIF_TEXT) && row < rows.size() && col < rows[row].cells.size())
             info->item.pszText = rows[row].cells[col].data();
+        return true;
+    }
+    if (hdr->code == LVN_GETINFOTIPW && infoTip)
+    {
+        auto tip = reinterpret_cast<NMLVGETINFOTIPW *>(hdr);
+        if (tip->iSubItem != 0 || tip->iItem < 0 || static_cast<size_t>(tip->iItem) >= rows.size())
+            return false;
+        if (tip->pszText && tip->cchTextMax > 0)
+            tip->pszText[0] = L'\0';
+        if (tip->pszText && tip->cchTextMax > 0 && WslHostIntegerSetting(L"EnableTooltipSupport"))
+        {
+            auto content = infoTip(rows[tip->iItem]);
+            const auto capacity = static_cast<size_t>(tip->cchTextMax - 1);
+            if (content.size() > capacity)
+            {
+                content.resize(capacity);
+                if (capacity >= 3)
+                    content.replace(capacity - 3, 3, L"...");
+            }
+            std::copy(content.begin(), content.end(), tip->pszText);
+            tip->pszText[content.size()] = L'\0';
+        }
         return true;
     }
     if (hdr->code == LVN_COLUMNCLICK)
@@ -874,6 +928,7 @@ LRESULT Table::customDraw(NMLVCUSTOMDRAW *draw) const
         apply(item.value("is_suspended", false), L"ColorSuspended");
         apply(item.value("is_partially_suspended", false), L"ColorPartiallySuspended");
         apply(item.value("no_tty", false), L"ColorBackgroundProcesses");
+        apply(item.value("name", std::string{}) == "wsl-observer", L"ColorHandleFiltered");
         apply(item.value("sudo_root", false), L"ColorElevatedProcesses");
         apply(readSetting(L"Detect32BitProcesses", 0) != 0 && item.value("is_32bit", false),
               L"ColorWow64Processes");
@@ -1033,6 +1088,40 @@ void Table::clearHover()
     if (old >= 0)
         ListView_RedrawItems(window, old, old);
 }
+void Table::trackHeaderHover(POINT point)
+{
+    HWND header = ListView_GetHeader(window);
+    RECT client{};
+    GetClientRect(header, &client);
+    HDHITTESTINFO hit{};
+    hit.pt = point;
+    const int next =
+        PtInRect(&client, point)
+            ? static_cast<int>(SendMessageW(header, HDM_HITTEST, 0, reinterpret_cast<LPARAM>(&hit)))
+            : -1;
+    if (next != hotHeaderColumn)
+    {
+        const int old = hotHeaderColumn;
+        hotHeaderColumn = next;
+        for (const int column : {old, next})
+        {
+            RECT bounds{};
+            if (column >= 0 && Header_GetItemRect(header, column, &bounds))
+                InvalidateRect(header, &bounds, FALSE);
+        }
+    }
+    TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, header, 0};
+    TrackMouseEvent(&tracking);
+}
+void Table::clearHeaderHover()
+{
+    const int old = hotHeaderColumn;
+    hotHeaderColumn = -1;
+    RECT bounds{};
+    HWND header = ListView_GetHeader(window);
+    if (old >= 0 && Header_GetItemRect(header, old, &bounds))
+        InvalidateRect(header, &bounds, FALSE);
+}
 LRESULT Table::drawHeader(NMCUSTOMDRAW *draw) const
 {
     if (draw->dwDrawStage == CDDS_PREPAINT)
@@ -1049,9 +1138,9 @@ LRESULT Table::drawHeader(NMCUSTOMDRAW *draw) const
     }
     else if (theme)
         DrawThemeBackground(theme, draw->hdc, HP_HEADERITEM,
-                            (draw->uItemState & CDIS_SELECTED) ? HIS_PRESSED
-                            : (draw->uItemState & CDIS_HOT)    ? HIS_HOT
-                                                               : HIS_NORMAL,
+                            (draw->uItemState & CDIS_SELECTED)                             ? HIS_PRESSED
+                            : (column == hotHeaderColumn || (draw->uItemState & CDIS_HOT)) ? HIS_HOT
+                                                                                           : HIS_NORMAL,
                             &draw->rc, nullptr);
     else
         FillRect(draw->hdc, &draw->rc, GetSysColorBrush(COLOR_WINDOW));
@@ -1060,8 +1149,7 @@ LRESULT Table::drawHeader(NMCUSTOMDRAW *draw) const
     textBounds.right -= scale(window, 6);
     SelectObject(draw->hdc, reinterpret_cast<HFONT>(SendMessageW(window, WM_GETFONT, 0, 0)));
     SetBkMode(draw->hdc, TRANSPARENT);
-    // This is TreeNew's header text color, not COLOR_WINDOWTEXT.
-    SetTextColor(draw->hdc, WslIsDarkTheme() ? RGB(143, 143, 143) : RGB(97, 116, 139));
+    SetTextColor(draw->hdc, WslIsDarkTheme() ? WslDialogText() : GetSysColor(COLOR_WINDOWTEXT));
     DrawTextW(draw->hdc, columns[column].title.c_str(), -1, &textBounds,
               DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX |
                   (columns[column].numeric ? DT_RIGHT : DT_LEFT));

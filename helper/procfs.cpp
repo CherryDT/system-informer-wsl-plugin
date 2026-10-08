@@ -381,18 +381,39 @@ Json process_json(const ProcessStat& stat, const std::map<uid_t, std::string>& u
         result["read_chars"] = field_value(io, "rchar:");
         result["write_chars"] = field_value(io, "wchar:");
     }
-    if (fields.wants({"cgroup", "is_service"})) {
+    if (fields.wants({"cgroup", "is_service", "service_unit", "service_scope"})) {
         const auto cgroup = read_text(proc_path(stat.pid, "cgroup"), 16384);
         result["cgroup"] = cgroup;
-        // Includes user services as well as system.slice services. Require an
-        // actual path component suffix, not '.service' somewhere in a filename.
-        bool service = false;
-        size_t at = 0;
-        while ((at = cgroup.find(".service", at)) != std::string::npos) {
-            at += 8;
-            if (at == cgroup.size() || cgroup[at] == '/' || cgroup[at] == '\n') { service = true; break; }
+        // Use the innermost service component. A user service can be nested
+        // below user@UID.service; reporting only that manager loses its identity.
+        std::string unit, scope;
+        size_t deepest = 0;
+        std::istringstream lines(cgroup);
+        std::string line;
+        while (std::getline(lines, line)) {
+            const auto controller = line.find(':');
+            const auto path_begin = controller == std::string::npos ? std::string::npos : line.find(':', controller + 1);
+            if (path_begin == std::string::npos) continue;
+            std::istringstream components(line.substr(path_begin + 1));
+            std::string component;
+            bool within_user_manager = false;
+            size_t depth = 0;
+            while (std::getline(components, component, '/')) {
+                ++depth;
+                if (component.size() < 8 || component.compare(component.size() - 8, 8, ".service") != 0)
+                    continue;
+                if (depth >= deepest) {
+                    deepest = depth;
+                    unit = component;
+                    scope = within_user_manager ? "user" : "system";
+                }
+                if (component.rfind("user@", 0) == 0)
+                    within_user_manager = true;
+            }
         }
-        result["is_service"] = service;
+        result["is_service"] = !unit.empty();
+        result["service_unit"] = unit;
+        result["service_scope"] = scope;
     }
     if (fields.wants({"exe", "runtime"})) {
         const auto executable = read_link(proc_path(stat.pid, "exe"));

@@ -13,6 +13,7 @@
 #include <commctrl.h>
 #include <functional>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <shellapi.h>
 #include <string>
@@ -79,6 +80,8 @@ struct Row
     // Removed rows remain copyable until the host highlighting period expires.
     bool removed = false;
     ULONGLONG highlightedSince = 0;
+    // Sorting must not depend on rounding, hidden zeroes, or displayed units.
+    std::map<size_t, double> numeric;
 };
 class Table
 {
@@ -96,6 +99,8 @@ class Table
         Environment
     };
     Kind kind = Kind::Generic;
+    // Supplied by the main view; details grids retain their ordinary label tips.
+    std::function<std::wstring(const Row &)> infoTip;
     HWND window = nullptr;
     std::vector<Row> rows;
     std::vector<Column> columns;
@@ -110,9 +115,11 @@ class Table
     void showHeaderMenu(POINT point);
     void trackHover(POINT point);
     void clearHover();
+    void trackHeaderHover(POINT point);
+    void clearHeaderHover();
     LRESULT drawHeader(NMCUSTOMDRAW *draw) const;
     void releaseDrawingResources();
-    void setAncestryOrder(bool enabled);
+    void setAncestryOrder(bool enabled, bool showSort = false);
     // Always pass the complete snapshot. Filtering must not look like removal.
     // The predicate is retained for expiry redraws; capture local values by value.
     // Incomplete collections cannot establish that an absent object exited.
@@ -120,6 +127,7 @@ class Table
     void clear();
     void expireHighlights();
     void sort(int column);
+    void sortRows(std::vector<Row> &items) const;
     bool notify(NMHDR *hdr);
     LRESULT customDraw(NMLVCUSTOMDRAW *draw) const;
     const Row *selected() const;
@@ -130,7 +138,9 @@ class Table
   private:
     std::wstring settingsPrefix;
     bool ancestryOrder = false;
+    bool ancestrySortIndicator = false;
     int hotRow = -1;
+    int hotHeaderColumn = -1;
     int defaultSortColumn = -1;
     bool defaultSortDescending = false;
     std::vector<int> hiddenWidths;
