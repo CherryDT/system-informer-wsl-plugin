@@ -484,6 +484,30 @@ std::vector<std::wstring> registeredWsl2Distros() {
     return enumerateRegisteredWsl2Distros();
 }
 
+std::optional<uint32_t> distroDefaultUid(const std::wstring& distro) {
+    HKEY root = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Lxss",
+                     0, KEY_READ, &root) != ERROR_SUCCESS) return std::nullopt;
+    struct KeyGuard { HKEY value; ~KeyGuard() { RegCloseKey(value); } } guard{root};
+    for (DWORD index = 0;; ++index) {
+        wchar_t key[256];
+        DWORD length = 256;
+        if (RegEnumKeyExW(root, index, key, &length, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+            break;
+        wchar_t name[256];
+        DWORD size = sizeof(name);
+        if (RegGetValueW(root, key, L"DistributionName", RRF_RT_REG_SZ, nullptr, name, &size) != ERROR_SUCCESS ||
+            distro != name) continue;
+        DWORD uid = 0;
+        size = sizeof(uid);
+        if (RegGetValueW(root, key, L"DefaultUid", RRF_RT_REG_DWORD, nullptr, &uid, &size) == ERROR_SUCCESS)
+            return uid;
+        return std::nullopt;
+    }
+    // Missing registration data must not accidentally classify root as "own".
+    return std::nullopt;
+}
+
 std::vector<Distro> runningDistros(const std::function<bool()>& cancelled) {
     if (cancelled && cancelled()) throw std::runtime_error("WSL discovery cancelled.");
     const auto registered = registeredWsl2Distros();

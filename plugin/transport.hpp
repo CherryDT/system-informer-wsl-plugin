@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <optional>
 #include <functional>
 #include <stdexcept>
 #include <memory>
@@ -23,6 +24,7 @@ struct Distro {
 
 // Reads registered WSL2 names without starting any distribution.
 std::vector<std::wstring> registeredWsl2Distros();
+std::optional<uint32_t> distroDefaultUid(const std::wstring& distro);
 
 // Lists already-running WSL2 distributions. Discovery never launches a distro.
 std::vector<Distro> runningDistros(const std::function<bool()>& cancelled = {});

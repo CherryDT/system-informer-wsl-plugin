@@ -216,24 +216,25 @@ void layoutOptions(HWND window)
         place(GetDlgItem(window, id), units.left, units.top, bounds.right - units.left - units.right,
               units.bottom);
     };
-    position(IDC_WSL_GENERAL_GROUP, 7, 7, 7, 92);
+    position(IDC_WSL_GENERAL_GROUP, 7, 7, 7, 110);
     position(IDC_WSL_CPU_LABEL, 14, 20, 14, 10);
     position(IDC_WSL_CPU_MODE, 14, 33, 14, 70);
     position(IDC_WSL_NODE_INSPECTOR, 14, 53, 14, 20);
-    position(IDC_WSL_REFRESH_NOTE, 14, 77, 14, 16);
-    position(IDC_WSL_PATH_GROUP, 7, 106, 7, 99);
-    position(IDC_WSL_DISTRO_LABEL, 14, 119, 14, 10);
-    position(IDC_WSL_DISTRO, 14, 132, 14, 70);
-    position(IDC_WSL_PREFIX_LABEL, 14, 152, 14, 10);
-    position(IDC_WSL_PREFIX, 14, 165, 89, 14);
-    RECT button{0, 164, 70, 16};
+    position(IDC_WSL_DETECT_32BIT, 14, 76, 14, 14);
+    position(IDC_WSL_REFRESH_NOTE, 14, 95, 14, 16);
+    position(IDC_WSL_PATH_GROUP, 7, 124, 7, 99);
+    position(IDC_WSL_DISTRO_LABEL, 14, 137, 14, 10);
+    position(IDC_WSL_DISTRO, 14, 150, 14, 70);
+    position(IDC_WSL_PREFIX_LABEL, 14, 170, 14, 10);
+    position(IDC_WSL_PREFIX, 14, 183, 89, 14);
+    RECT button{0, 182, 70, 16};
     MapDialogRect(window, &button);
     RECT margin{14, 0, 0, 0};
     MapDialogRect(window, &margin);
     place(GetDlgItem(window, IDC_WSL_APPLY_PREFIX), bounds.right - margin.left - button.right, button.top,
           button.right, button.bottom);
-    position(IDC_WSL_PREFIX_HINT, 14, 185, 14, 14);
-    position(IDC_WSL_OPTIONS_STATUS, 7, 211, 7, 18);
+    position(IDC_WSL_PREFIX_HINT, 14, 203, 14, 14);
+    position(IDC_WSL_OPTIONS_STATUS, 7, 229, 7, 18);
 }
 
 INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
@@ -251,6 +252,8 @@ INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                             readSetting(L"CpuPercentOfTotal", 1) ? 1 : 0, 0);
         CheckDlgButton(window, IDC_WSL_NODE_INSPECTOR,
                        readSetting(L"UseNodeInspectorWithoutAsking", 0) ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(window, IDC_WSL_DETECT_32BIT,
+                       readSetting(L"Detect32BitProcesses", 0) ? BST_CHECKED : BST_UNCHECKED);
         SendDlgItemMessageW(window, IDC_WSL_PREFIX, EM_SETLIMITTEXT, 32760, 0);
         try
         {
@@ -305,6 +308,12 @@ INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 writeSetting(L"UseNodeInspectorWithoutAsking",
                              IsDlgButtonChecked(window, id) == BST_CHECKED ? 1 : 0);
                 optionsStatus(window, L"Node Inspector preference saved.");
+                return TRUE;
+            }
+            if (id == IDC_WSL_DETECT_32BIT && event == BN_CLICKED)
+            {
+                writeSetting(L"Detect32BitProcesses", IsDlgButtonChecked(window, id) == BST_CHECKED ? 1 : 0);
+                optionsStatus(window, L"32-bit detection preference saved.");
                 return TRUE;
             }
             if (id == IDC_WSL_PREFIX && event == EN_CHANGE)
