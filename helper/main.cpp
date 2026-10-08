@@ -28,6 +28,7 @@ observer::Json dispatch(const observer::Json& request) {
     if (operation == "details") return observer::process_details(request);
     if (operation == "connections") return observer::connections(request);
     if (operation == "signal") return observer::send_signal(request);
+    if (operation == "stacks") return observer::process_stacks(request);
     if (operation == "services") return observer::services();
     if (operation == "service_details") return observer::service_details(request);
     if (operation == "service_action") return observer::service_action(request);

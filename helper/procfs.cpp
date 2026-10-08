@@ -178,6 +178,7 @@ Json hello() {
     return {{"protocol", 1}, {"boot_id", boot_id()}, {"uid", getuid()},
             {"cpus", sysconf(_SC_NPROCESSORS_ONLN)}, {"clock_ticks", sysconf(_SC_CLK_TCK)},
             {"systemd", access("/run/systemd/system", F_OK) == 0},
+            {"gdb", access("/usr/bin/gdb", X_OK) == 0 || access("/bin/gdb", X_OK) == 0},
             {"helper_version", "0.1.0"}};
 }
 Json snapshot() {
@@ -322,6 +323,128 @@ Json process_details(const Json& request) {
             {"environment_truncated", environment_truncated}, {"threads_truncated", threads_truncated},
             {"summary_truncated", summary_truncated}};
 }
+Json process_stacks(const Json& request) {
+    const auto identity = request_identity(request);
+    if (identity.pid <= 1 || identity.pid == getpid())
+        throw std::runtime_error("Debugger attachment to this process is protected");
+    require_identity(identity);
+    if (access("/usr/bin/gdb", X_OK) != 0 && access("/bin/gdb", X_OK) != 0)
+        return {{"available", false}, {"text", ""},
+            {"message", "GDB is not installed. Install gdb in this distribution to inspect user-space thread stacks."}};
+
+    std::string backtrace = "thread apply all bt 64";
+    if (request.contains("tid")) {
+        const auto& requested_tid = request["tid"];
+        if (!requested_tid.is_number_integer() || requested_tid.get<int64_t>() <= 0 ||
+            requested_tid.get<int64_t>() > std::numeric_limits<int>::max())
+            throw std::runtime_error("Invalid thread ID");
+        const auto tid = requested_tid.get<int>();
+        if (read_text(proc_path(identity.pid, ("task/" + std::to_string(tid) + "/stat").c_str()), 16384).empty())
+            throw std::runtime_error("Thread exited or is not part of this process");
+        // GDB's thread numbers differ from Linux TIDs. This is a fixed Python
+        // expression with one validated integer, never a user-provided command.
+        backtrace = "python t = next(t for t in gdb.selected_inferior().threads() if t.ptid[1] == " +
+            std::to_string(tid) + "); t.switch(); gdb.execute('bt 64')";
+    }
+    auto capture = [&](bool minimal_symbols) {
+        // --readnever skips DWARF while retaining ELF minimal symbols, including
+        // exported functions. Shared-library loading stays enabled for libc and
+        // other module names; --se supplies the main executable's ELF symbols.
+        std::vector<std::string> arguments{"gdb", "--nx", "--nh", "--batch", "--quiet"};
+        if (minimal_symbols) {
+            arguments.push_back("--readnever");
+            arguments.push_back("--se=" + proc_path(identity.pid, "exe"));
+        }
+        const std::vector<std::string> options{
+            "-iex", "set auto-load off", "-iex", "set debuginfod enabled off",
+            "-iex", "set index-cache enabled off", "-iex", "set libthread-db-search-path $sdir",
+            "-iex", "maintenance set internal-error corefile no",
+            "-iex", "maintenance set internal-error quit yes",
+            "-iex", "maintenance set internal-warning corefile no",
+            "-iex", "set exec-file-mismatch off",
+            "-ex", "set pagination off", "-ex", "set confirm off",
+            "-ex", "set print frame-arguments none", "-ex", "set print entry-values no",
+            "-ex", "attach " + std::to_string(identity.pid), "-ex", backtrace};
+        arguments.insert(arguments.end(), options.begin(), options.end());
+        if (minimal_symbols) arguments.insert(arguments.end(), {"-ex", "info sharedlibrary"});
+        arguments.insert(arguments.end(), {"-ex", "detach"});
+        // GDB cannot attach through a pidfd. Recheck each numeric attachment,
+        // including a retry, without claiming this closes the PID-reuse race.
+        require_identity(identity);
+        auto result = run_command(arguments, 15000, 256 * 1024);
+        require_identity(identity);
+        return result;
+    };
+    auto primary = capture(false);
+    const std::vector<std::string> symbol_failures{
+        "DWARF Error", "Dwarf Error", "dwarf2/", "DW_TAG_skeleton_unit",
+        "Could not find DWO CU", "could not find DWO CU", "error reading .dwo",
+        "Recursive internal problem", "internal-error:"};
+    const bool needs_fallback = std::any_of(symbol_failures.begin(), symbol_failures.end(),
+        [&](const std::string& marker) { return primary.output.find(marker) != std::string::npos; });
+    auto result = primary;
+    std::string message;
+    std::string output = primary.output;
+    if (needs_fallback) {
+        result = capture(true);
+        message = "GDB encountered a debug-information error. Retried with ELF minimal symbols; "
+            "exported function and module names remain available, but source lines and reliable DWARF unwinding may be unavailable.";
+
+        // Preserve useful module context even for stripped frames named '??'.
+        // This is a mapped-file offset, not a promise about an ELF virtual RVA.
+        struct Mapping { uint64_t start, end, offset; std::string path; };
+        std::vector<Mapping> mappings;
+        std::istringstream map_lines(read_text(proc_path(identity.pid, "maps"), 8 * 1024 * 1024));
+        std::string line;
+        while (std::getline(map_lines, line)) {
+            std::istringstream fields(line);
+            std::string range, permissions, offset, device, inode, path;
+            if (!(fields >> range >> permissions >> offset >> device >> inode)) continue;
+            std::getline(fields >> std::ws, path);
+            const auto dash = range.find('-');
+            if (path.empty() || path.front() != '/' || dash == std::string::npos) continue;
+            try {
+                mappings.push_back({std::stoull(range.substr(0, dash), nullptr, 16),
+                    std::stoull(range.substr(dash + 1), nullptr, 16), std::stoull(offset, nullptr, 16), path});
+            } catch (const std::exception&) { }
+        }
+        std::istringstream stack_lines(result.output);
+        std::string annotated;
+        while (std::getline(stack_lines, line)) {
+            const auto address_start = line.find("0x");
+            if (!line.empty() && line.front() == '#' && address_start != std::string::npos) {
+                try {
+                    const auto address = std::stoull(line.substr(address_start), nullptr, 16);
+                    for (const auto& mapping : mappings) if (address >= mapping.start && address < mapping.end) {
+                        std::ostringstream location;
+                        location << " [" << mapping.path << " file+0x" << std::hex <<
+                            (mapping.offset + address - mapping.start) << "]";
+                        line += location.str();
+                        break;
+                    }
+                } catch (const std::exception&) { }
+            }
+            if (annotated.size() + line.size() + 1 > 512 * 1024) {
+                annotated += "[Annotated output truncated]\n";
+                break;
+            }
+            annotated += line + "\n";
+        }
+        output = message + "\n\nMinimal-symbol backtrace\n" + annotated +
+            "\nOriginal GDB diagnostics\n" + primary.output;
+    }
+    if (result.timed_out) {
+        if (!message.empty()) message += " ";
+        message += "GDB timed out after 15 seconds; the debugger was terminated.";
+    } else if (result.exit_code != 0) {
+        if (!message.empty()) message += " ";
+        message += "GDB could not collect every requested stack. See its diagnostic output; ptrace permissions and debug symbols may be required.";
+    }
+    require_identity(identity);
+    return {{"available", true}, {"text", output}, {"message", message},
+        {"fallback", needs_fallback}, {"timed_out", result.timed_out},
+        {"exit_code", result.exit_code}, {"primary_exit_code", primary.exit_code}};
+}
 Json send_signal(const Json& request) {
     const auto identity = request_identity(request);
     const auto& requested_signal = request.at("signal");
@@ -330,8 +453,8 @@ Json send_signal(const Json& request) {
         throw std::runtime_error("Invalid signal number");
     const int signal = requested_signal.get<int>();
     if (identity.pid <= 1 || identity.pid == getpid()) throw std::runtime_error("This process is protected");
-    if (signal != SIGTERM && signal != SIGKILL && signal != SIGSTOP && signal != SIGCONT && signal != SIGUSR1 && signal != SIGUSR2)
-        throw std::runtime_error("Unsupported signal; use TERM, KILL, STOP, CONT, USR1, or USR2");
+    if (signal != SIGTERM && signal != SIGKILL && signal != SIGSTOP && signal != SIGCONT && signal != SIGUSR1 && signal != SIGUSR2 && signal != SIGHUP && signal != SIGWINCH)
+        throw std::runtime_error("Unsupported signal; use TERM, KILL, STOP, CONT, USR1, USR2, HUP, or WINCH");
 #if defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
     const int fd = static_cast<int>(syscall(SYS_pidfd_open, identity.pid, 0));
     if (fd < 0) throw std::runtime_error(std::string("Cannot open process identity: ") + std::strerror(errno));

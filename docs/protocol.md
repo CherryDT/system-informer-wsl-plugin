@@ -41,7 +41,8 @@ signals. A disappearing process is a normal, recoverable error.
 ### `hello`
 
 Returns `protocol`, `helper_version`, `boot_id`, `uid`, `cpus` (online logical CPUs),
-`clock_ticks` (ticks per second), and `systemd` (whether systemd is running).
+`clock_ticks` (ticks per second), `systemd` (whether systemd is running), and
+`gdb` (whether GDB is installed in a trusted system binary directory).
 
 ### `snapshot`
 
@@ -131,9 +132,51 @@ at 12 MiB and reports `connections_truncated:true` when full.
 ### `signal` (`pid`, `start_ticks`, `signal`)
 
 Allows only SIGTERM (15), SIGKILL (9), SIGSTOP (19), SIGCONT (18), SIGUSR1 (10), and
-SIGUSR2 (12) on supported WSL x86-64/ARM64 Linux targets. Returns `{sent:true}`.
+SIGUSR2 (12), SIGHUP (1), and SIGWINCH (28) on supported WSL x86-64/ARM64 Linux targets. Returns `{sent:true}`.
 A successful return means the kernel accepted the signal, not that the process
 has already exited. Refresh to observe the resulting state.
+
+### `stacks` (`pid`, `start_ticks`, optional `tid`)
+
+Returns `{available,text,message,timed_out?,exit_code?,fallback?,primary_exit_code?}` with GDB user-space
+backtraces. If GDB is absent, `available:false` includes an installation hint;
+the helper never installs software. PID 1 and the helper itself are protected.
+Each thread has at most 64 frames, the capture limit is 256 KiB, and the deadline
+is 15 seconds per attempt. An optional Linux TID selects one thread through a fixed GDB Python
+expression; this requires a GDB build with Python support. Otherwise all threads
+are shown. Missing symbols and ptrace/security restrictions appear in the output.
+Frame arguments and entry values are omitted to avoid needless reads of fragile
+variable debug information. GDB internal errors are configured not to write core
+dumps or wait for interactive confirmation.
+
+If GDB reports a DWARF/split-DWARF reader error or an internal debugger failure,
+the helper retries once with `--readnever` and the executable supplied through
+`--se`. This retains ELF minimal symbols and shared-library lookup, including
+exported function names, while skipping symbolic DWARF debug information. The
+fallback also appends module/file-offset annotations and a shared-library list.
+`fallback:true` and `message` disclose the retry, and the original diagnostics are
+preserved beneath the fallback trace. Missing DWARF unwind information can make
+these traces shorter or less reliable; the result is not advertised as a fully
+symbolicated stack. The two attempts can take up to approximately 31 seconds in
+total, including command cleanup. Permission errors do not trigger this retry.
+
+The behavior of `--readnever` and executable/symbol selection is documented in
+the [GDB file options](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/File-Options.html)
+and [file commands](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/Files.html).
+
+This operation attaches a debugger and briefly stops the target's threads. It
+must be an explicit inspection action, not an automatic refresh. GDB accepts a
+numeric PID, so unlike signal actions this attachment cannot be made atomically
+against a pidfd identity: identity is checked immediately before and after, but
+a narrow PID-reuse race remains. A successful post-check does not guarantee an
+atomic snapshot. Do not describe this operation as passive or pidfd-safe.
+
+GDB runs only from `/usr/bin` or `/bin`, with init files and auto-loading disabled,
+index-cache writes disabled, thread-debugging libraries restricted to GDB system
+directories, debuginfod disabled, an empty `DEBUGINFOD_URLS`, a clean environment, and `/` as its
+working directory. No caller-provided GDB commands are accepted. The batch ends
+with an explicit detach; on timeout the debugger process group is terminated,
+which releases ptrace ownership. It does not send SIGCONT to the target itself.
 
 ### `services`
 

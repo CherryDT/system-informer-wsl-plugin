@@ -37,8 +37,10 @@ Json hello();
 Json snapshot();
 Json process_details(const Json& request);
 Json send_signal(const Json& request);
+Json process_stacks(const Json& request);
 Json connections(const Json& request);
-CommandResult run_command(const std::vector<std::string>& arguments, int timeout_ms = 5000);
+CommandResult run_command(const std::vector<std::string>& arguments, int timeout_ms = 5000,
+    size_t output_limit = 2 * 1024 * 1024);
 Json services();
 Json service_details(const Json& request);
 Json service_action(const Json& request);

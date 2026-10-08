@@ -31,8 +31,8 @@ std::string checked_output(const CommandResult& result) {
 bool systemd_available() { return access("/run/systemd/system", F_OK) == 0; }
 }
 
-CommandResult run_command(const std::vector<std::string>& arguments, int timeout_ms) {
-    if (arguments.empty() || (arguments[0] != "systemctl" && arguments[0] != "journalctl"))
+CommandResult run_command(const std::vector<std::string>& arguments, int timeout_ms, size_t output_limit) {
+    if (arguments.empty() || (arguments[0] != "systemctl" && arguments[0] != "journalctl" && arguments[0] != "gdb"))
         throw std::runtime_error("Unsupported system command");
     std::string executable;
     for (const auto* directory : {"/usr/bin/", "/bin/"}) {
@@ -61,14 +61,14 @@ CommandResult run_command(const std::vector<std::string>& arguments, int timeout
     for (const auto& argument : arguments) argv.push_back(const_cast<char*>(argument.c_str()));
     argv.push_back(nullptr);
     std::vector<std::string> environment{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C",
-        "SYSTEMD_COLORS=0", "SYSTEMD_URLIFY=0", "SYSTEMD_PAGER=cat"};
+        "SYSTEMD_COLORS=0", "SYSTEMD_URLIFY=0", "SYSTEMD_PAGER=cat", "DEBUGINFOD_URLS=", "HOME=/"};
     std::vector<char*> envp;
     for (auto& entry : environment) envp.push_back(entry.data());
     envp.push_back(nullptr);
     const pid_t child = fork();
     if (child < 0) { close(pipes[0]); close(pipes[1]); throw std::runtime_error("Cannot start command"); }
     if (child == 0) {
-        if (setpgid(0, 0) != 0) _exit(126);
+        if (setpgid(0, 0) != 0 || chdir("/") != 0) _exit(126);
         const int null_fd = open("/dev/null", O_RDONLY);
         if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0 ||
             dup2(pipes[1], STDOUT_FILENO) < 0 || dup2(pipes[1], STDERR_FILENO) < 0) _exit(126);
@@ -81,7 +81,6 @@ CommandResult run_command(const std::vector<std::string>& arguments, int timeout
     CommandResult result;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     bool exited = false, eof = false;
-    constexpr size_t output_limit = 2 * 1024 * 1024;
     while (!exited || !eof) {
         char buffer[8192];
         // A continuously writing child must not prevent deadline checks.
