@@ -333,7 +333,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     information->DisplayName = L"WSL Tools";
     information->Author = L"David Trapp";
     information->Description =
-        L"Processes, connections, open files, modules and systemd services for WSL 2. MIT licensed.";
+        L"Processes, connections, open files, modules and systemd services for WSL 2.";
     information->HasOptions = TRUE;
 
     PhRegisterCallback(PhGetGeneralCallback(GeneralCallbackSettingsUpdated), HostSettingsUpdated, NULL,
