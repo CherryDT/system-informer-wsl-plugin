@@ -1,4 +1,5 @@
 #include "observer.hpp"
+#include "thread_tools.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -638,6 +639,8 @@ Json process_details(const Json& request) {
             if (!append_with_budget(files, {{"fd", std::stoi(name)},
                 {"target", read_link(fd_path + "/" + name)}, {"flags", flags},
                 {"flags_text", flags_known ? descriptor_flags(numeric_flags) : "Unknown"},
+                {"position", field_value(info, "pos:")}, {"mount_id", field_value(info, "mnt_id:")},
+                {"inode", field_value(info, "ino:")},
                 {"inherited", flags_known && !(numeric_flags & O_CLOEXEC)}}, file_budget)) {
                 files_truncated = true; break;
             }
@@ -747,8 +750,12 @@ Json process_details(const Json& request) {
             auto wchan = read_text(task_path + "/" + tid + "/wchan", 4096);
             while (!wchan.empty() && (wchan.back() == '\n' || wchan.back() == '\r')) wchan.pop_back();
             const auto state = text.substr(end + 2, 1);
-            if (!append_with_budget(threads, {{"tid", std::stoi(tid)}, {"name", text.substr(begin + 1, end - begin - 1)},
-                {"state", state}, {"wchan", wchan}, {"wait_kind", thread_wait_kind(state, wchan)}}, thread_budget)) {
+            Json thread;
+            try { thread = thread_snapshot(identity.pid, std::stoi(tid), text); }
+            catch (const std::exception&) { continue; } // A racing task must not fail the whole inspector.
+            thread["wchan"] = wchan;
+            thread["wait_kind"] = thread_wait_kind(state, wchan);
+            if (!append_with_budget(threads, std::move(thread), thread_budget)) {
                 threads_truncated = true; break;
             }
         }

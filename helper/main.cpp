@@ -1,4 +1,6 @@
 #include "observer.hpp"
+#include "resource_tools.hpp"
+#include "thread_tools.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -23,6 +25,8 @@ void check_nesting(const std::string& line) {
 }
 observer::Json dispatch(const observer::Json& request) {
     const auto operation = request.at("op").get<std::string>();
+    if (operation == "resource") return observer::resource_tool(request);
+    if (operation == "thread") return observer::thread_tool(request);
     if (operation == "hello") return observer::hello();
     if (operation == "snapshot") return observer::snapshot(request);
     if (operation == "find_handles") return observer::find_handles(request);
