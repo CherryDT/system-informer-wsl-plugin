@@ -179,7 +179,7 @@ void layout(View &v)
     place(v.tree, width - checkWidth(v.tree), 0, checkWidth(v.tree), line);
     place(v.listeners, width - checkWidth(v.listeners), 0, checkWidth(v.listeners), line);
     const int footerHeight = s(18);
-    const int footerY = height - gap - footerHeight;
+    const int footerY = height - s(2) - footerHeight;
     place(v.status, s(2), footerY, width - s(4), footerHeight);
 
     const bool content = !v.componentMissing;
@@ -217,7 +217,7 @@ void layout(View &v)
         tableTop += gap + editHeight(v.window) + gap;
     }
     for (auto table : {&v.processes, &v.connections, &v.services})
-        place(table->window, 0, tableTop, width, std::max(0, footerY - gap - tableTop));
+        place(table->window, 0, tableTop, width, std::max(0, footerY - s(2) - tableTop));
 }
 void switchPage(View &v)
 {
@@ -815,7 +815,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                 GetLocalTime(&time);
                 wchar_t stamp[32];
                 swprintf_s(stamp, L"%02u:%02u:%02u", time.wHour, time.wMinute, time.wSecond);
-                auto statusText = L"Root · " + v->selectedDistro + L" · ";
+                std::wstring statusText;
                 if (v->page == 0 && !v->statistics.empty())
                     statusText += v->statistics;
                 else

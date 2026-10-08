@@ -223,7 +223,11 @@ LRESULT CALLBACK graphProc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
         InflateRect(&label, -scale(window, 5), -scale(window, 3));
         std::wstring caption = state->memory ? L"WSL VM memory used" : L"Distro CPU";
         if (!samples.empty())
+        {
             caption += L"  " + number(value(samples.back(), state->memory)) + L"%";
+            if (state->memory)
+                caption += L" (" + bytes(samples.back().memoryTotal - samples.back().memoryAvailable) + L")";
+        }
         DrawTextW(dc, caption.c_str(), -1, &label, DT_LEFT | DT_TOP | DT_SINGLELINE);
         SelectObject(dc, originalFont);
         SetDCBrushColor(dc, dark ? RGB(100, 100, 100) : GetSysColor(COLOR_3DSHADOW));
