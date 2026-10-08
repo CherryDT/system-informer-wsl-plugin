@@ -64,6 +64,7 @@ void clearDistro(View &v)
     v.componentMissing = false;
     v.previous.clear();
     v.cpu.clear();
+    v.cpuHistory.clear();
     v.readRate.clear();
     v.writeRate.clear();
     v.previousTime = 0;
@@ -117,6 +118,14 @@ void render(View &v, uintptr_t changed)
         const bool hideWslToWindows = readSetting(L"HideWslToWindowsInterop", 0) != 0;
         v.processes.setAncestryOrder(tree, tree && (WslHostIntegerSetting(L"SortChildProcesses") ||
                                                     WslHostIntegerSetting(L"SortRootProcesses")));
+        auto cpuText = [&](double value) -> std::wstring {
+            // Both CPU columns follow the host's precision and tiny-value option.
+            if (value >= cpuThreshold)
+                return number(value, precision);
+            if (value > 0 && showSmallCpu)
+                return L"< " + number(value, precision);
+            return {};
+        };
         for (const auto &p : items)
         {
             auto cpuTime = [&](const char *key) {
@@ -124,13 +133,8 @@ void render(View &v, uintptr_t changed)
             };
             auto key = processKey(p);
             const double cpu = v.cpu[key] / cpuDivisor;
-            // Match the host: exact zero is always blank; tiny nonzero CPU is
-            // optional and uses its below-precision indicator.
-            std::wstring cpuText;
-            if (cpu >= cpuThreshold)
-                cpuText = number(cpu, precision);
-            else if (cpu > 0 && showSmallCpu)
-                cpuText = L"< " + number(cpu, precision);
+            const auto history = v.cpuHistory.find(key);
+            const double average = history != v.cpuHistory.end() ? history->second.average() / cpuDivisor : 0;
             auto rate = [](double value) {
                 return value >= 1 ? bytes(static_cast<uint64_t>(value)) + L"/s" : L"";
             };
@@ -146,7 +150,7 @@ void render(View &v, uintptr_t changed)
             Row row{{name,
                      text(p, "pid"),
                      text(p, "user"),
-                     cpuText,
+                     cpuText(cpu),
                      bytes(p.value("rss_bytes", 0ull)),
                      rate(v.readRate[key]),
                      rate(v.writeRate[key]),
@@ -188,14 +192,13 @@ void render(View &v, uintptr_t changed)
                          : L"",
                      cpuTime("user_ticks"),
                      cpuTime("kernel_ticks"),
-                     text(p, "policy")},
+                     text(p, "policy"),
+                     cpuText(average)},
                     p,
                     key};
-            row.numeric = {{ProcessAge, static_cast<double>(age)},
-                           {ProcessCpu, cpu},
-                           {ProcessRss, p.value("rss_bytes", 0.0)},
-                           {ProcessRead, v.readRate[key]},
-                           {ProcessWrite, v.writeRate[key]}};
+            row.numeric = {{ProcessAge, static_cast<double>(age)}, {ProcessCpu, cpu},
+                           {ProcessCpuAverage, average},           {ProcessRss, p.value("rss_bytes", 0.0)},
+                           {ProcessRead, v.readRate[key]},         {ProcessWrite, v.writeRate[key]}};
             for (const auto &field :
                  std::initializer_list<std::pair<size_t, const char *>>{{ProcessVirtual, "virtual_bytes"},
                                                                         {ProcessSwap, "swap_bytes"},
@@ -322,6 +325,7 @@ void updateSnapshot(View &v, const Json &data)
     if (v.bootId != boot || now <= v.previousTime)
     {
         v.previous.clear();
+        v.cpuHistory.clear();
         v.previousTime = 0;
         v.graphSamples.clear();
         v.graphSequence = 0;
@@ -334,6 +338,7 @@ void updateSnapshot(View &v, const Json &data)
     GraphSample graph;
     GetSystemTimeAsFileTime(&graph.timestamp);
     graph.interval = elapsed;
+    const size_t historyCapacity = std::max(1ul, WslHostIntegerSetting(L"SampleCount"));
     std::map<std::string, ProcessSample> samples;
     v.newProcess.clear();
     v.cpu.clear();
@@ -353,7 +358,15 @@ void updateSnapshot(View &v, const Json &data)
         {
             auto &old = previous->second;
             if (sample.ticks >= old.ticks)
+            {
                 usage = 100.0 * (sample.ticks - old.ticks) / hz / elapsed;
+                // A baseline-only reading and manual refreshes while capture is
+                // paused are not CPU history samples. Neither adds a false zero.
+                if (!v.paused)
+                    v.cpuHistory[key].append(usage, historyCapacity);
+            }
+            else
+                v.cpuHistory.erase(key); // Counter reset: start a fresh history.
             if (sample.hasIo && old.hasIo && sample.read >= old.read)
                 read = (sample.read - old.read) / elapsed;
             if (sample.hasIo && old.hasIo && sample.written >= old.written)
@@ -377,6 +390,12 @@ void updateSnapshot(View &v, const Json &data)
             graph.largestRssPid = p.value("pid", 0);
         }
     }
+    // Do not retain histories for exited processes, or transfer one to a reused PID.
+    for (auto it = v.cpuHistory.begin(); it != v.cpuHistory.end();)
+        if (samples.count(it->first))
+            ++it;
+        else
+            it = v.cpuHistory.erase(it);
     v.previous = std::move(samples);
     v.previousTime = now;
     // Cheap background samples omit expensive fields. Retain the last known

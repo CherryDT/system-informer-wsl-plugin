@@ -460,7 +460,8 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                              {L"Architecture", 95, false, false},
                              {L"User CPU time", 120, true, false},
                              {L"Kernel CPU time", 120, true, false},
-                             {L"Scheduling policy", 130, false, false}},
+                             {L"Scheduling policy", 130, false, false},
+                             {L"CPU (average)", 115, true, false}},
                             3, true);
 
         v->connections.create(window, ConnectionTable,

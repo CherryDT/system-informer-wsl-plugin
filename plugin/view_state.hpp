@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.hpp"
+#include <algorithm>
 #include <deque>
 #include <map>
 #include <optional>
@@ -54,6 +55,28 @@ struct ProcessSample
     uint64_t ticks = 0, read = 0, written = 0;
     bool hasIo = false;
 };
+// Raw per-vCPU percentages, independent of the current display scale. Keeping
+// the sum makes each update constant-time once the history window is full.
+struct CpuHistory
+{
+    std::deque<double> samples;
+    double sum = 0;
+
+    void append(double usage, size_t capacity)
+    {
+        samples.push_back(usage);
+        sum += usage;
+        while (samples.size() > capacity)
+        {
+            sum -= samples.front();
+            samples.pop_front();
+        }
+    }
+    double average() const
+    {
+        return samples.empty() ? 0 : std::max(0.0, sum / samples.size());
+    }
+};
 struct GraphSample
 {
     FILETIME timestamp{};
@@ -75,6 +98,9 @@ struct View
     // Only the current process identities are retained between samples.
     std::map<std::string, ProcessSample> previous;
     std::map<std::string, double> cpu, readRate, writeRate;
+    // Separate from the interval baseline so a capture pause does not add zeros
+    // or discard valid history. Keys include the process start time.
+    std::map<std::string, CpuHistory> cpuHistory;
     std::deque<GraphSample> graphSamples;
     uint64_t graphSequence = 0;
     uint64_t previousTime = 0;
@@ -152,7 +178,8 @@ enum ProcessColumn
     ProcessArchitecture,
     ProcessUserTime,
     ProcessKernelTime,
-    ProcessPolicy
+    ProcessPolicy,
+    ProcessCpuAverage
 };
 
 // Window/controller boundary. Queue tags carry the current epoch in their high
