@@ -72,7 +72,7 @@ struct View
     unsigned epoch = 1;
     int page = 0;
     bool active = false, paused = false, pending = false, failed = false;
-    bool componentMissing = false, cpuPercentOfTotal = false;
+    bool componentMissing = false, cpuPercentOfTotal = true;
     Table &table()
     {
         return page == 0 ? processes : page == 1 ? connections : services;

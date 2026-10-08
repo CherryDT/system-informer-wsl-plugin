@@ -79,7 +79,7 @@ void updateButtons(View &v)
 }
 void render(View &v)
 {
-    v.cpuPercentOfTotal = readSetting(L"CpuPercentOfTotal", 0) != 0;
+    v.cpuPercentOfTotal = readSetting(L"CpuPercentOfTotal", 1) != 0;
     const double cpuDivisor =
         v.cpuPercentOfTotal && v.snapshot.is_object() ? std::max(1.0, v.snapshot.value("cpus", 1.0)) : 1.0;
     std::vector<Row> rows;

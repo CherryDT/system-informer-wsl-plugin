@@ -385,7 +385,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         return 0;
     case WM_TIMER: {
         static ULONGLONG last = 0;
-        if (v->cpuPercentOfTotal != (readSetting(L"CpuPercentOfTotal", 0) != 0))
+        if (v->cpuPercentOfTotal != (readSetting(L"CpuPercentOfTotal", 1) != 0))
             render(*v);
         auto now = GetTickCount64();
         auto interval = std::clamp(readSetting(L"RefreshInterval", 2000), 500ul, 60000ul);

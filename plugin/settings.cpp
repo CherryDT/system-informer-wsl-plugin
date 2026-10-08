@@ -241,7 +241,7 @@ LRESULT CALLBACK settingsProc(HWND window, UINT message, WPARAM wparam, LPARAM l
         state->cpuMode = control(window, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, CpuMode);
         for (auto label : {L"100% = one vCPU (Linux convention)", L"100% = all WSL vCPUs"})
             SendMessageW(state->cpuMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
-        SendMessageW(state->cpuMode, CB_SETCURSEL, readSetting(L"CpuPercentOfTotal", 0) ? 1 : 0, 0);
+        SendMessageW(state->cpuMode, CB_SETCURSEL, readSetting(L"CpuPercentOfTotal", 1) ? 1 : 0, 0);
         state->status =
             control(window, L"STATIC",
                     L"Collectors always run as Linux root. Only the selected running distro is "

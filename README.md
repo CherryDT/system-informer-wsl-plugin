@@ -45,7 +45,7 @@ The SDK is pinned to System Informer revision `bfc8145f2744a415319ccaaa8f1e32dd2
 
 The inner views are **Processes · Services · Network**. When ToolStatus and its search box are enabled, the normal toolbar search filters the active WSL view using System Informer's search rules. Without it, a local filter is available. Process inspector tabs are **General · Threads · Modules · Environment · Handles · Network · Stacks · Details**; service inspectors have **General · Details**. Table pages keep their own filters.
 
-**Processes:** By default, process CPU uses Linux's convention: **100% means one fully occupied virtual CPU**. In **WSL → Settings**, choose whether process CPU should use that scale or **100% = all WSL vCPUs**. The registry setting is `CpuPercentOfTotal` (`REG_DWORD`): `0` is the default one-vCPU scale and `1` uses total WSL CPU capacity. The summary and CPU graph always divide the selected distro's visible process total by the guest CPU count, regardless of the process-column setting. Memory available/total is VM-wide because WSL distributions share a kernel; RSS is per process and includes shared pages. Read/write rates are Linux storage accounting, not network or every buffered read/write operation. Bordered CPU and VM-memory graphs remain visible and keep updating across Processes, Services and Network.
+**Processes:** By default, process CPU follows the Windows convention: **100% = all WSL vCPUs**. In **WSL → Settings**, you can switch to Linux's convention, where **100% means one fully occupied virtual CPU**. The registry setting is `CpuPercentOfTotal` (`REG_DWORD`): `1` is the default total-WSL-capacity scale and `0` selects the one-vCPU scale. The summary and CPU graph always divide the selected distro's visible process total by the guest CPU count, regardless of the process-column setting. Memory available/total is VM-wide because WSL distributions share a kernel; RSS is per process and includes shared pages. Read/write rates are Linux storage accounting, not network or every buffered read/write operation. Bordered CPU and VM-memory graphs remain visible and keep updating across Processes, Services and Network.
 
 **Network:** enter a port such as `3000`, or combine terms such as `node 3000`. Space-separated search terms are ANDed across visible row values. **Listening / bound ports only** includes TCP listeners and unconnected UDP endpoints. Unix sockets are included. Double-click an owned socket to switch to Processes and select its owner; press Enter again to inspect it. PID 0 means no owner was visible; it is not a Windows PID.
 
@@ -100,7 +100,7 @@ Column widths, display order and the sort column/direction are saved independent
 
 Settings are independent of System Informer's normal configuration. The refresh interval is `RefreshInterval` (`REG_DWORD`, decimal milliseconds, 500–60000) in the parent registry key; default is 2000.
 
-`CpuPercentOfTotal` (`REG_DWORD`, `0` or `1`) controls process-row CPU percentages as described above; default is `0`.
+`CpuPercentOfTotal` (`REG_DWORD`, `0` or `1`) controls process-row CPU percentages as described above; default is `1`.
 
 ## Build
 

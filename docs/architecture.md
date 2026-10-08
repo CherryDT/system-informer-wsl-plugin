@@ -40,7 +40,7 @@ Signal operations open a pidfd, validate the requested start time against the li
 
 ## Accounting
 
-Raw process CPU is `100 * delta(utime + stime) / CLK_TCK / elapsed_seconds`; one busy vCPU is 100%. The optional `CpuPercentOfTotal` display setting divides process-row CPU by the guest vCPU count, making 100% represent all WSL vCPUs; the default is 0, which keeps the one-vCPU scale. The distro summary and graph always divide the visible process sum by the number of guest CPUs. Child CPU counters are deliberately excluded. First/new samples have no measurable delta and start at zero. Storage rates similarly use counter deltas. Missing counters, restarts and negative deltas do not create spikes.
+Raw process CPU is `100 * delta(utime + stime) / CLK_TCK / elapsed_seconds`; one busy vCPU is 100%. The `CpuPercentOfTotal` display setting defaults to 1: it divides process-row CPU by the guest vCPU count, making 100% represent all WSL vCPUs, like the Windows convention. Setting it to 0 selects the Linux one-vCPU scale. The distro summary and graph always divide the visible process sum by the number of guest CPUs. Child CPU counters are deliberately excluded. First/new samples have no measurable delta and start at zero. Storage rates similarly use counter deltas. Missing counters, restarts and negative deltas do not create spikes.
 
 Memory totals and pressure data describe the shared WSL VM. Individual process RSS can count shared pages multiple times. The host's `vmmemWSL` accounting is not modified. Snapshot polling is not a complete process/socket event history.
 
