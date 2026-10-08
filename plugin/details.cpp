@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "settings.hpp"
 #include <algorithm>
 #include <array>
 #include <cwctype>
@@ -141,8 +142,8 @@ const wchar_t *runtimeLabel(const Inspector &state)
 
 std::wstring runtimeStackIntro(const Inspector &state)
 {
-    std::wstring intro =
-        std::wstring(L"Press Capture ") + runtimeLabel(state) + L" stacks… to collect a stack trace.\r\n\r\n";
+    std::wstring intro = std::wstring(L"Press \"Capture ") + runtimeLabel(state) +
+                         L" stacks…\" to collect a stack trace.\r\n\r\n";
     if (state.runtime == "java")
         return intro +
                L"The JVM may briefly pause threads at a safepoint.\r\nRequires jcmd from a matching JDK.";
@@ -154,7 +155,7 @@ std::wstring runtimeStackIntro(const Inspector &state)
 
 const wchar_t *nativeStackIntro()
 {
-    return L"Press Capture all stacks… to collect native thread stacks.\r\n\r\n"
+    return L"Press \"Capture all stacks…\" to collect native thread stacks.\r\n\r\n"
            L"The process pauses while GDB is attached.\r\nRequires GDB in this distribution.";
 }
 
@@ -823,7 +824,13 @@ void captureRuntimeStacks(Inspector &state)
     }
     // The runtime hint only controls presentation. The helper revalidates the
     // executable and process identity before choosing a diagnostic tool.
-    state.nodeChoiceOffered = false;
+    bool useInspector = state.runtime == "node" && readSetting(L"UseNodeInspectorWithoutAsking", 0) != 0;
+    if (useInspector)
+    {
+        request["backend"] = "inspector";
+        request["enable_inspector"] = true;
+    }
+    state.nodeChoiceOffered = useInspector;
     queueRuntimeCapture(state, std::move(request));
 }
 
@@ -1219,7 +1226,7 @@ void loadRuntimeStacks(Inspector &state, const Json &data)
 
 bool chooseNodeBackend(Inspector &state, const Json &data)
 {
-    if (state.nodeChoiceOffered)
+    if (state.nodeChoiceOffered && !data.value("inspector_unavailable", false))
     {
         // An explicit backend must not open the same chooser again if its
         // retry fails. Keep diagnostics in the page and preserve any capture.
@@ -1229,7 +1236,7 @@ bool chooseNodeBackend(Inspector &state, const Json &data)
     state.nodeChoiceOffered = true;
     constexpr int EnableInspector = 1001;
     constexpr int UseLlnode = 1002;
-    const TASKDIALOG_BUTTON buttons[] = {{EnableInspector, L"Enable Inspector"},
+    const TASKDIALOG_BUTTON buttons[] = {{EnableInspector, L"Temporarily Enable Inspector"},
                                          {UseLlnode, L"Use llnode\nMay not work with every node version"}};
     TASKDIALOGCONFIG config{sizeof(config)};
     config.hwndParent = state.window;
@@ -1238,15 +1245,17 @@ bool chooseNodeBackend(Inspector &state, const Json &data)
     config.dwCommonButtons = TDCBF_CANCEL_BUTTON;
     config.pszWindowTitle = L"Capture JavaScript stacks";
     const bool unavailable = data.value("inspector_unavailable", false);
-    config.pszMainInstruction = unavailable ? L"Inspector requires Python 3" : L"Node Inspector is disabled";
+    config.pszMainInstruction = unavailable ? L"Inspector requires Python 3" : L"Node Inspector is not enabled for this process";
     config.pszContent = unavailable ? L"Install Python 3 in this distribution, or use llnode." : nullptr;
+    config.pszVerificationText = unavailable ? nullptr : L"Don't show again";
     config.cButtons = unavailable ? 1 : static_cast<UINT>(std::size(buttons));
     config.pButtons = unavailable ? buttons + 1 : buttons;
     config.nDefaultButton = IDCANCEL;
     int selected = IDCANCEL;
     const HWND owner = state.window;
     const Inspector *expectedState = &state;
-    HRESULT result = TaskDialogIndirect(&config, &selected, nullptr, nullptr);
+    BOOL remember = FALSE;
+    HRESULT result = TaskDialogIndirect(&config, &selected, nullptr, &remember);
     // The task dialog pumps messages. Host shutdown can destroy this inspector
     // while it is open; do not touch its state again after that nested teardown.
     if (!IsWindow(owner) ||
@@ -1268,6 +1277,17 @@ bool chooseNodeBackend(Inspector &state, const Json &data)
     Json request = state.runtimeRequest;
     if (selected == EnableInspector)
     {
+        if (remember)
+        {
+            try
+            {
+                writeSetting(L"UseNodeInspectorWithoutAsking", 1);
+            }
+            catch (const std::exception &error)
+            {
+                errorBox(state.window, wide(error.what()));
+            }
+        }
         request["backend"] = "inspector";
         request["enable_inspector"] = true;
     }
