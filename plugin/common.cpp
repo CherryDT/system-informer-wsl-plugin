@@ -1246,7 +1246,7 @@ LRESULT Table::customDraw(NMLVCUSTOMDRAW *draw) const
     COLORREF foreground = WslIsDarkTheme() ? WslDialogText() : GetSysColor(COLOR_WINDOWTEXT);
     bool semantic = false;
     auto apply = [&](bool condition, PCWSTR setting) {
-        if (!condition || semantic)
+        if (!condition || semantic || disabledHighlights.count(setting))
             return;
         if (WslHostIntegerSetting((std::wstring(L"Use") + setting).c_str()))
         {

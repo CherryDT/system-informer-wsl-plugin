@@ -1,5 +1,6 @@
 #include "controller.hpp"
 #include "transport.hpp"
+#include "process_rules.hpp"
 
 #include <algorithm>
 #include <condition_variable>
@@ -93,8 +94,18 @@ void run()
             clients.erase(job.distro);
             continue;
         }
+        const bool savedRule = job.request.value("_saved_scheduling", false);
         if (!job.mailbox || !job.mailbox->window.load())
+        {
+            if (savedRule)
+                cancelSavedScheduling(job.distro, job.request);
             continue;
+        }
+        if (savedRule && !savedSchedulingCurrent(job.distro, job.request))
+        {
+            cancelSavedScheduling(job.distro, job.request);
+            continue;
+        }
 
         auto reply = std::make_unique<Reply>();
         reply->tag = job.tag;
@@ -159,6 +170,35 @@ void run()
             activeDistro.clear();
             if (stopping)
                 break;
+        }
+        if (savedRule)
+        {
+            bool allowed;
+            {
+                std::lock_guard<std::mutex> lock(queueMutex);
+                allowed = captureAllowed(job.distro, operation);
+            }
+            if (!allowed)
+                cancelSavedScheduling(job.distro, job.request);
+            else
+            {
+                auto error = reply->error;
+                if (error.empty() && !reply->data.value("complete", false))
+                    error = reply->data.value("text", std::string("Could not apply all saved settings."));
+                finishSavedScheduling(job.distro, job.request, error);
+            }
+            continue;
+        }
+        if (operation == "snapshot" && reply->error.empty())
+        {
+            if (auto request = nextSavedScheduling(job.distro, reply->data))
+            {
+                std::lock_guard<std::mutex> lock(queueMutex);
+                if (!stopping && captureAllowed(job.distro, "thread") && jobs.size() < MaximumQueuedRequests)
+                    jobs.push_back({job.distro, std::move(*request), job.mailbox, 0});
+                else
+                    cancelSavedScheduling(job.distro, *request);
+            }
         }
         deliver(job.mailbox, std::move(reply));
     }
@@ -250,6 +290,11 @@ void setCapturePolicy(bool background, bool visible, const std::wstring &distro)
     }
     for (const auto &job : cancelled)
     {
+        if (job.request.value("_saved_scheduling", false))
+        {
+            cancelSavedScheduling(job.distro, job.request);
+            continue;
+        }
         auto reply = std::make_unique<Reply>();
         reply->tag = job.tag;
         reply->error = CapturePaused;
@@ -271,6 +316,12 @@ void disconnect(const std::wstring &distro)
         jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
                                   [&](const Job &job) {
                                       const auto operation = job.request.value("op", "");
+                                      if (job.distro == distro &&
+                                          job.request.value("_saved_scheduling", false))
+                                      {
+                                          cancelSavedScheduling(distro, job.request);
+                                          return true;
+                                      }
                                       return job.distro == distro &&
                                              (operation == "snapshot" || operation == "connections" ||
                                               operation == "services" || operation == "disconnect");

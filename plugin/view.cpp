@@ -5,6 +5,8 @@
 #include "view_state.hpp"
 #include "transport.hpp"
 #include "resource_tooltips.hpp"
+#include "resource_dialog.hpp"
+#include "process_rules.hpp"
 #include <algorithm>
 #include <set>
 #include <utility>
@@ -126,9 +128,16 @@ Json mergeIdentitySnapshot(const Json &previous, const Json &incoming, const cha
 Json snapshotRequest(const View &v)
 {
     Json request{{"op", "snapshot"}, {"fields", Json::array()}};
+    const bool savedScheduling = hasSavedScheduling(v.selectedDistro);
     if (!contentVisible(v) || v.page != 0)
+    {
+        if (savedScheduling)
+            request["fields"].push_back("exe");
         return request;
+    }
     std::set<std::string> fields;
+    if (savedScheduling)
+        fields.insert("exe");
     auto needs = [&](std::initializer_list<int> columns) {
         for (int column : columns)
             if (v.processes.isColumnVisible(column) || v.processes.sortColumn == column)
@@ -543,6 +552,11 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
     case WM_SIZE:
         layout(*v);
         return 0;
+    case ResourceActionCompleted:
+        v->forceRefresh = true;
+        v->refreshAfterPending = v->pending;
+        refresh(*v);
+        return 0;
     case WM_TIMER: {
         updateCaptureState(*v);
         const bool foreground = contentVisible(*v);
@@ -902,6 +916,9 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                 if ((v->page == 0 && v->snapshot.value("processes_truncated", false)) ||
                     (v->page == 1 && v->sockets.value("connections_truncated", false)))
                     statusText += L" · collection limit reached (partial results)";
+                const auto schedulingError = savedSchedulingError(v->selectedDistro);
+                if (!schedulingError.empty())
+                    statusText += L" · " + schedulingError;
                 status(*v, statusText);
             }
         }

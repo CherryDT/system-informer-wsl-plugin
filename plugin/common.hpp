@@ -18,6 +18,7 @@
 #include <shellapi.h>
 #include <string>
 #include <vector>
+#include <set>
 
 namespace wsl
 {
@@ -99,6 +100,7 @@ class Table
         Environment
     };
     Kind kind = Kind::Generic;
+    std::set<std::wstring> disabledHighlights;
     // Supplied by the main view; details grids retain their ordinary label tips.
     std::function<std::wstring(const Row &)> infoTip;
     HWND window = nullptr;

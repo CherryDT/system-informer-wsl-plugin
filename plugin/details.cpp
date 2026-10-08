@@ -1,6 +1,9 @@
 #include "common.hpp"
 #include "settings.hpp"
 #include "host_bridge.h"
+#include "detail_options.hpp"
+#include "resource_dialog.hpp"
+#include "target_actions.hpp"
 #include <algorithm>
 #include <array>
 #include <cwctype>
@@ -32,7 +35,8 @@ enum class Operation
     ServiceDetails,
     Connections,
     Stacks,
-    RuntimeStacks
+    RuntimeStacks,
+    TargetAction
 };
 enum ControlId
 {
@@ -60,7 +64,28 @@ enum ControlId
     CaptureStack,
     RuntimeStackText,
     Memory,
-    JournalText
+    JournalText,
+    PageOptions,
+    TargetOptions,
+    ResourceProperties = 400,
+    ReadMemory,
+    MemoryStrings,
+    ModuleExports,
+    ModuleImports,
+    ModuleDependencies,
+    GoToMemory,
+    GoToModule,
+    GoToSocket,
+    CopyIdentifier,
+    CopyAssignment,
+    CopyShellAssignment,
+    ViewPathEntries,
+    Statistics,
+    KernelStack,
+    ThreadNice,
+    ThreadAffinity,
+    ThreadPolicy,
+    ThreadIoPriority
 };
 
 struct OverviewField
@@ -92,6 +117,10 @@ struct Inspector
     HWND refresh = nullptr, copy = nullptr, copyAll = nullptr, save = nullptr;
     HWND open = nullptr, path = nullptr, value = nullptr;
     HWND filterLabel = nullptr, filter = nullptr, clearFilter = nullptr;
+    HWND pageOptions = nullptr, targetOptions = nullptr, closeButton = nullptr;
+    std::set<int> enabledOptions;
+    std::string pendingSocket;
+    bool refreshAfterAction = false;
     ULONG_PTR filterMatch = 0;
     std::array<Table, TableCount> tables;
     std::array<std::vector<Row>, TableCount> snapshots;
@@ -758,14 +787,13 @@ void layout(Inspector &state);
 
 void updateActions(Inspector &state)
 {
-    bool pathTab = !state.isService && (state.page == 1 || state.page == 2 || state.page == MemoryPage);
     bool overviewPage = state.page == 0;
     SetWindowTextW(state.open, overviewPage ? (state.isService ? L"Open &unit file" : L"Open &executable")
                                             : L"&Open location");
     SetWindowTextW(state.path, overviewPage ? L"Copy co&mmand" : L"Copy &path");
-    ShowWindow(state.open, pathTab || overviewPage ? SW_SHOW : SW_HIDE);
-    ShowWindow(state.path, pathTab || overviewPage ? SW_SHOW : SW_HIDE);
-    ShowWindow(state.value, state.page == 3 ? SW_SHOW : SW_HIDE);
+    ShowWindow(state.open, SW_HIDE);
+    ShowWindow(state.path, SW_HIDE);
+    ShowWindow(state.value, SW_HIDE);
     std::wstring path = selectedPath(state);
     EnableWindow(state.open, !state.loading && canOpen(selectedPath(state, true)));
     EnableWindow(state.path,
@@ -773,8 +801,7 @@ void updateActions(Inspector &state)
                               : !path.empty());
     EnableWindow(state.value, state.page == 3 && state.tables[2].selected());
     EnableWindow(state.refresh, !state.loading);
-    bool stackAction =
-        !state.isService && (state.page == 4 || state.page == StacksPage || state.page == RuntimeStacksPage);
+    bool stackAction = !state.isService && (state.page == StacksPage || state.page == RuntimeStacksPage);
     ShowWindow(state.captureStack, stackAction ? SW_SHOW : SW_HIDE);
     bool removedThread =
         state.page == 4 && state.tables[3].selected() && !state.tables[3].selectedActionable();
@@ -863,12 +890,15 @@ void showPage(Inspector &state)
     {
         int visibility = activeTable(state) ? SW_SHOW : SW_HIDE;
         ShowWindow(state.filter, visibility);
+        ShowWindow(state.pageOptions, visibility);
         EnableWindow(state.filter, activeTable(state) != nullptr);
     }
     ensureConnections(state);
     updateActions(state);
     layout(state);
 }
+
+std::wstring mappedAddress(const Json &value, const char *key, bool pad = true);
 
 void applyFilter(Inspector &state)
 {
@@ -879,10 +909,27 @@ void applyFilter(Inspector &state)
         // must not make every row in that first reply appear newly created.
         if (!state.tables[i].window || !state.snapshotReady[i])
             continue;
+        if (i == 1 || i == MemoryTable)
+            for (auto &row : state.snapshots[i])
+            {
+                const bool pad =
+                    state.enabledOptions.count(i == 1 ? PadModuleAddresses : PadMemoryAddresses) != 0;
+                row.cells[i == 1 ? 1 : 0] = mappedAddress(row.data, i == 1 ? "base" : "start", pad);
+                row.cells[i == 1 ? 2 : 1] = mappedAddress(row.data, "end", pad);
+                if (i == MemoryTable)
+                    row.cells[4] = mappedAddress(row.data, "offset", pad);
+            }
+        state.tables[i].disabledHighlights.clear();
+        for (const auto &option : detailOptions(state.tables[i].kind))
+            if (option.color && !state.enabledOptions.count(option.id))
+                state.tables[i].disabledHighlights.insert(option.color);
         state.tables[i].replace(
             state.snapshots[i],
-            [match, hideWaiting = i == ConnectionsTable &&
-                                  WslHostIntegerSetting(L"HideWaitingConnections")](const Row &row) {
+            [match, kind = state.tables[i].kind, enabled = state.enabledOptions,
+             hideWaiting =
+                 i == ConnectionsTable && WslHostIntegerSetting(L"HideWaitingConnections")](const Row &row) {
+                if (!passesDetailFilters(kind, row, enabled))
+                    return false;
                 if (hideWaiting && (row.data.value("pid", 0) == 0 ||
                                     (row.data.value("protocol", std::string{}).rfind("tcp", 0) == 0 &&
                                      row.data.value("state", std::string{}) == "CLOSE_WAIT")))
@@ -948,7 +995,11 @@ void layout(Inspector &state)
     SelectObject(dc, previousFont);
     ReleaseDC(state.window, dc);
     int contentY = buttonsY + buttonHeight + toolbarGap;
-    RECT body{pageMargin, contentY, width - pageMargin, height - pageMargin};
+    const int footerY = height - toolbarMargin - buttonHeight;
+    place(state.targetOptions, toolbarMargin, footerY, scale(state.window, 80), buttonHeight);
+    place(state.closeButton, width - toolbarMargin - scale(state.window, 80), footerY,
+          scale(state.window, 80), buttonHeight);
+    RECT body{pageMargin, contentY, width - pageMargin, footerY - toolbarGap};
     // The tab frame never moves when changing pages. Search and status belong
     // inside that frame, like native Threads/Modules/Handles property pages.
     place(state.tabs, body.left, body.top, body.right - body.left, body.bottom - body.top);
@@ -961,9 +1012,18 @@ void layout(Inspector &state)
     {
         int fieldHeight = editHeight(state.window);
         int rowHeight = std::max(buttonHeight, fieldHeight);
-        place(state.filter, body.left, body.top + (rowHeight - fieldHeight) / 2, body.right - body.left,
+        place(state.pageOptions, body.left, body.top + (rowHeight - buttonHeight) / 2,
+              scale(state.window, 75), buttonHeight);
+        const int searchWidth =
+            std::min(scale(state.window, 260), static_cast<int>(body.right - body.left) - scale(state.window, 90));
+        place(state.filter, body.right - searchWidth, body.top + (rowHeight - fieldHeight) / 2, searchWidth,
               fieldHeight);
-        body.top += rowHeight + scale(state.window, 6);
+        body.top += rowHeight + scale(state.window, 4);
+    }
+    else if (!state.isService && (state.page == StacksPage || state.page == RuntimeStacksPage))
+    {
+        place(state.captureStack, body.left, body.top, scale(state.window, 170), buttonHeight);
+        body.top += buttonHeight + scale(state.window, 4);
     }
     if (state.statusVisible)
     {
@@ -1120,6 +1180,24 @@ void refresh(Inspector &state)
     submit(state.distro, std::move(request), state.mailbox, ++state.requestTag);
 }
 
+void refreshAfterMutation(Inspector &state)
+{
+    if (state.loading)
+    {
+        state.refreshAfterAction = true;
+        return;
+    }
+    state.refreshAfterAction = false;
+    Json request = state.isService ? Json{{"op", "service_details"}, {"name", state.service}}
+                                   : Json{{"op", "details"},
+                                          {"pid", state.process.at("pid")},
+                                          {"start_ticks", state.process.at("start_ticks")}};
+    state.pending = state.isService ? Operation::ServiceDetails : Operation::ProcessDetails;
+    state.loading = true;
+    updateActions(state);
+    submit(state.distro, std::move(request), state.mailbox, ++state.requestTag);
+}
+
 std::wstring allText(Inspector &state)
 {
     if (auto *table = activeTable(state))
@@ -1166,10 +1244,387 @@ std::wstring selectionText(Inspector &state)
     return result;
 }
 
-void command(Inspector &state, int id)
+void command(Inspector &state, int id);
+
+std::wstring descriptorType(const Json &value)
 {
+    const auto target = cell(value, "target");
+    if (target.rfind(L"socket:[", 0) == 0)
+        return L"Socket";
+    if (target.rfind(L"pipe:[", 0) == 0)
+        return L"Pipe";
+    if (target.rfind(L"anon_inode:", 0) == 0)
+        return L"Anonymous inode";
+    return !target.empty() && target.front() == L'/' ? L"File / directory" : L"Other";
+}
+
+void showStatistics(Inspector &state)
+{
+    auto *table = activeTable(state);
+    if (!table)
+        return;
+    const size_t index = static_cast<size_t>(table - state.tables.data());
+    std::map<std::wstring, uint64_t> counts;
+    uint64_t virtualBytes = 0;
+    for (const auto &row : state.snapshots[index])
+    {
+        const auto category = state.page == 1                          ? descriptorType(row.data)
+                              : state.page == 4                        ? cell(row.data, "state")
+                              : state.page == 3                        ? cell(row.data, "scope")
+                              : state.page == MemoryPage               ? cell(row.data, "permissions")
+                              : row.data.value("known_library", false) ? L"Standard libraries"
+                                                                       : L"Other modules";
+        ++counts[category];
+        virtualBytes += row.data.value("size_bytes", uint64_t{0});
+    }
+    Json report = {{"fields", Json::array()},
+                   {"text", "Counts describe the last collected snapshot, before view filters."}};
+    auto field = [&](const std::wstring &name, const std::wstring &value) {
+        report["fields"].push_back({{"name", utf8(name)}, {"value", utf8(value)}});
+    };
+    field(L"Collected objects", std::to_wstring(state.snapshots[index].size()));
+    field(L"Visible rows (including removal highlights)", std::to_wstring(table->rows.size()));
+    for (const auto &[name, count] : counts)
+        field(name, std::to_wstring(count));
+    if (state.page == MemoryPage || state.page == 2)
+        field(L"Mapped virtual bytes", bytes(virtualBytes));
+    if (!state.snapshotComplete[index])
+        report["text"] = "This collection is incomplete. Counts cover only the collected objects.";
+    openResourceReport(state.window, L"Statistics — " + state.distro, std::move(report));
+}
+
+void resourceAction(Inspector &state, int id)
+{
+    auto *table = activeTable(state);
+    const auto *selected = table ? table->selectedActionable() : nullptr;
+    if (!selected || state.loading)
+        return;
+    // Menus and new windows run nested message loops. Keep the identity and all
+    // menu input separate from the table's refreshable storage.
+    const Json row = selected->data;
+    if (state.page == 3)
+    {
+        const auto name = cell(row, "name"), value = cell(row, "value");
+        if (id == CopyIdentifier)
+        {
+            copyText(state.window, name);
+            return;
+        }
+        if (id == CopyAssignment)
+        {
+            copyText(state.window, name + L"=" + value);
+            return;
+        }
+        if (id == CopyShellAssignment)
+        {
+            const bool validName = !name.empty() && (iswalpha(name.front()) || name.front() == L'_') &&
+                                   std::all_of(name.begin(), name.end(), [](wchar_t c) {
+                                       return c == L'_' || (c >= L'a' && c <= L'z') ||
+                                              (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9');
+                                   });
+            if (!validName)
+            {
+                errorBox(state.window, L"This variable name is not a portable shell identifier.");
+                return;
+            }
+            std::wstring quoted = L"'";
+            for (wchar_t c : value)
+                quoted += c == L'\'' ? L"'\\''" : std::wstring(1, c);
+            copyText(state.window, name + L"=" + quoted + L"'");
+            return;
+        }
+        Json report{
+            {"fields",
+             Json::array(
+                 {{{"name", "Name"}, {"value", utf8(name)}},
+                  {{"name", "Value"}, {"value", utf8(value)}},
+                  {{"name", "Value length (UTF-16 units)"}, {"value", std::to_string(value.size())}},
+                  {{"name", "Environment classification"}, {"value", row.value("scope", "process")}}})},
+            {"text", utf8(value)}};
+        if (id == ViewPathEntries)
+        {
+            report["fields"] = Json::array();
+            size_t begin = 0, part = 1;
+            do
+            {
+                const auto end = value.find(L':', begin);
+                auto entry = value.substr(begin, end == std::wstring::npos ? end : end - begin);
+                report["fields"].push_back({{"name", std::to_string(part++)},
+                                            {"value", utf8(entry.empty() ? L"(current directory)" : entry)}});
+                if (end == std::wstring::npos)
+                    break;
+                begin = end + 1;
+            } while (part <= 1024);
+        }
+        openResourceReport(state.window, name + L" — " + state.distro, std::move(report));
+        return;
+    }
+    if (id == CopyIdentifier)
+    {
+        copyText(state.window, cell(row, state.page == 1   ? "fd"
+                                         : state.page == 4 ? "tid"
+                                         : state.page == 2 ? "base"
+                                                           : "start"));
+        return;
+    }
+    if (id == GoToMemory || id == GoToModule)
+    {
+        const int destination = id == GoToMemory ? MemoryPage : 2;
+        const size_t index = destination == MemoryPage ? MemoryTable : 1;
+        std::string key;
+        for (const auto &candidate : state.snapshots[index])
+            if (candidate.data.value("device", "") == row.value("device", "") &&
+                candidate.data.value("inode", uint64_t{0}) == row.value("inode", uint64_t{0}) &&
+                row.value("inode", uint64_t{0}) != 0)
+            {
+                key = candidate.key;
+                break;
+            }
+        if (key.empty())
+        {
+            errorBox(state.window, L"No matching object is present in the current snapshot.");
+            return;
+        }
+        state.page = destination;
+        // A navigation command must be able to reveal its destination even if
+        // the user previously hid that object category on the destination tab.
+        for (const auto &option : detailOptions(state.tables[index].kind))
+            if (!option.color && option.id != PadMemoryAddresses && option.id != PadModuleAddresses)
+                state.enabledOptions.erase(option.id);
+        SetWindowTextW(state.filter, L"");
+        applyFilter(state);
+        TabCtrl_SetCurSel(state.tabs, tabFromPage(state, destination));
+        showPage(state);
+        state.tables[index].selectKey(key);
+        state.tables[index].centerSelection();
+        return;
+    }
+    if (id == GoToSocket)
+    {
+        const auto target = row.value("target", std::string{});
+        if (target.rfind("socket:[", 0) != 0)
+            return;
+        state.pendingSocket = target.substr(8, target.size() - 9);
+        state.page = ConnectionsPage;
+        state.connectionsAttempted = false;
+        SetWindowTextW(state.filter, L"");
+        TabCtrl_SetCurSel(state.tabs, tabFromPage(state, ConnectionsPage));
+        showPage(state);
+        return;
+    }
+    Json request = {{"op", state.page == 4 ? "thread" : "resource"},
+                    {"pid", state.process.at("pid")},
+                    {"start_ticks", state.process.at("start_ticks")},
+                    {"row", row},
+                    {"action", "properties"}};
+    if (state.page != 4)
+        request["kind"] = state.page == 1 ? "handle" : state.page == 2 ? "module" : "memory";
+    std::wstring title = L"Properties";
+    std::vector<ResourceInput> inputs;
+    bool mutation = false;
     switch (id)
     {
+    case ReadMemory:
+        request["action"] = "read";
+        title = L"Read memory";
+        inputs = {{L"Address (hex)", "address", L"0x" + cell(row, "start")},
+                  {L"Bytes (maximum 1 MB)", "length", L"4096"}};
+        break;
+    case MemoryStrings:
+        request["action"] = "strings";
+        title = L"Find strings in memory";
+        inputs = {{L"Minimum characters", "minimum_length", L"4"},
+                  {L"Maximum bytes (up to 16 MB)", "maximum_bytes", L"1048576"}};
+        break;
+    case ModuleExports:
+    case ModuleImports:
+        request["action"] = "symbols";
+        request["inputs"]["symbols"] = id == ModuleExports ? "exports" : "imports";
+        title = id == ModuleExports ? L"Exported ELF symbols" : L"Imported ELF symbols";
+        break;
+    case ModuleDependencies:
+        request["action"] = "dependencies";
+        title = L"Declared ELF dependencies";
+        break;
+    case KernelStack:
+        request["action"] = "kernel_stack";
+        title = L"Kernel stack and wait diagnostics";
+        break;
+    case ThreadNice:
+        request["action"] = "set_nice";
+        title = L"Thread niceness";
+        mutation = true;
+        inputs = {{L"Niceness (-20 to 19)", "nice", cell(row, "nice")}};
+        break;
+    case ThreadAffinity:
+        request["action"] = "set_affinity";
+        title = L"Thread CPU affinity";
+        mutation = true;
+        inputs = {{L"CPU list (for example 0-3,5)", "cpus", L""}};
+        break;
+    case ThreadPolicy:
+        request["action"] = "set_policy";
+        title = L"Thread scheduling policy";
+        mutation = true;
+        inputs = {{L"Policy (other, batch, idle)", "policy", L"other"}};
+        break;
+    case ThreadIoPriority:
+        request["action"] = "set_io_priority";
+        title = L"Thread I/O priority";
+        mutation = true;
+        inputs = {{L"Class (none, best-effort, idle)", "class", L"best-effort"},
+                  {L"Level (0 highest, 7 lowest)", "level", L"4"}};
+        break;
+    }
+    title += L" — " + cell(state.process, "name") + L" (" + cell(state.process, "pid") + L" @ " +
+             state.distro + L")";
+    openResourceTool(state.window, state.distro, std::move(request), title, std::move(inputs), mutation);
+}
+
+void appendResourceActions(Inspector &state, HMENU menu)
+{
+    auto *table = activeTable(state);
+    const auto row = table ? table->selectedActionable() : nullptr;
+    const UINT flags = MF_STRING | (row && !state.loading ? 0 : MF_GRAYED);
+    auto add = [&](int id, const wchar_t *label) { AppendMenuW(menu, flags, id, label); };
+    if (state.page != ConnectionsPage)
+        add(ResourceProperties, state.page == MemoryPage ? L"Mapping properties…" : L"Properties…\tEnter");
+    if (state.page == 4)
+    {
+        add(CaptureStack, L"View native stack…");
+        add(KernelStack, L"Kernel stack / wait diagnostics…");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        add(ThreadNice, L"Niceness…");
+        add(ThreadAffinity, L"CPU affinity…");
+        add(ThreadPolicy, L"Scheduling policy…");
+        add(ThreadIoPriority, L"I/O priority…");
+        add(CopyIdentifier, L"Copy thread ID");
+    }
+    if (state.page == 2)
+    {
+        add(ModuleExports, L"Exported symbols…");
+        add(ModuleImports, L"Imported symbols…");
+        add(ModuleDependencies, L"Declared dependencies…");
+        add(GoToMemory, L"Go to memory region");
+        add(CopyIdentifier, L"Copy base address");
+    }
+    if (state.page == MemoryPage)
+    {
+        const bool readable =
+            row && row->data.value("permissions", std::string{}).find('r') != std::string::npos;
+        AppendMenuW(menu, flags | (readable ? 0 : MF_GRAYED), ReadMemory, L"Read memory…\tEnter");
+        AppendMenuW(menu, flags | (readable ? 0 : MF_GRAYED), MemoryStrings, L"Find strings…");
+        add(GoToModule, L"Go to module");
+        add(CopyIdentifier, L"Copy address");
+    }
+    if (state.page == 1)
+    {
+        const bool socket = row && row->data.value("target", std::string{}).rfind("socket:[", 0) == 0;
+        AppendMenuW(menu, flags | (socket ? 0 : MF_GRAYED), GoToSocket, L"Go to network connection");
+        add(CopyIdentifier, L"Copy descriptor number");
+    }
+    if (state.page == 3)
+    {
+        add(CopyIdentifier, L"Copy name");
+        add(CopyValue, L"Copy value\tCtrl+Shift+C");
+        add(CopyAssignment, L"Copy NAME=value");
+        add(CopyShellAssignment, L"Copy shell assignment");
+        add(ViewPathEntries, L"View colon-separated entries…");
+    }
+    if (state.page == 1 || state.page == 2 || state.page == MemoryPage)
+    {
+        AppendMenuW(menu, flags | (canOpen(selectedPath(state, true)) ? 0 : MF_GRAYED), OpenLocation,
+                    L"Open file location\tCtrl+Enter");
+        add(CopyPath, L"Copy path\tCtrl+Shift+C");
+    }
+    if (state.page != ConnectionsPage)
+        SetMenuDefaultItem(menu, state.page == MemoryPage ? ReadMemory : ResourceProperties, FALSE);
+}
+
+void showPageOptions(Inspector &state)
+{
+    auto *table = activeTable(state);
+    if (!table)
+        return;
+    HMENU menu = CreatePopupMenu();
+    HMENU highlights = CreatePopupMenu();
+    for (const auto &option : detailOptions(table->kind))
+    {
+        UINT flags = MF_STRING | (state.enabledOptions.count(option.id) ? MF_CHECKED : 0);
+        std::wstring label = option.label;
+        if (option.color && !WslHostIntegerSetting((std::wstring(L"Use") + option.color).c_str()))
+        {
+            flags = MF_STRING | MF_GRAYED;
+            label += L" (disabled globally)";
+        }
+        AppendMenuW(option.color ? highlights : menu, flags, option.id, label.c_str());
+    }
+    if (GetMenuItemCount(highlights))
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(highlights), L"Highlighting");
+    else
+        DestroyMenu(highlights);
+    if (GetMenuItemCount(menu))
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, Statistics, L"Statistics…");
+    HMENU selection = CreatePopupMenu();
+    appendResourceActions(state, selection);
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(selection), L"Selected object");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, Save, L"Save…\tCtrl+S");
+    RECT bounds{};
+    GetWindowRect(state.pageOptions, &bounds);
+    const HWND owner = state.window;
+    const auto identity = reinterpret_cast<LONG_PTR>(&state);
+    const int id =
+        TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, bounds.left, bounds.bottom, 0, owner, nullptr);
+    DestroyMenu(menu);
+    if (id && IsWindow(owner) && GetWindowLongPtrW(owner, GWLP_USERDATA) == identity)
+        command(state, id);
+}
+
+void commandImpl(Inspector &state, int id)
+{
+    if (auto *table = activeTable(state))
+        for (const auto &option : detailOptions(table->kind))
+            if (id == option.id)
+            {
+                if (!state.enabledOptions.erase(id))
+                    state.enabledOptions.insert(id);
+                writeSetting((std::wstring(L"Inspector.") + option.key).c_str(),
+                             state.enabledOptions.count(id) ? 1 : 0);
+                applyFilter(state);
+                return;
+            }
+    if (id >= ResourceProperties && id <= ThreadIoPriority)
+    {
+        if (id == Statistics)
+            showStatistics(state);
+        else
+            resourceAction(state, id);
+        return;
+    }
+    switch (id)
+    {
+    case PageOptions:
+        showPageOptions(state);
+        break;
+    case TargetOptions: {
+        const HWND owner = state.window;
+        const auto identity = reinterpret_cast<LONG_PTR>(&state);
+        Json target = state.process.is_object() ? state.process : Json::object();
+        if (state.overviewData.is_object())
+            target.update(state.overviewData);
+        auto request = targetOptions(state.window, state.targetOptions, state.distro, target, state.service,
+                                     state.loading);
+        if (request && IsWindow(owner) && GetWindowLongPtrW(owner, GWLP_USERDATA) == identity)
+        {
+            state.loading = true;
+            state.pending = Operation::TargetAction;
+            updateActions(state);
+            submit(state.distro, std::move(*request), state.mailbox, ++state.requestTag);
+        }
+        break;
+    }
     case Refresh:
         refresh(state);
         break;
@@ -1221,6 +1676,18 @@ void command(Inspector &state, int id)
     }
 }
 
+void command(Inspector &state, int id)
+{
+    const HWND owner = state.window;
+    const auto identity = reinterpret_cast<LONG_PTR>(&state);
+    try { commandImpl(state, id); }
+    catch (const std::exception &error)
+    {
+        if (IsWindow(owner) && GetWindowLongPtrW(owner, GWLP_USERDATA) == identity)
+            errorBox(owner, wide(error.what()));
+    }
+}
+
 void contextMenu(Inspector &state, HWND source, LPARAM position)
 {
     Table *table = activeTable(state);
@@ -1240,40 +1707,30 @@ void contextMenu(Inspector &state, HWND source, LPARAM position)
     HMENU menu = CreatePopupMenu();
     if (!menu)
         return;
-    AppendMenuW(menu, MF_STRING, CopySelection, L"Copy &selection\tCtrl+C");
-    AppendMenuW(menu, MF_STRING, CopyAll, L"Copy &all");
-    AppendMenuW(menu, MF_STRING, Save, L"&Save this view…\tCtrl+S");
-    if (state.page == 1 || state.page == 2 || state.page == MemoryPage)
-    {
-        std::wstring path = selectedPath(state);
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING | (state.loading || !canOpen(selectedPath(state, true)) ? MF_GRAYED : 0),
-                    OpenLocation, L"&Open location\tEnter");
-        AppendMenuW(menu, MF_STRING | (path.empty() ? MF_GRAYED : 0), CopyPath, L"Copy &path\tCtrl+Shift+C");
-    }
-    else if (state.page == 3)
-    {
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING | (table->selected() ? 0 : MF_GRAYED), CopyValue,
-                    L"Copy &value\tCtrl+Shift+C");
-    }
-    if (state.page == 1 || state.page == 2 || state.page == MemoryPage)
-        SetMenuDefaultItem(menu, OpenLocation, FALSE);
+    appendResourceActions(state, menu);
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, CopySelection, L"Copy selection\tCtrl+C");
+    AppendMenuW(menu, MF_STRING, CopyAll, L"Copy all");
+    AppendMenuW(menu, MF_STRING, Save, L"Save this view…\tCtrl+S");
+    const HWND owner = state.window;
+    const auto identity = reinterpret_cast<LONG_PTR>(&state);
     int selected =
         TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, state.window, nullptr);
     DestroyMenu(menu);
-    if (selected)
+    if (selected && IsWindow(owner) && GetWindowLongPtrW(owner, GWLP_USERDATA) == identity)
         command(state, selected);
 }
 
 void syncRuntimeTab(Inspector &state, const Json &data);
 
-std::wstring mappedAddress(const Json &value, const char *key)
+std::wstring mappedAddress(const Json &value, const char *key, bool pad)
 {
     std::wstring address = cell(value, key);
     if (address.empty())
         return address;
-    if (address.size() < 16)
+    const auto significant = address.find_first_not_of(L'0');
+    address = significant == std::wstring::npos ? L"0" : address.substr(significant);
+    if (pad && address.size() < 16)
         address.insert(0, 16 - address.size(), L'0');
     return L"0x" + address;
 }
@@ -1332,16 +1789,21 @@ void loadProcessDetails(Inspector &state, const Json &data)
                 switch (index)
                 {
                 case 0:
-                    row.cells = {cell(value, "fd"), cell(value, "target"),
+                    row.cells = {cell(value, "fd"),
+                                 cell(value, "target"),
                                  value.contains("flags_text") ? cell(value, "flags_text")
-                                                              : cell(value, "flags")};
+                                                              : cell(value, "flags"),
+                                 descriptorType(value),
+                                 cell(value, "position"),
+                                 cell(value, "mount_id"),
+                                 cell(value, "inode")};
                     row.key = rowKey(value, "fd") + ":" + rowKey(value, "target");
                     break;
                 case 1:
                     row.cells = {cell(value, "path"),
                                  mappedAddress(value, "base"),
                                  mappedAddress(value, "end"),
-                                 cell(value, "size_bytes"),
+                                 bytes(value.value("size_bytes", uint64_t{0})),
                                  cell(value, "device"),
                                  cell(value, "inode"),
                                  deletedText};
@@ -1350,20 +1812,23 @@ void loadProcessDetails(Inspector &state, const Json &data)
                         row.key = rowKey(value, "device") + ":" + rowKey(value, "inode");
                     break;
                 case 2:
-                    row.cells = {cell(value, "name"), cell(value, "value")};
+                    row.cells = {cell(value, "name"), cell(value, "value"), cell(value, "scope")};
                     row.key = rowKey(value, "name");
                     row.key += ":" + std::to_string(nameOccurrences[row.key]++);
                     break;
                 case 3:
-                    row.cells = {cell(value, "tid"), cell(value, "name"), cell(value, "state"),
-                                 cell(value, "wchan")};
-                    row.key = rowKey(value, "tid");
+                    row.cells = {
+                        cell(value, "tid"),          cell(value, "name"),       cell(value, "state"),
+                        cell(value, "wchan"),        cell(value, "nice"),       cell(value, "priority"),
+                        cell(value, "policy"),       cell(value, "processor"),  cell(value, "user_ticks"),
+                        cell(value, "kernel_ticks"), cell(value, "start_ticks")};
+                    row.key = rowKey(value, "tid") + ":" + rowKey(value, "start_ticks");
                     break;
                 case MemoryTable: {
                     std::wstring backing = cell(value, "path");
                     row.cells = {mappedAddress(value, "start"),
                                  mappedAddress(value, "end"),
-                                 cell(value, "size_bytes"),
+                                 bytes(value.value("size_bytes", uint64_t{0})),
                                  cell(value, "permissions"),
                                  mappedAddress(value, "offset"),
                                  backing.empty() ? L"[anonymous]" : backing,
@@ -1377,6 +1842,21 @@ void loadProcessDetails(Inspector &state, const Json &data)
                               rowKey(value, "offset");
                     break;
                 }
+                }
+                if (index == 1 || index == MemoryTable)
+                {
+                    row.numeric[index == 1 ? 3 : 2] = value.value("size_bytes", 0.0);
+                    for (const auto &address : std::vector<std::pair<size_t, const char *>>{
+                             {index == 1 ? 1u : 0u, index == 1 ? "base" : "start"},
+                             {index == 1 ? 2u : 1u, "end"}})
+                        try
+                        {
+                            row.numeric[address.first] = static_cast<double>(
+                                std::stoull(value.value(address.second, "0"), nullptr, 16));
+                        }
+                        catch (const std::exception &)
+                        {
+                        }
                 }
                 rows.push_back(std::move(row));
             }
@@ -1639,6 +2119,17 @@ void loadReply(Inspector &state, const Reply &reply)
     const bool runtimeStacks = completed == Operation::RuntimeStacks;
     auto &notice = operationNotice(state, completed);
     state.loading = false;
+    if (completed == Operation::TargetAction)
+    {
+        if (!reply.error.empty())
+        {
+            updateActions(state);
+            errorBox(state.window, wide(reply.error));
+        }
+        else
+            refreshAfterMutation(state);
+        return;
+    }
     auto choice = reply.data.find("choice_required");
     if (runtimeStacks && state.runtime == "node" && reply.error.empty() && choice != reply.data.end() &&
         choice->is_boolean() && choice->get<bool>())
@@ -1700,6 +2191,22 @@ void loadReply(Inspector &state, const Reply &reply)
         }
         if (!state.isService && !stacks && !runtimeStacks)
             applyFilter(state);
+        if (network && !state.pendingSocket.empty())
+        {
+            for (const auto &row : state.tables[ConnectionsTable].rows)
+                if (cell(row.data, "inode") == wide(state.pendingSocket))
+                {
+                    state.tables[ConnectionsTable].selectKey(row.key);
+                    state.tables[ConnectionsTable].centerSelection();
+                    break;
+                }
+            state.pendingSocket.clear();
+        }
+    }
+    if (state.refreshAfterAction)
+    {
+        refreshAfterMutation(state);
+        return;
     }
     ensureConnections(state);
     updateActions(state);
@@ -1749,7 +2256,7 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             else if (shift && (page == 1 || page == 2 || page == MemoryPage))
                 id = CopyPath;
         }
-        if (ctrl && wParam == 'F')
+        if (ctrl && (wParam == 'F' || wParam == 'K'))
         {
             auto state = reinterpret_cast<Inspector *>(GetWindowLongPtrW(inspector, GWLP_USERDATA));
             HWND filter = state ? state->filter : nullptr;
@@ -1786,8 +2293,15 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         }
         if (wParam == VK_RETURN)
         {
-            if (controlId == Files || controlId == Modules || controlId == Memory)
+            if (controlId == Files || controlId == Modules || controlId == Threads ||
+                controlId == Environment)
+                id = ResourceProperties;
+            else if (controlId == Memory)
+                id = ReadMemory;
+            if (ctrl && (controlId == Files || controlId == Modules || controlId == Memory))
                 id = OpenLocation;
+            else if (controlId == PageOptions || controlId == TargetOptions || controlId == IDCANCEL)
+                id = controlId;
             else if ((controlId >= Refresh && controlId <= CopyValue) || controlId == ClearFilter ||
                      controlId == CaptureStack)
                 id = controlId;
@@ -2014,6 +2528,8 @@ void createControls(Inspector &state)
     state.value = control(window, WC_BUTTONW, L"Copy &value", BS_PUSHBUTTON | WS_TABSTOP, CopyValue);
     state.captureStack =
         control(window, WC_BUTTONW, L"Capture all &stacks…", BS_PUSHBUTTON | WS_TABSTOP, CaptureStack);
+    state.targetOptions = control(window, WC_BUTTONW, L"&Options", BS_PUSHBUTTON | WS_TABSTOP, TargetOptions);
+    state.closeButton = control(window, WC_BUTTONW, L"Close", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL);
     state.tabs = control(window, WC_TABCONTROLW, L"Detail categories",
                          WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, Tabs);
     SetWindowLongPtrW(state.tabs, GWL_EXSTYLE,
@@ -2021,9 +2537,12 @@ void createControls(Inspector &state)
     SetWindowSubclass(state.tabs, tabPageProc, 2, reinterpret_cast<DWORD_PTR>(window));
     state.pageWindow = control(state.tabs, PageClass, L"", WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0);
     SetWindowLongPtrW(state.pageWindow, GWL_EXSTYLE, WS_EX_CONTROLPARENT);
+    SetParent(state.captureStack, state.pageWindow);
     if (!state.isService)
     {
         state.filter = control(state.pageWindow, WC_EDITW, L"", WS_TABSTOP | ES_AUTOHSCROLL, Filter);
+        state.pageOptions =
+            control(state.pageWindow, WC_BUTTONW, L"Options", BS_PUSHBUTTON | WS_TABSTOP, PageOptions);
     }
     std::vector<std::wstring> names =
         state.isService
@@ -2068,12 +2587,18 @@ void createControls(Inspector &state)
         if (!state.runtime.empty())
             createRuntimeStackControl(state);
         state.tables[0].create(state.pageWindow, Files,
-                               {{L"FD", 65, true}, {L"Target", 520}, {L"Flags", 170}});
+                               {{L"FD", 65, true},
+                                {L"Target", 520},
+                                {L"Flags", 170},
+                                {L"Type", 120, false, false},
+                                {L"Position", 110, true, false},
+                                {L"Mount ID", 95, true, false},
+                                {L"Inode", 110, true, false}});
         state.tables[1].create(state.pageWindow, Modules,
                                {{L"Module path", 350},
                                 {L"Base address", 145},
                                 {L"End address", 145},
-                                {L"Mapped bytes", 110, true},
+                                {L"Mapped size", 110, true},
                                 {L"Device", 85},
                                 {L"Inode", 105, true},
                                 {L"Deleted", 65}});
@@ -2081,16 +2606,27 @@ void createControls(Inspector &state)
         state.tables[MemoryTable].create(state.pageWindow, Memory,
                                          {{L"Start address", 145},
                                           {L"End address", 145},
-                                          {L"Size (bytes)", 110, true},
+                                          {L"Size", 110, true},
                                           {L"Protection", 85},
                                           {L"File offset", 145},
                                           {L"Backing", 350},
                                           {L"Device", 85},
                                           {L"Inode", 105, true},
                                           {L"Deleted", 65}});
-        state.tables[2].create(state.pageWindow, Environment, {{L"Variable", 230}, {L"Value", 600}});
+        state.tables[2].create(state.pageWindow, Environment,
+                               {{L"Variable", 230}, {L"Value", 600}, {L"Classification", 120, false, false}});
         state.tables[3].create(state.pageWindow, Threads,
-                               {{L"TID", 85, true}, {L"Name", 210}, {L"State", 100}, {L"Wait channel", 390}});
+                               {{L"TID", 85, true},
+                                {L"Name", 210},
+                                {L"State", 100},
+                                {L"Wait channel", 390},
+                                {L"Niceness", 80, true, false},
+                                {L"Priority", 80, true, false},
+                                {L"Scheduling policy", 130, false, false},
+                                {L"Last CPU", 80, true, false},
+                                {L"User time (ticks)", 120, true, false},
+                                {L"Kernel time (ticks)", 120, true, false},
+                                {L"Start time (ticks)", 120, true, false}});
         state.tables[ConnectionsTable].create(state.pageWindow, Connections,
                                               {{L"Protocol", 85},
                                                {L"Local address", 195},
@@ -2105,6 +2641,11 @@ void createControls(Inspector &state)
         state.tables[MemoryTable].kind = Table::Kind::Memory;
         state.tables[3].kind = Table::Kind::Threads;
         state.tables[ConnectionsTable].kind = Table::Kind::Network;
+        for (auto &table : state.tables)
+            for (const auto &option : detailOptions(table.kind))
+                if (readSetting((std::wstring(L"Inspector.") + option.key).c_str(),
+                                option.defaultEnabled ? 1 : 0))
+                    state.enabledOptions.insert(option.id);
         const wchar_t *labels[] = {L"Open file descriptors",       L"Loaded ELF modules",
                                    L"Environment variables",       L"Process threads",
                                    L"Process network connections", L"Virtual memory mappings"};
@@ -2117,7 +2658,7 @@ void createControls(Inspector &state)
     SetWindowSubclass(window, inspectorColorsProc, 3, 0);
     EnumChildWindows(window, styleInspectorControl, 0);
     if (state.filter)
-        WslCreateSearch(state.pageWindow, state.filter, L"Search this view (Ctrl+F)", filterChanged, &state);
+        WslCreateSearch(state.pageWindow, state.filter, L"Search this view (Ctrl+K)", filterChanged, &state);
     createTooltips(state);
     updateInspectorFonts(state);
     showPage(state);
@@ -2207,8 +2748,8 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
             if (hdr->code == LVN_ODFINDITEMW)
                 return table.findItem(*reinterpret_cast<NMLVFINDITEMW *>(hdr));
             table.notify(hdr);
-            if (hdr->code == NM_DBLCLK && (state->page == 1 || state->page == 2 || state->page == MemoryPage))
-                command(*state, OpenLocation);
+            if (hdr->code == NM_DBLCLK && state->page != ConnectionsPage)
+                command(*state, state->page == MemoryPage ? ReadMemory : ResourceProperties);
             if (hdr->code == LVN_ITEMCHANGED)
                 updateActions(*state);
             break;
@@ -2221,6 +2762,9 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
             loadReply(*state, *reply);
         return 0;
     }
+    case ResourceActionCompleted:
+        refreshAfterMutation(*state);
+        return 0;
     case WM_CLOSE:
         DestroyWindow(window);
         return 0;

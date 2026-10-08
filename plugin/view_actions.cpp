@@ -1,3 +1,4 @@
+#include "target_actions.hpp"
 #include "controller.hpp"
 #include "view_state.hpp"
 
@@ -46,6 +47,9 @@ void goToProcess(View &v, const Json &process)
 }
 void action(View &v, int id)
 {
+    if (v.page == 0 && v.table().selectedActionable() &&
+        openProcessScheduling(v.window, v.selectedDistro, v.table().selectedActionable()->data, id))
+        return;
     const Row *selected = v.table().selected();
     if (!selected)
         return;
@@ -235,6 +239,9 @@ void menu(View &v, POINT point)
         AppendMenuW(popup, MF_STRING, CopyCommand, L"Copy command line");
         AppendMenuW(popup, MF_STRING, OpenExecutable, L"Show executable in Explorer");
         AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+        appendProcessSchedulingMenu(popup, v.table().selectedActionable() != nullptr, v.selectedDistro,
+                                    v.table().selected()->data);
+        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(popup, MF_STRING, Terminate, L"Terminate — SIGTERM");
         AppendMenuW(popup, MF_STRING, InterruptSignal, L"Interrupt — SIGINT");
         AppendMenuW(popup, MF_STRING, Kill, L"Force kill — SIGKILL");
@@ -260,8 +267,8 @@ void menu(View &v, POINT point)
         AppendMenuW(popup, MF_STRING, DisableService, L"Disable at boot");
         const auto unit = row ? row->data.value("name", std::string{}) : std::string{};
         if (unit.size() >= 9 && unit.compare(unit.size() - 9, 9, "@.service") == 0)
-            for (int command : {StartService, StopService, RestartService, ReloadService,
-                                EnableService, DisableService})
+            for (int command :
+                 {StartService, StopService, RestartService, ReloadService, EnableService, DisableService})
                 EnableMenuItem(popup, command, MF_BYCOMMAND | MF_GRAYED);
     }
     if (!v.table().selectedActionable())

@@ -148,11 +148,12 @@ Returns:
 - `summary`: human-readable status, I/O counters, cgroups, resource limits,
   namespace IDs, executable path, and current working directory. Status includes
   UIDs/GIDs, capability masks, seccomp state, and other kernel-provided fields.
-- `files`: `{fd,target,flags,flags_text,inherited}`. `flags` is the original octal
-  `/proc` flag string; `flags_text` contains symbolic names and a hexadecimal value
-  (or `Unknown`). `inherited` means known flags without `O_CLOEXEC`, an exec-survival
-  approximation rather than proof of fork inheritance. Targets may be paths,
-  sockets, pipes, anonymous handles, or deleted paths.
+- `files`: `{fd,target,flags,flags_text,inherited,position,mount_id,inode}`.
+  `flags` is the original octal `/proc` flag string; `flags_text` contains symbolic
+  names and a hexadecimal value (or `Unknown`). `inherited` means known flags
+  without `O_CLOEXEC`, an exec-survival approximation rather than proof of fork
+  inheritance. Position, mount ID, and inode come from `fdinfo`; targets may be
+  paths, sockets, pipes, anonymous handles, or deleted paths.
 - `modules`: verified ELF executable/shared-object images that have an executable
   mapping. One object is returned per device/inode identity, with `path`, `base`,
   `end`, `size_bytes`/`mapped_bytes`, `device`, `inode`, `identity`, `deleted`,
@@ -177,9 +178,11 @@ Returns:
   `/etc/environment`, then `user` for exact account `USER`, `LOGNAME`, `HOME` or
   `SHELL` matches, otherwise `process`. Shell expansions are not evaluated. These
   are matching baselines, not evidence of where a value was inherited.
-- `threads`: `{tid,name,state,wchan,wait_kind}` entries. Wait kind is `suspended`,
-  `delay`, `alert` (futex), `queue`, `executive`, `user_request`, or empty. These
-  descriptive Linux wait-channel analogues are not Windows wait-reason IDs.
+- `threads`: `{pid,tid,name,state,start_ticks,nice,priority,processor,policy,
+  user_ticks,kernel_ticks,wchan,wait_kind}` entries. Start time and CPU counters
+  are Linux clock ticks. Wait kind is `suspended`, `delay`, `alert` (futex),
+  `queue`, `executive`, `user_request`, or empty. These descriptive Linux
+  wait-channel analogues are not Windows wait-reason IDs.
 - `files_accessible`, `modules_accessible`, `memory_accessible`: availability
   indicators. `modules_unverified` counts executable mapped files that could not
   be checked as ELF images. `module_classification_note` explains what appears
@@ -196,6 +199,92 @@ memory, and environment arrays each have a 1 MiB budget; threads have 512 KiB. S
 text is capped at 256 KiB. These limits keep detail responses below the Windows
 transport limit even when paths contain characters requiring JSON escapes.
 A partial final environment value is omitted instead of presenting it as complete.
+
+### `resource` (`pid`, `start_ticks`, `kind`, `action`, `row`, optional `inputs`)
+
+Runs one explicit inspection against a selected process resource. It does not
+change process state. The response data has `title`, `fields` (an array of
+`{name,value}` strings), `text`, and `truncated`; memory reads also return
+`data_hex` and `suggested_filename` for binary export. The process identity is
+checked around inspection. Rows identify the selected object from the current
+`details` response rather than trusting a stale row number.
+
+| `kind` | `action` | Behavior |
+| --- | --- | --- |
+| `handle` | `properties` | Combines `fdinfo` with file metadata and any lock information exposed by the kernel. `row` supplies `fd` and `target`; `inode` and `mount_id` are checked when present. |
+| `module` | `properties` | Reads ELF headers, program and section headers, notes, and dynamic metadata with `readelf`. `row` supplies the module `path`, `base`, `end`, `device`, and `inode`. |
+| `module` | `symbols` | Reads ELF symbols with `readelf`. `inputs.symbols` is `all` (default), `exports`, or `imports`. Export/import views select externally visible defined/undefined dynamic symbols respectively. |
+| `module` | `dependencies` | Reads `DT_NEEDED`, `SONAME`, `RPATH`, and `RUNPATH` metadata. It does not execute the mapped image or run `ldd`; it reports declared names and search paths, not resolved dependency paths. |
+| `memory` | `properties` | Reads `smaps` properties and VM flags for the selected mapping. `row` supplies the mapping's `start`, `end`, `permissions`, `offset`, `device`, `inode`, and `path`. |
+| `memory` | `read` | Reads bytes from the selected readable mapping. `inputs` supplies `address` and `length`; the length is 1 through 1,048,576 bytes. |
+| `memory` | `strings` | Scans the selected mapping for printable ASCII and UTF-16LE strings. `inputs.minimum_length` is 2–4096 characters (default 4); `inputs.maximum_bytes` is 1–16,777,216 bytes (default 1 MiB). |
+
+The memory mapping list must fit within 8 MiB. A `smaps` lookup scans at most
+64 MiB or three seconds and caps the selected record at 64 KiB. Memory reads and
+string scans use `process_vm_readv`, stop after three seconds, and return a partial
+result when a readable range ends early if any bytes were read; a read that gets
+no bytes returns an error. A memory read's text is a hex/ASCII display; `data_hex`
+is the captured raw byte sequence for saving as a binary file.
+String output is capped at 2 MiB; individual displayed strings are capped at
+4,096 characters. These reads do not suspend the process, so data can change
+during collection.
+
+Module inspection requires `readelf` in a trusted system location. Each command
+has a five-second deadline and 2 MiB output limit. The helper pins the mapped file
+and checks its device/inode and metadata before and after parsing; it never runs
+the target image. Handle properties read at most 256 KiB from `fdinfo`, use
+`O_PATH` or metadata-only `stat` access, and check the descriptor target and
+identity again before returning. Kernel restrictions can make individual fields
+unavailable. These operations are on demand and never run as part of a refresh.
+
+### `thread` (`pid`, `start_ticks`, `action`, optional `row`, `inputs`, `all_threads`, `expected_exe`)
+
+Provides thread diagnostics and Linux scheduler controls. For a single thread,
+`row` contains its `tid` and thread `start_ticks` from `details.threads`.
+`properties` returns fields for identity, state, niceness, priority, scheduling
+policy, current CPU and affinity, I/O priority, CPU times, context switches,
+wait channel, current syscall, and kernel stack where readable. `kernel_stack`
+returns the kernel stack/wait diagnostics as text. Scheduling actions are
+`set_nice` (`inputs.nice`, -20 through 19), `set_affinity`
+(`inputs.cpus`, for example `0-3,5`), `set_policy`
+(`inputs.policy`: `other`, `batch`, or `idle`), and `set_io_priority`
+(`inputs.class`: `none`, `best-effort`, or `idle`; best-effort also uses
+`inputs.level`, 0 through 7). Real-time and deadline policies cannot be changed
+through this interface. CPU affinity accepts only online CPUs, with IDs up to
+8191. I/O-priority effects depend on the block-device scheduler.
+
+For example, inspect one thread with:
+
+```json
+{"id":7,"op":"thread","pid":123,"start_ticks":4567,"action":"properties","row":{"tid":124,"start_ticks":9876}}
+```
+
+`all_threads:true` is supported for the four scheduling actions only. It takes
+one initial snapshot of the process's current TIDs and thread start times, then
+attempts the setting separately for each captured thread. `expected_exe`, when
+provided, must be an absolute path and must exactly match the process's current
+resolved `/proc/PID/exe` path before each mutation; saved executable rules use
+this check to avoid applying after `exec()` changes the image. The operation
+considers at most 8,192 threads and has a five-second overall limit. Its response
+reports `updated`, `failed`, `not_attempted`, `complete`, and
+`mutation_applied`, with per-thread diagnostics in `text` and summary `fields`;
+diagnostic text is capped at 512 KiB. Some threads can be changed even when the
+overall result is incomplete. The operation is not atomic, and threads created
+after enumeration follow Linux's normal inheritance rules.
+
+Linux scheduler syscalls take numeric TIDs rather than a stable thread handle.
+The helper checks process and thread start times and the optional executable
+path immediately around each mutation, but cannot eliminate the narrow TID
+exit/reuse race between a check and the syscall. This is also why process-wide
+controls are implemented as separate actions on the current thread set, rather
+than as a claim of an atomic process-wide scheduler setting.
+
+For example, set affinity on the current process threads while checking that its
+executable still has the expected path:
+
+```json
+{"id":8,"op":"thread","pid":123,"start_ticks":4567,"all_threads":true,"action":"set_affinity","expected_exe":"/usr/bin/node","inputs":{"cpus":"0-3"}}
+```
 
 ### `find_handles` (`query`, optional `enumerate`, `case_sensitive`)
 
