@@ -381,6 +381,10 @@ std::wstring overviewValue(const Inspector &state, const OverviewField &field)
     std::wstring value = cell(state.overviewData, field.key);
     if (value.empty())
     {
+        // An empty unit after a successful cgroup read means no owning service.
+        if (!state.isService && key == "service_unit" && state.overviewData.contains("service_unit") &&
+            !cell(state.overviewData, "cgroup").empty())
+            return L"(none)";
         if (state.isService && (std::string(field.key) == "user" || std::string(field.key) == "group"))
             return L"Systemd default";
         return L"Not available";
