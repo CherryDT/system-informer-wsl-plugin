@@ -136,18 +136,19 @@ Json snapshotRequest(const View &v)
         return false;
     };
     auto enabled = [](PCWSTR name) { return WslHostIntegerSetting(name) != 0; };
-    if (needs({ProcessUser}))
+    const bool tooltips = enabled(L"EnableTooltipSupport");
+    if (needs({ProcessUser}) || tooltips)
         fields.insert("user");
     // Search is intentionally restricted to the data actually collected. The
     // command line remains searchable when its column is visible (the default).
-    if (needs({ProcessCommand}))
+    if (needs({ProcessCommand}) || (tooltips && enabled(L"EnableCommandLineTooltips")))
         fields.insert("command");
     if (needs({ProcessRead, ProcessWrite, ProcessReadTotal, ProcessWriteTotal, ProcessReadChars,
                ProcessWriteChars, ProcessReadCalls, ProcessWriteCalls}))
         fields.insert("io");
-    if (needs({ProcessExecutable}))
+    if (needs({ProcessExecutable}) || tooltips)
         fields.insert("exe");
-    if (needs({ProcessDirectory}))
+    if (needs({ProcessDirectory}) || tooltips)
         fields.insert("cwd");
     if (needs({ProcessCgroup}) || enabled(L"UseColorServiceProcesses") || enabled(L"EnableTooltipSupport"))
         fields.insert("cgroup");
@@ -159,7 +160,7 @@ Json snapshotRequest(const View &v)
         enabled(L"HideMicrosoftProcesses"))
         fields.insert("status");
     if (enabled(L"UseColorElevatedProcesses") || enabled(L"UseColorSystemProcesses") ||
-        enabled(L"HideMicrosoftProcesses"))
+        enabled(L"HideMicrosoftProcesses") || tooltips)
         fields.insert("sudo");
     if (enabled(L"UseColorSuspended") || enabled(L"UseColorPartiallySuspended"))
         fields.insert("suspension");

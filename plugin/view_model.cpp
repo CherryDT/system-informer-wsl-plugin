@@ -406,7 +406,7 @@ void updateSnapshot(View &v, const Json &data)
             dropGroup("cwd", {"cwd"});
             dropGroup("command", {"command"});
             dropGroup("cgroup", {"cgroup", "is_service", "service_unit", "service_scope"});
-            dropGroup("sudo", {"sudo_root"});
+            dropGroup("sudo", {"sudo_root", "sudo_user", "sudo_uid", "sudo_gid", "sudo_command"});
             dropGroup("suspension", {"is_suspended", "is_partially_suspended", "stopped_threads"});
             dropGroup("elf32", {"is_32bit"});
             merged.update(process);

@@ -334,7 +334,7 @@ Json process_json(const ProcessStat& stat, const std::map<uid_t, std::string>& u
         {"minor_faults", stat.minor_faults}, {"major_faults", stat.major_faults},
         {"processor", stat.processor}, {"policy", stat.policy},
         {"user_ticks", stat.user_ticks}, {"kernel_ticks", stat.kernel_ticks}};
-    const bool sudo_requested = fields.wants({"sudo", "sudo_root"});
+    const bool sudo_requested = fields.wants({"sudo", "sudo_root", "sudo_user", "sudo_uid", "sudo_gid", "sudo_command"});
     const bool user_requested = fields.wants({"user"});
     if (user_requested || sudo_requested || fields.wants({"status", "uid", "euid", "gid", "egid", "tracer_pid",
         "voluntary_switches", "involuntary_switches", "seccomp", "no_new_privs", "capabilities", "swap_bytes", "is_own", "security"})) {
@@ -358,21 +358,42 @@ Json process_json(const ProcessStat& stat, const std::map<uid_t, std::string>& u
         }
         if (sudo_requested) {
             bool sudo_root = false;
+            Json sudo_metadata = Json::object();
             if (euid == 0) {
                 const auto environment = read_text(proc_path(stat.pid, "environ"), 256 * 1024);
                 for (size_t begin = 0; begin < environment.size();) {
                     const auto end = environment.find('\0', begin);
-                    if (end == std::string::npos) break;
+                    if (end == std::string::npos) break; // Ignore a truncated final entry.
+                    if (environment.compare(begin, 5, "SUDO_") != 0) {
+                        begin = end + 1;
+                        continue;
+                    }
                     const auto entry = environment.substr(begin, end - begin);
-                    if (entry.rfind("SUDO_UID=", 0) == 0) {
-                        const auto value = entry.substr(9);
-                        if (!value.empty() && value.find_first_not_of("0123456789") == std::string::npos)
-                            try { sudo_root = unsigned_value(value) != 0; } catch (...) { }
-                        break;
+                    const auto equals = entry.find('=');
+                    if (equals != std::string::npos) {
+                        const auto name = entry.substr(0, equals);
+                        const auto value = entry.substr(equals + 1);
+                        if (name == "SUDO_UID" || name == "SUDO_GID") {
+                            if (!value.empty() && value.find_first_not_of("0123456789") == std::string::npos) {
+                                try {
+                                    const auto id = unsigned_value(value);
+                                    sudo_metadata[name == "SUDO_UID" ? "sudo_uid" : "sudo_gid"] = id;
+                                    if (name == "SUDO_UID") sudo_root = id != 0;
+                                } catch (...) { }
+                            }
+                        } else if (name == "SUDO_USER") {
+                            sudo_metadata["sudo_user"] = value.substr(0, 256);
+                        } else if (name == "SUDO_COMMAND") {
+                            sudo_metadata["sudo_command"] = value.substr(0, 16384);
+                        }
                     }
                     begin = end + 1;
                 }
             }
+            // These inherited environment values are an origin hint, not a
+            // verified ancestry record. Never expose them for ordinary root
+            // processes (including sudo invoked by UID 0).
+            if (sudo_root) result.update(sudo_metadata);
             result["sudo_root"] = sudo_root;
         }
     }
