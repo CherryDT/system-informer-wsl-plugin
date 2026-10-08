@@ -108,6 +108,7 @@ void render(View &v)
         const auto precision = static_cast<int>(std::min(6ul, WslHostIntegerSetting(L"MaxPrecisionUnit")));
         const double cpuThreshold = std::pow(10.0, -precision);
         const bool ownOnly = WslHostIntegerSetting(L"HideOtherUserProcesses") != 0;
+        const bool hideSystem = WslHostIntegerSetting(L"HideMicrosoftProcesses") != 0;
         v.processes.setAncestryOrder(tree, tree && (WslHostIntegerSetting(L"SortChildProcesses") ||
                                                     WslHostIntegerSetting(L"SortRootProcesses")));
         for (const auto &p : items)
@@ -236,8 +237,10 @@ void render(View &v)
         }
         v.processes.replace(
             std::move(rows),
-            [query, ownOnly, uid = v.defaultUid](const Row &row) {
-                return (!ownOnly ||
+            [query, ownOnly, hideSystem, uid = v.defaultUid](const Row &row) {
+                const bool system = row.data.value("euid", row.data.value("uid", -1)) == 0 &&
+                                    !row.data.value("sudo_root", false);
+                return (!hideSystem || !system) && (!ownOnly ||
                         (uid && row.data.contains("euid") && row.data.value("euid", uint32_t(-1)) == *uid)) &&
                        matches(row, query);
             },

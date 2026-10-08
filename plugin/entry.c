@@ -130,6 +130,7 @@ static LRESULT CALLBACK HostWindowSubclass(HWND window, UINT message, WPARAM wpa
         switch (LOWORD(wparam))
         {
         case 10232: /* Hide other users */
+        case 10238: /* Hide system processes (root in WSL) */
         case 10246: /* CPU below 0.01 */
         case 10262: /* Sort roots */
         case 10272: /* Hide waiting connections */

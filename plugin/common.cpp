@@ -932,7 +932,8 @@ LRESULT Table::customDraw(NMLVCUSTOMDRAW *draw) const
         apply(item.value("sudo_root", false), L"ColorElevatedProcesses");
         apply(readSetting(L"Detect32BitProcesses", 0) != 0 && item.value("is_32bit", false),
               L"ColorWow64Processes");
-        apply(item.value("euid", item.value("uid", -1)) == 0, L"ColorSystemProcesses");
+        apply(item.value("euid", item.value("uid", -1)) == 0 && !item.value("sudo_root", false),
+              L"ColorSystemProcesses");
         apply(item.value("is_own", false), L"ColorOwnProcesses");
         apply(item.value("is_service", false), L"ColorServiceProcesses");
     }

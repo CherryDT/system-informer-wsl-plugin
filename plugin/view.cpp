@@ -91,9 +91,11 @@ Json snapshotRequest(const View &v)
                ProcessVoluntarySwitches, ProcessInvoluntarySwitches, ProcessSeccomp,
                ProcessNoNewPrivileges}) ||
         enabled(L"UseColorDebuggedProcesses") || enabled(L"UseColorOwnProcesses") ||
-        enabled(L"UseColorSystemProcesses") || enabled(L"HideOtherUserProcesses"))
+        enabled(L"UseColorSystemProcesses") || enabled(L"HideOtherUserProcesses") ||
+        enabled(L"HideMicrosoftProcesses"))
         fields.insert("status");
-    if (enabled(L"UseColorElevatedProcesses"))
+    if (enabled(L"UseColorElevatedProcesses") || enabled(L"UseColorSystemProcesses") ||
+        enabled(L"HideMicrosoftProcesses"))
         fields.insert("sudo");
     if (enabled(L"UseColorSuspended") || enabled(L"UseColorPartiallySuspended"))
         fields.insert("suspension");
