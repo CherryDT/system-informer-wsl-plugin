@@ -25,6 +25,7 @@ struct CommandResult {
     std::string output;
 };
 
+bool append_with_budget(Json& array, Json item, size_t& bytes_left);
 std::string read_text(const std::string& path, size_t limit = 1024 * 1024);
 std::string read_link(const std::string& path);
 std::vector<int> process_ids();

@@ -10,7 +10,7 @@
 
 namespace observer {
 namespace {
-struct Owner { int pid; std::string name; };
+struct Owner { int pid; uint64_t start_ticks; std::string name; };
 std::string decode_address(const std::string& value, bool ipv6) {
     unsigned char bytes[16]{};
     const size_t expected = ipv6 ? 32 : 8;
@@ -64,12 +64,23 @@ Json connections(const Json& request) {
             if (target.rfind("socket:[", 0) != 0 || target.back() != ']') continue;
             try {
                 const auto inode = std::stoull(target.substr(8, target.size() - 9));
-                if (seen.insert(inode).second) owners[inode].push_back({pid, stat.name});
+                seen.insert(inode);
             } catch (...) { }
         }
         closedir(directory);
+        try {
+            // fd paths can change while we scan. Do not attach a previous PID
+            // occupant's sockets to a newly started process with the same PID.
+            if (process_stat(pid).start_ticks == stat.start_ticks)
+                for (const auto inode : seen) owners[inode].push_back({pid, stat.start_ticks, stat.name});
+        } catch (const std::exception&) { }
     }
     Json result = Json::array();
+    size_t response_budget = 12 * 1024 * 1024;
+    bool truncated = false;
+    auto append = [&](Json item) {
+        if (!append_with_budget(result, std::move(item), response_budget)) truncated = true;
+    };
     unsigned tables_read = 0;
     for (const std::string protocol : {"tcp", "tcp6", "udp", "udp6"}) {
         const bool ipv6 = protocol.back() == '6';
@@ -81,7 +92,7 @@ Json connections(const Json& request) {
         std::istringstream lines(table);
         std::string line;
         std::getline(lines, line);
-        while (std::getline(lines, line)) {
+        while (!truncated && std::getline(lines, line)) {
             std::istringstream input(line);
             std::vector<std::string> fields;
             std::string field;
@@ -101,13 +112,13 @@ Json connections(const Json& request) {
                 const auto found = owners.find(inode);
                 if (found == owners.end()) {
                     if (!filtered) {
-                        item["pid"] = 0; item["process"] = "";
-                        result.push_back(std::move(item));
+                        item["pid"] = 0; item["start_ticks"] = 0; item["process"] = "";
+                        append(std::move(item));
                     }
                 } else {
                     for (const auto& owner : found->second) {
-                        item["pid"] = owner.pid; item["process"] = owner.name;
-                        result.push_back(item);
+                        item["pid"] = owner.pid; item["start_ticks"] = owner.start_ticks; item["process"] = owner.name;
+                        append(item);
                     }
                 }
             } catch (...) { /* A malformed or concurrently changing row is skipped. */ }
@@ -118,7 +129,7 @@ Json connections(const Json& request) {
     std::istringstream unix_lines(unix_table);
     std::string unix_line;
     std::getline(unix_lines, unix_line);
-    while (std::getline(unix_lines, unix_line)) {
+    while (!truncated && std::getline(unix_lines, unix_line)) {
         std::istringstream input(unix_line);
         std::string number, refs, protocol, flags, type, state, inode_text, path;
         if (!(input >> number >> refs >> protocol >> flags >> type >> state >> inode_text)) continue;
@@ -133,19 +144,19 @@ Json connections(const Json& request) {
             const auto found = owners.find(inode);
             if (found == owners.end()) {
                 if (!filtered) {
-                    item["pid"] = 0; item["process"] = "";
-                    result.push_back(std::move(item));
+                    item["pid"] = 0; item["start_ticks"] = 0; item["process"] = "";
+                    append(std::move(item));
                 }
             } else {
                 for (const auto& owner : found->second) {
-                    item["pid"] = owner.pid; item["process"] = owner.name;
-                    result.push_back(item);
+                    item["pid"] = owner.pid; item["start_ticks"] = owner.start_ticks; item["process"] = owner.name;
+                    append(item);
                 }
             }
         } catch (...) { }
     }
     if (filtered) require_identity(identity);
-    return {{"connections", result}, {"inaccessible_processes", inaccessible},
+    return {{"connections", result}, {"connections_truncated", truncated}, {"inaccessible_processes", inaccessible},
             {"tables_read", tables_read}, {"network_namespace", read_link("/proc/self/ns/net")},
             {"coverage", "Current network namespace only. PID 0 means no visible owner (including TIME_WAIT sockets)."}};
 }

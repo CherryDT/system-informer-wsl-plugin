@@ -32,40 +32,59 @@ bool systemd_available() { return access("/run/systemd/system", F_OK) == 0; }
 }
 
 CommandResult run_command(const std::vector<std::string>& arguments, int timeout_ms) {
-    if (arguments.empty()) throw std::runtime_error("Missing command");
+    if (arguments.empty() || (arguments[0] != "systemctl" && arguments[0] != "journalctl"))
+        throw std::runtime_error("Unsupported system command");
+    std::string executable;
+    for (const auto* directory : {"/usr/bin/", "/bin/"}) {
+        const auto candidate = std::string(directory) + arguments[0];
+        if (access(candidate.c_str(), X_OK) == 0) { executable = candidate; break; }
+    }
+    if (executable.empty()) throw std::runtime_error(arguments[0] + " is not installed");
+
+    // A process stuck in an uninterruptible kernel wait may outlive SIGKILL.
+    // Reap it on the next command instead of blocking the entire transport.
+    static std::vector<pid_t> pending_children;
+    pending_children.erase(std::remove_if(pending_children.begin(), pending_children.end(), [](pid_t pid) {
+        int status;
+        const auto result = waitpid(pid, &status, WNOHANG);
+        return result == pid || (result < 0 && errno == ECHILD);
+    }), pending_children.end());
     int pipes[2];
     if (pipe2(pipes, O_CLOEXEC) != 0) throw std::runtime_error("Cannot create command pipe");
-    // Build argv before fork; the child performs only minimal descriptor setup
-    // and exec. There is no shell, and unit names never become command syntax.
+    if (fcntl(pipes[0], F_SETFL, O_NONBLOCK) < 0) {
+        close(pipes[0]); close(pipes[1]);
+        throw std::runtime_error("Cannot configure command pipe");
+    }
+    // Never search a root process's inherited PATH or inherit dynamic-loader,
+    // bus-address, pager, or other environment overrides from the caller.
     std::vector<char*> argv;
     for (const auto& argument : arguments) argv.push_back(const_cast<char*>(argument.c_str()));
     argv.push_back(nullptr);
+    std::vector<std::string> environment{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C",
+        "SYSTEMD_COLORS=0", "SYSTEMD_URLIFY=0", "SYSTEMD_PAGER=cat"};
+    std::vector<char*> envp;
+    for (auto& entry : environment) envp.push_back(entry.data());
+    envp.push_back(nullptr);
     const pid_t child = fork();
     if (child < 0) { close(pipes[0]); close(pipes[1]); throw std::runtime_error("Cannot start command"); }
     if (child == 0) {
-        setpgid(0, 0);
-        dup2(pipes[1], STDOUT_FILENO);
-        dup2(pipes[1], STDERR_FILENO);
+        if (setpgid(0, 0) != 0) _exit(126);
         const int null_fd = open("/dev/null", O_RDONLY);
-        if (null_fd >= 0) { dup2(null_fd, STDIN_FILENO); close(null_fd); }
-        close(pipes[0]); close(pipes[1]);
-        setenv("LC_ALL", "C", 1);
-        setenv("SYSTEMD_COLORS", "0", 1);
-        setenv("SYSTEMD_PAGER", "cat", 1);
-        execvp(argv[0], argv.data());
+        if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0 ||
+            dup2(pipes[1], STDOUT_FILENO) < 0 || dup2(pipes[1], STDERR_FILENO) < 0) _exit(126);
+        close(null_fd); close(pipes[0]); close(pipes[1]);
+        execve(executable.c_str(), argv.data(), envp.data());
         _exit(127);
     }
     setpgid(child, child);
     close(pipes[1]);
-    const int old_flags = fcntl(pipes[0], F_GETFL, 0);
-    fcntl(pipes[0], F_SETFL, old_flags | O_NONBLOCK);
     CommandResult result;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     bool exited = false, eof = false;
-    int status = 0;
     constexpr size_t output_limit = 2 * 1024 * 1024;
     while (!exited || !eof) {
         char buffer[8192];
+        // A continuously writing child must not prevent deadline checks.
         for (unsigned reads = 0; reads < 64; ++reads) {
             const auto count = read(pipes[0], buffer, sizeof(buffer));
             if (count > 0) {
@@ -76,21 +95,40 @@ CommandResult run_command(const std::vector<std::string>& arguments, int timeout
                 break;
             }
         }
-        if (!exited) exited = waitpid(child, &status, WNOHANG) == child;
+        if (!exited) {
+            siginfo_t info{};
+            // Observe exit without releasing the PID: descendants may still
+            // own the pipe, and timeout cleanup must never kill a reused group.
+            if (waitid(P_PID, static_cast<id_t>(child), &info, WEXITED | WNOHANG | WNOWAIT) == 0)
+                exited = info.si_pid == child;
+        }
         if (exited && eof) break;
         if (std::chrono::steady_clock::now() >= deadline) {
             result.timed_out = true;
-            // Descendants may inherit stdout. Kill the whole command group so
-            // an inherited pipe cannot make a read hang after the leader exits.
             kill(-child, SIGKILL);
-            if (!exited) while (waitpid(child, &status, 0) < 0 && errno == EINTR) { }
+            kill(child, SIGKILL);
             break;
         }
         pollfd descriptor{pipes[0], POLLIN | POLLHUP, 0};
-        poll(&descriptor, 1, 50);
+        if (eof) poll(nullptr, 0, 20);
+        else poll(&descriptor, 1, 50);
     }
     close(pipes[0]);
-    result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    int status = 0;
+    const auto reap_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    for (;;) {
+        const auto reaped = waitpid(child, &status, WNOHANG);
+        if (reaped == child) {
+            result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+            break;
+        }
+        if (reaped < 0 && errno != EINTR) break;
+        if (std::chrono::steady_clock::now() >= reap_deadline) {
+            pending_children.push_back(child);
+            break;
+        }
+        poll(nullptr, 0, 10);
+    }
     if (result.output.size() == output_limit) result.output += "\n[Output truncated]\n";
     return result;
 }
@@ -174,9 +212,34 @@ Json service_details(const Json& request) {
     const auto unit = run_command({"systemctl", "cat", "--no-pager", "--", name});
     const auto journal = run_command({"journalctl", "--unit=" + name, "--lines=100", "--no-pager", "--output=short-iso"});
     auto format = [](const CommandResult& result) {
-        return result.output + (result.timed_out ? "\n[Command timed out]\n" : "");
+        auto text = result.output.substr(0, 128 * 1024);
+        if (text.size() < result.output.size()) text += "\n[Display truncated]\n";
+        return text + (result.timed_out ? "\n[Command timed out]\n" : "");
     };
-    return {{"text", "Status\n" + format(status) + "\nProperties\n" + properties.output + "\nUnit files\n" + format(unit) + "\nRecent journal\n" + format(journal)}};
+    // systemctl show properties are one key=value per line. Split once so
+    // commands and descriptions containing '=' retain their complete value.
+    std::map<std::string, std::string> property_values;
+    std::istringstream property_lines(properties.output);
+    std::string property_line;
+    while (std::getline(property_lines, property_line)) {
+        const auto separator = property_line.find('=');
+        if (separator == std::string::npos) continue;
+        auto value = property_line.substr(separator + 1);
+        if (value.size() > 16 * 1024) value = value.substr(0, 16 * 1024) + " [truncated]";
+        property_values[property_line.substr(0, separator)] = std::move(value);
+    }
+    const std::pair<const char*, const char*> fields[] = {
+        {"name", "Id"}, {"description", "Description"}, {"load", "LoadState"},
+        {"active", "ActiveState"}, {"sub", "SubState"}, {"enabled", "UnitFileState"},
+        {"main_pid", "MainPID"}, {"fragment_path", "FragmentPath"}, {"exec_start", "ExecStart"},
+        {"user", "User"}, {"group", "Group"}, {"restarts", "NRestarts"},
+        {"result", "Result"}, {"active_since", "ActiveEnterTimestamp"},
+        {"memory_current", "MemoryCurrent"}, {"tasks_current", "TasksCurrent"}
+    };
+    Json overview = Json::object();
+    for (const auto& field : fields) overview[field.first] = property_values[field.second];
+    if (overview["name"].get<std::string>().empty()) overview["name"] = name;
+    return {{"overview", overview}, {"text", "Status\n" + format(status) + "\nProperties\n" + format(properties) + "\nUnit files\n" + format(unit) + "\nRecent journal\n" + format(journal)}};
 }
 Json service_action(const Json& request) {
     const auto name = unit_name(request);

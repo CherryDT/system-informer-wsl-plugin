@@ -8,7 +8,7 @@
 #include <dirent.h>
 #include <fstream>
 #include <limits>
-#include <pwd.h>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <sys/syscall.h>
@@ -25,37 +25,57 @@ uint64_t unsigned_value(const std::string& value) {
     if (used != value.size()) throw std::runtime_error("Invalid numeric field in /proc");
     return result;
 }
-std::string user_name(uid_t uid) {
-    // Avoid retaining pointers into libc's shared passwd buffer.
-    std::vector<char> buffer(16384);
-    passwd entry{}, *result = nullptr;
-    if (getpwuid_r(uid, &entry, buffer.data(), buffer.size(), &result) == 0 && result)
-        return entry.pw_name;
-    return std::to_string(uid);
+std::map<uid_t, std::string> local_user_names() {
+    // A statically linked helper must not load distribution-specific NSS modules
+    // or stall a snapshot on LDAP. Resolve local accounts and retain numeric UIDs
+    // for accounts supplied by other name services.
+    std::map<uid_t, std::string> users;
+    std::istringstream lines(read_text("/etc/passwd", 1024 * 1024));
+    std::string line;
+    while (std::getline(lines, line)) {
+        const auto first = line.find(':');
+        if (first == std::string::npos) continue;
+        const auto second = line.find(':', first + 1);
+        if (second == std::string::npos) continue;
+        const auto third = line.find(':', second + 1);
+        if (third == std::string::npos) continue;
+        try {
+            const auto uid = unsigned_value(line.substr(second + 1, third - second - 1));
+            if (uid <= std::numeric_limits<uid_t>::max())
+                users.emplace(static_cast<uid_t>(uid), line.substr(0, first));
+        } catch (const std::exception&) { }
+    }
+    return users;
 }
-uint64_t field_value(const std::string& text, const std::string& key) {
+std::string field_text(const std::string& text, const std::string& key) {
     std::istringstream lines(text);
     std::string line;
     while (std::getline(lines, line)) {
-        if (line.compare(0, key.size(), key) == 0) {
-            std::istringstream value(line.substr(key.size()));
-            uint64_t number = 0;
-            value >> number;
-            return number;
-        }
+        if (line.compare(0, key.size(), key) != 0) continue;
+        const auto begin = line.find_first_not_of(" \t", key.size());
+        if (begin == std::string::npos) return {};
+        const auto end = line.find_last_not_of(" \t\r");
+        return line.substr(begin, end - begin + 1);
     }
-    return 0;
+    return {};
 }
-Json process_json(const ProcessStat& stat) {
+uint64_t field_value(const std::string& text, const std::string& key) {
+    uint64_t number = 0;
+    std::istringstream(field_text(text, key)) >> number;
+    return number;
+}
+Json process_json(const ProcessStat& stat, const std::map<uid_t, std::string>& users) {
     const auto status = read_text(proc_path(stat.pid, "status"));
     const auto uid = status.empty() ? std::numeric_limits<uid_t>::max() :
         static_cast<uid_t>(field_value(status, "Uid:"));
-    auto command = read_text(proc_path(stat.pid, "cmdline"), 256 * 1024);
+    const auto account = users.find(uid);
+    const auto user = status.empty() ? "unknown" : account == users.end() ? std::to_string(uid) : account->second;
+    auto command = read_text(proc_path(stat.pid, "cmdline"), 16 * 1024);
     std::replace(command.begin(), command.end(), '\0', ' ');
     if (!command.empty() && command.back() == ' ') command.pop_back();
     const auto io = read_text(proc_path(stat.pid, "io"));
     return {{"pid", stat.pid}, {"ppid", stat.ppid}, {"start_ticks", stat.start_ticks},
-            {"name", stat.name}, {"state", stat.state}, {"user", status.empty() ? "unknown" : user_name(uid)},
+            {"name", stat.name}, {"state", stat.state}, {"user", user},
             {"status_accessible", !status.empty()},
             {"uid", uid}, {"threads", stat.threads}, {"cpu_ticks", stat.cpu_ticks},
             {"rss_bytes", stat.rss_bytes}, {"virtual_bytes", stat.virtual_bytes},
@@ -66,6 +86,13 @@ Json process_json(const ProcessStat& stat) {
 }
 }
 
+bool append_with_budget(Json& array, Json item, size_t& bytes_left) {
+    const auto size = item.dump(-1, ' ', false, Json::error_handler_t::replace).size() + 1;
+    if (size > bytes_left) return false;
+    bytes_left -= size;
+    array.push_back(std::move(item));
+    return true;
+}
 std::string read_text(const std::string& path, size_t limit) {
     std::ifstream input(path, std::ios::binary);
     if (!input) return {};
@@ -106,7 +133,7 @@ ProcessStat process_stat(int pid) {
     // comm can contain spaces, newlines, and parentheses. The final ')' ends it;
     // splitting the entire line on whitespace silently corrupts later fields.
     const auto begin = text.find('('), end = text.rfind(')');
-    if (begin == std::string::npos || end == std::string::npos || end <= begin)
+    if (begin == std::string::npos || end == std::string::npos || end <= begin || end + 2 >= text.size())
         throw std::runtime_error("Process exited or its /proc entry is inaccessible");
     std::istringstream input(text.substr(end + 2));
     std::vector<std::string> fields;
@@ -155,23 +182,28 @@ Json hello() {
 }
 Json snapshot() {
     Json processes = Json::array();
+    const auto users = local_user_names();
+    size_t bytes_left = 12 * 1024 * 1024;
+    bool truncated = false;
     for (int pid : process_ids()) {
         try {
             const auto stat = process_stat(pid);
-            auto process = process_json(stat);
+            auto process = process_json(stat, users);
             // Do not combine metadata from two occupants of a rapidly reused PID.
-            if (process_stat(pid).start_ticks == stat.start_ticks) processes.push_back(std::move(process));
+            if (process_stat(pid).start_ticks == stat.start_ticks &&
+                !append_with_budget(processes, std::move(process), bytes_left)) { truncated = true; break; }
         } catch (const std::exception&) { /* Processes can disappear during a scan. */ }
     }
     const auto memory = read_text("/proc/meminfo");
     double uptime = 0;
     std::istringstream(read_text("/proc/uptime")) >> uptime;
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
-    return {{"processes", std::move(processes)},
+    return {{"processes", std::move(processes)}, {"processes_truncated", truncated},
             {"monotonic_ms", std::chrono::duration_cast<std::chrono::milliseconds>(now).count()},
             {"uptime_seconds", uptime}, {"memory_total", field_value(memory, "MemTotal:") * 1024},
             {"memory_available", field_value(memory, "MemAvailable:") * 1024},
-            {"cpus", sysconf(_SC_NPROCESSORS_ONLN)}, {"boot_id", boot_id()},
+            {"cpus", sysconf(_SC_NPROCESSORS_ONLN)}, {"clock_ticks", sysconf(_SC_CLK_TCK)},
+            {"boot_id", boot_id()},
             {"loadavg", read_text("/proc/loadavg", 256)},
             {"pressure", "CPU\n" + read_text("/proc/pressure/cpu", 4096) + "\nMemory\n" + read_text("/proc/pressure/memory", 4096) + "\nI/O\n" + read_text("/proc/pressure/io", 4096)}};
 }
@@ -179,6 +211,8 @@ Json process_details(const Json& request) {
     const auto identity = request_identity(request);
     require_identity(identity);
     Json files = Json::array(), modules = Json::array();
+    size_t file_budget = 1024 * 1024, module_budget = 1024 * 1024;
+    bool files_truncated = false, modules_truncated = false;
     const auto fd_path = proc_path(identity.pid, "fd");
     DIR* directory = opendir(fd_path.c_str());
     const bool files_accessible = directory != nullptr;
@@ -193,12 +227,16 @@ Json process_details(const Json& request) {
             while (std::getline(lines, line)) if (line.rfind("flags:", 0) == 0) {
                 std::istringstream(line.substr(6)) >> flags;
             }
-            files.push_back({{"fd", std::stoi(name)}, {"target", read_link(fd_path + "/" + name)}, {"flags", flags}});
+            if (!append_with_budget(files, {{"fd", std::stoi(name)},
+                {"target", read_link(fd_path + "/" + name)}, {"flags", flags}}, file_budget)) {
+                files_truncated = true; break;
+            }
         }
         closedir(directory);
     }
     std::sort(files.begin(), files.end(), [](const Json& a, const Json& b) { return a["fd"].get<int>() < b["fd"].get<int>(); });
     const auto maps = read_text(proc_path(identity.pid, "maps"), 8 * 1024 * 1024);
+    const bool maps_truncated = maps.size() == 8 * 1024 * 1024;
     std::istringstream lines(maps);
     std::string line;
     while (std::getline(lines, line)) {
@@ -208,13 +246,17 @@ Json process_details(const Json& request) {
         std::getline(fields >> std::ws, path);
         const auto dash = range.find('-');
         if (path.empty() || dash == std::string::npos) continue;
-        modules.push_back({{"path", path}, {"start", range.substr(0, dash)},
-                           {"end", range.substr(dash + 1)}, {"permissions", permissions}});
+        if (!append_with_budget(modules, {{"path", path}, {"start", range.substr(0, dash)},
+            {"end", range.substr(dash + 1)}, {"permissions", permissions}}, module_budget)) {
+            modules_truncated = true; break;
+        }
     }
     std::string namespace_text;
     for (const auto* name : {"cgroup", "ipc", "mnt", "net", "pid", "pid_for_children", "time", "user", "uts"})
         namespace_text += std::string(name) + ": " + read_link(proc_path(identity.pid, (std::string("ns/") + name).c_str())) + "\n";
     Json threads = Json::array();
+    size_t thread_budget = 512 * 1024;
+    bool threads_truncated = false;
     const auto task_path = proc_path(identity.pid, "task");
     DIR* tasks = opendir(task_path.c_str());
     if (tasks) {
@@ -224,12 +266,14 @@ Json process_details(const Json& request) {
             const auto text = read_text(task_path + "/" + tid + "/stat", 16384);
             const auto begin = text.find('('), end = text.rfind(')');
             if (begin == std::string::npos || end == std::string::npos || end + 2 >= text.size()) continue;
-            threads.push_back({{"tid", std::stoi(tid)}, {"name", text.substr(begin + 1, end - begin - 1)},
-                {"state", text.substr(end + 2, 1)}, {"wchan", read_text(task_path + "/" + tid + "/wchan", 4096)}});
+            if (!append_with_budget(threads, {{"tid", std::stoi(tid)}, {"name", text.substr(begin + 1, end - begin - 1)},
+                {"state", text.substr(end + 2, 1)}, {"wchan", read_text(task_path + "/" + tid + "/wchan", 4096)}}, thread_budget)) {
+                threads_truncated = true; break;
+            }
         }
         closedir(tasks);
     }
-    const auto summary = "Status\n" + read_text(proc_path(identity.pid, "status")) +
+    auto summary = "Status\n" + read_text(proc_path(identity.pid, "status")) +
         "\nI/O counters\n" + read_text(proc_path(identity.pid, "io")) +
         "\nControl groups\n" + read_text(proc_path(identity.pid, "cgroup")) +
         "\nLimits\n" + read_text(proc_path(identity.pid, "limits")) +
@@ -238,19 +282,45 @@ Json process_details(const Json& request) {
         "\nWorking directory: " + read_link(proc_path(identity.pid, "cwd")) + "\n";
     Json environment = Json::array();
     const auto raw_environment = read_text(proc_path(identity.pid, "environ"), 4 * 1024 * 1024);
+    bool environment_truncated = raw_environment.size() == 4 * 1024 * 1024;
+    size_t environment_budget = 1024 * 1024;
     size_t offset = 0;
     while (offset < raw_environment.size()) {
         const auto end = raw_environment.find('\0', offset);
+        if (end == std::string::npos && environment_truncated) break;
         const auto entry = raw_environment.substr(offset, end == std::string::npos ? end : end - offset);
         const auto equals = entry.find('=');
-        environment.push_back({{"name", entry.substr(0, equals)},
-            {"value", equals == std::string::npos ? "" : entry.substr(equals + 1)}});
+        if (!append_with_budget(environment, {{"name", entry.substr(0, equals)},
+            {"value", equals == std::string::npos ? "" : entry.substr(equals + 1)}}, environment_budget)) {
+            environment_truncated = true; break;
+        }
         if (end == std::string::npos) break;
         offset = end + 1;
     }
+    const bool summary_truncated = summary.size() > 256 * 1024;
+    if (summary_truncated) summary.resize(256 * 1024);
+    if (files_truncated || modules_truncated || maps_truncated || environment_truncated || threads_truncated || summary_truncated)
+        summary += "\nSome inspection data was truncated to keep the response within transport limits.\n";
+    auto overview = process_json(process_stat(identity.pid), local_user_names());
+    const auto status = read_text(proc_path(identity.pid, "status"));
+    overview["cwd"] = read_link(proc_path(identity.pid, "cwd"));
+    overview["cgroup"] = read_text(proc_path(identity.pid, "cgroup"), 16 * 1024);
+    overview["capabilities"] = "Effective: " + field_text(status, "CapEff:") +
+        "\nPermitted: " + field_text(status, "CapPrm:") +
+        "\nInheritable: " + field_text(status, "CapInh:") +
+        "\nBounding: " + field_text(status, "CapBnd:") +
+        "\nAmbient: " + field_text(status, "CapAmb:");
+    const auto seccomp = field_text(status, "Seccomp:");
+    overview["seccomp"] = seccomp == "0" ? "Disabled" : seccomp == "1" ? "Strict" :
+        seccomp == "2" ? "Filter" : seccomp;
+    const auto no_new_privs = field_text(status, "NoNewPrivs:");
+    overview["no_new_privs"] = no_new_privs == "1" ? "Yes" : no_new_privs == "0" ? "No" : no_new_privs;
     require_identity(identity);
-    return {{"threads", threads}, {"environment", environment}, {"summary", summary}, {"files", files}, {"modules", modules},
-            {"files_accessible", files_accessible}, {"modules_accessible", !maps.empty()}};
+    return {{"overview", overview}, {"threads", threads}, {"environment", environment}, {"summary", summary}, {"files", files}, {"modules", modules},
+            {"files_accessible", files_accessible}, {"modules_accessible", !maps.empty()},
+            {"files_truncated", files_truncated}, {"modules_truncated", maps_truncated || modules_truncated},
+            {"environment_truncated", environment_truncated}, {"threads_truncated", threads_truncated},
+            {"summary_truncated", summary_truncated}};
 }
 Json send_signal(const Json& request) {
     const auto identity = request_identity(request);

@@ -9,7 +9,7 @@ Windows service is needed.
 Every message is one UTF-8 JSON object followed by a newline (NDJSON). The helper
 sends exactly one response for each complete input line and never emits unsolicited
 messages. Requests are handled sequentially. The maximum request length is 1 MiB;
-an oversized line is drained and rejected. Invalid UTF-8 in Linux names is
+an oversized line is drained and rejected. Nesting is limited to 32 levels. Invalid UTF-8 in Linux names is
 replaced with U+FFFD when serializing a response. Stdout is protocol-only.
 
 ```json
@@ -50,8 +50,10 @@ Returns:
 - `processes`: objects with `pid`, `ppid`, `start_ticks`, `name`, `state`, `user`,
   `uid`, `threads`, `cpu_ticks`, `rss_bytes`, `virtual_bytes`, `read_bytes`,
   `write_bytes`, `io_accessible`, `status_accessible`, `command`, and `exe`.
+- `processes_truncated`: true if the encoded process array reached its 12 MiB budget.
 - `monotonic_ms`: helper monotonic time, sampled at the end of collection.
-- `uptime_seconds`, `memory_total`, `memory_available`, `cpus`, `boot_id`.
+- `uptime_seconds`, `memory_total`, `memory_available`, `cpus`, `clock_ticks`, `boot_id`.
+  Memory and pressure values describe the shared WSL VM, not just this distro.
 - `loadavg`: Linux load-average text; `pressure`: CPU, memory, and I/O pressure
   text, where the kernel provides it.
 
@@ -64,12 +66,18 @@ RSS and virtual memory are byte counts, and I/O counters are cumulative byte
 counts. Missing I/O permission produces `io_accessible:false` with zero counters. An
 unreadable status file produces `status_accessible:false`, user `unknown`, and
 UID 4294967295 instead of incorrectly reporting root.
-Short-lived processes may disappear during collection and are omitted.
+Short-lived processes may disappear during collection and are omitted. Usernames
+come from the local `/etc/passwd`; other UIDs remain numeric, so inspection never
+blocks on network name services. Command lines are capped at 16 KiB per process.
 
 ### `details` (`pid`, `start_ticks`)
 
 Returns:
 
+- `overview`: current process snapshot fields, plus `cwd`, `cgroup`,
+  `capabilities` (effective, permitted, inheritable, bounding, and ambient masks),
+  `seccomp` (`Disabled`, `Strict`, or `Filter`), and `no_new_privs` (`Yes` or `No`).
+  Missing status fields remain empty; numeric fields retain snapshot types.
 - `summary`: human-readable status, I/O counters, cgroups, resource limits,
   namespace IDs, executable path, and current working directory. Status includes
   UIDs/GIDs, capability masks, seccomp state, and other kernel-provided fields.
@@ -81,20 +89,28 @@ Returns:
 - `environment`: `{name,value}` pairs. Ordering and duplicate names are retained.
 - `threads`: `{tid,name,state,wchan}` entries.
 - `files_accessible`, `modules_accessible`: availability indicators.
+- `files_truncated`, `modules_truncated`, `environment_truncated`,
+  `threads_truncated`, `summary_truncated`: display-limit indicators. A visible
+  notice is also appended to `summary` when any part was truncated.
 
 The environment can contain credentials and other secrets; the UI should expose
 it only through explicit inspection, without automatic logging. Inspection is a
 best-effort snapshot, not a frozen view of the process. Maps are capped at 8 MiB,
-environment at 4 MiB, and ordinary proc files at 1 MiB.
+environment at 4 MiB, and ordinary proc files at 1 MiB. Encoded files, modules,
+and environment arrays each have a 1 MiB budget; threads have 512 KiB. Summary
+text is capped at 256 KiB. These limits keep detail responses below the Windows
+transport limit even when paths contain characters requiring JSON escapes.
+A partial final environment value is omitted instead of presenting it as complete.
 
 ### `connections` (optional `pid`, `start_ticks`)
 
-Returns `connections`, `inaccessible_processes`, `tables_read`,
+Returns `connections`, `connections_truncated`, `inaccessible_processes`, `tables_read`,
 `network_namespace`, and `coverage`.
 
 Each row has `protocol` (`tcp`, `tcp6`, `udp`, `udp6`, or `unix`),
 `local_address`, `local_port`, `remote_address`, `remote_port`, `state`, `pid`,
-`process`, and `inode`. Unix socket addresses are paths (including abstract
+`process`, `start_ticks`, and `inode`. The start time identifies the socket owner
+from the ownership scan; PID 0 uses start time 0. Unix socket addresses are paths (including abstract
 namespace names), with zero ports and an empty remote address. Stream listeners
 use `LISTEN`; bound UDP sockets usually use `UNCONN`.
 
@@ -109,7 +125,8 @@ in the PID namespace can still be inaccessible due to procfs/security policy;
 `inaccessible_processes` counts failures to open their FD directories, including
 processes that disappeared during collection. Ownership and socket tables are
 sampled separately, so extremely short-lived sockets can have no matched owner.
-Each protocol table is capped at 32 MiB.
+Each protocol table is capped at 32 MiB. The encoded connection array is capped
+at 12 MiB and reports `connections_truncated:true` when full.
 
 ### `signal` (`pid`, `start_ticks`, `signal`)
 
@@ -136,8 +153,17 @@ On old systemd versions, the two queries and their fallbacks can take up to
 
 ### `service_details` (`name`)
 
-Returns `{text}` with systemctl status, all properties, unit file contents and
-drop-ins, and the last 100 journal entries. Failed/inactive status is valid detail
+Returns `{text,overview}`. `overview` has the string fields `name`, `description`,
+`load`, `active`, `sub`, `enabled`, `main_pid`, `fragment_path`, `exec_start`,
+`user`, `group`, `restarts`, `result`, `active_since`, `memory_current`, and
+`tasks_current`. These retain systemd property values, including unknown or
+unlimited markers; unavailable properties are empty. Each overview value has a
+16 KiB display limit. The properties are extracted from the existing show result
+without another subprocess.
+
+`text` contains systemctl status, all properties, unit file contents and
+drop-ins, and the last 100 journal entries. Each of the four text sections has a
+128 KiB display limit with a visible truncation marker. Failed/inactive status is valid detail
 output. Journal permission failures are included in the detail text.
 
 ### `service_action` (`name`, `action`)
@@ -148,9 +174,13 @@ message}` after systemctl accepts the request. Start/stop jobs are queued with
 `--no-block`; refresh to inspect completion or failure. Enable/disable changes
 boot activation and does not imply an immediate start/stop.
 
-System tools run with explicit argv, no shell, no interactive password prompt,
+System tools run from trusted `/usr/bin` or `/bin` paths with explicit argv and
+a minimal environment. Caller PATH, bus-address, loader, and pager overrides are
+not inherited. They use no shell, no interactive password prompt,
 no pager, and C locale. Output is limited to 2 MiB per command. Read-only commands
 have a 5-second deadline each; service actions have a 10-second deadline. A
 service detail query makes four sequential commands and can therefore take up to
-20 seconds. On timeout the helper kills the command process group, but a service
+20 seconds. On timeout the helper kills the command process group and reaps the child. A
+child stuck in an uninterruptible kernel wait is reaped on a later command, so it
+cannot indefinitely block the transport. A service
 job already accepted by systemd can continue independently.

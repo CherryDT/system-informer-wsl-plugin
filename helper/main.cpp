@@ -4,6 +4,23 @@
 #include <stdexcept>
 
 namespace {
+void check_nesting(const std::string& line) {
+    unsigned depth = 0;
+    bool in_string = false, escaped = false;
+    for (const char character : line) {
+        if (in_string) {
+            if (escaped) escaped = false;
+            else if (character == '\\') escaped = true;
+            else if (character == '"') in_string = false;
+        } else if (character == '"') {
+            in_string = true;
+        } else if (character == '{' || character == '[') {
+            if (++depth > 32) throw std::runtime_error("Request nesting exceeds 32 levels");
+        } else if ((character == '}' || character == ']') && depth != 0) {
+            --depth;
+        }
+    }
+}
 observer::Json dispatch(const observer::Json& request) {
     const auto operation = request.at("op").get<std::string>();
     if (operation == "hello") return observer::hello();
@@ -35,6 +52,7 @@ int main() {
         Json response = {{"id", nullptr}, {"ok", false}};
         try {
             if (oversized) throw std::runtime_error("Request exceeds 1 MiB");
+            check_nesting(line);
             const auto request = Json::parse(line);
             if (!request.is_object() || !request.contains("id") || !request["id"].is_number_integer())
                 throw std::runtime_error("Request must include an integer id");
