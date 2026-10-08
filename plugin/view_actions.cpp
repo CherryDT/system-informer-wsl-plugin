@@ -1,0 +1,210 @@
+#include "controller.hpp"
+#include "view_state.hpp"
+
+namespace wsl::ui
+{
+void inspect(View &v)
+{
+    const Row *row = v.table().selected();
+    if (!row)
+        return;
+    if (v.page == 0)
+        openDetails(v.window, v.selectedDistro, row->data);
+    else if (v.page == 2)
+        openServiceDetails(v.window, v.selectedDistro, row->data.value("name", ""));
+    else
+    {
+        int pid = row->data.value("pid", 0);
+        if (!pid)
+        {
+            errorBox(v.window, L"No owner was visible for this socket. It may have closed or belong to "
+                               L"another PID namespace.");
+            return;
+        }
+        if (!row->data.contains("start_ticks") || row->data["start_ticks"].is_null())
+        {
+            errorBox(v.window, L"The socket owner's identity is unavailable. Refresh the connections view.");
+            return;
+        }
+        Json owner = {{"pid", pid},
+                      {"start_ticks", row->data["start_ticks"]},
+                      {"name", row->data.value("process", "")}};
+        openDetails(v.window, v.selectedDistro, owner);
+    }
+}
+void action(View &v, int id)
+{
+    const Row *selected = v.table().selected();
+    if (!selected)
+        return;
+    Row row = *selected;
+    if (id == Inspect || id == GoToProcess)
+    {
+        inspect(v);
+        return;
+    }
+    if (id == CopyRow)
+    {
+        std::wstring result;
+        for (auto &c : row.cells)
+        {
+            if (!result.empty())
+                result += L"\t";
+            result += c;
+        }
+        copyText(v.window, result);
+        return;
+    }
+    if (id == CopyCommand)
+    {
+        copyText(v.window, text(row.data, "command"));
+        return;
+    }
+    if (id == OpenExecutable)
+    {
+        openLinuxPath(v.window, v.selectedDistro, text(row.data, "exe"));
+        return;
+    }
+    if (v.pending)
+    {
+        errorBox(v.window, L"A request is still running. Wait for it to finish, then try the action again.");
+        return;
+    }
+    if (v.paused || !v.active || v.failed)
+    {
+        errorBox(v.window, L"Resume monitoring and refresh before changing a process or service.");
+        return;
+    }
+    if (v.page == 0)
+    {
+        int signal = 0;
+        std::wstring label;
+        switch (id)
+        {
+        case Terminate:
+            signal = 15;
+            label = L"Send SIGTERM (graceful termination)";
+            break;
+        case Kill:
+            signal = 9;
+            label = L"Send SIGKILL (force termination)";
+            break;
+        case Suspend:
+            signal = 19;
+            label = L"Send SIGSTOP (suspend)";
+            break;
+        case Resume:
+            signal = 18;
+            label = L"Send SIGCONT (resume)";
+            break;
+        case Hangup:
+            signal = 1;
+            label = L"Send SIGHUP";
+            break;
+        case WindowChanged:
+            signal = 28;
+            label = L"Send SIGWINCH";
+            break;
+        case User1:
+            signal = 10;
+            label = L"Send SIGUSR1";
+            break;
+        case User2:
+            signal = 12;
+            label = L"Send SIGUSR2";
+            break;
+        default:
+            return;
+        }
+        auto prompt = label + L" to " + text(row.data, "name") + L" (PID " + text(row.data, "pid") +
+                      L") in " + v.selectedDistro + L"?\r\n\r\n";
+        prompt +=
+            signal == 1 || signal == 10 || signal == 12
+                ? L"The program defines this signal's behavior. Without a handler, it terminates the process."
+                : L"This action runs as Linux root. Termination may lose unsaved work.";
+        if (MessageBoxW(v.window, prompt.c_str(), L"Confirm process signal",
+                        MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES)
+            return;
+        queue(v,
+              {{"op", "signal"},
+               {"pid", row.data["pid"]},
+               {"start_ticks", row.data["start_ticks"]},
+               {"signal", signal}},
+              ActionTag);
+    }
+    else if (v.page == 2)
+    {
+        const char *verb = nullptr;
+        switch (id)
+        {
+        case StartService:
+            verb = "start";
+            break;
+        case StopService:
+            verb = "stop";
+            break;
+        case RestartService:
+            verb = "restart";
+            break;
+        case ReloadService:
+            verb = "reload";
+            break;
+        case EnableService:
+            verb = "enable";
+            break;
+        case DisableService:
+            verb = "disable";
+            break;
+        default:
+            return;
+        }
+        auto name = row.data.value("name", "");
+        auto prompt = wide(verb) + L" " + wide(name) + L" in " + v.selectedDistro +
+                      L"?\r\n\r\nThis changes a system service as Linux root.";
+        if (MessageBoxW(v.window, prompt.c_str(), L"Confirm service action",
+                        MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES)
+            return;
+        queue(v, {{"op", "service_action"}, {"name", name}, {"action", verb}}, ActionTag);
+    }
+    status(v, L"Applying action…");
+}
+void menu(View &v, POINT point)
+{
+    if (!v.table().selected())
+        return;
+    HMENU popup = CreatePopupMenu();
+    AppendMenuW(popup, MF_STRING, Inspect,
+                v.page == 1 ? L"Inspect owning process\tEnter" : L"Inspect…\tEnter");
+    AppendMenuW(popup, MF_STRING, CopyRow, L"Copy row\tCtrl+C");
+    if (v.page == 0)
+    {
+        AppendMenuW(popup, MF_STRING, CopyCommand, L"Copy command line");
+        AppendMenuW(popup, MF_STRING, OpenExecutable, L"Show executable in Explorer");
+        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(popup, MF_STRING, Terminate, L"Terminate — SIGTERM");
+        AppendMenuW(popup, MF_STRING, Kill, L"Force kill — SIGKILL");
+        AppendMenuW(popup, MF_STRING, Suspend, L"Suspend — SIGSTOP");
+        AppendMenuW(popup, MF_STRING, Resume, L"Resume — SIGCONT");
+        AppendMenuW(popup, MF_STRING, Hangup, L"Send SIGHUP");
+        AppendMenuW(popup, MF_STRING, WindowChanged, L"Send SIGWINCH");
+        AppendMenuW(popup, MF_STRING, User1, L"Send SIGUSR1");
+        AppendMenuW(popup, MF_STRING, User2, L"Send SIGUSR2");
+    }
+    else if (v.page == 2)
+    {
+        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(popup, MF_STRING, StartService, L"Start");
+        AppendMenuW(popup, MF_STRING, StopService, L"Stop");
+        AppendMenuW(popup, MF_STRING, RestartService, L"Restart");
+        AppendMenuW(popup, MF_STRING, ReloadService, L"Reload configuration");
+        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(popup, MF_STRING, EnableService, L"Enable at boot");
+        AppendMenuW(popup, MF_STRING, DisableService, L"Disable at boot");
+    }
+    int chosen =
+        TrackPopupMenu(popup, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, v.window, nullptr);
+    DestroyMenu(popup);
+    if (chosen)
+        action(v, chosen);
+}
+} // namespace wsl::ui

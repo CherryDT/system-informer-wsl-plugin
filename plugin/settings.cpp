@@ -257,6 +257,22 @@ LRESULT CALLBACK settingsProc(HWND window, UINT message, WPARAM wparam, LPARAM l
         layoutSettings(window, *state);
         return 0;
     }
+    case WM_GETFONT:
+        return reinterpret_cast<LRESULT>(font);
+    case WM_ERASEBKGND: {
+        RECT r{};
+        GetClientRect(window, &r);
+        SetDCBrushColor(reinterpret_cast<HDC>(wparam), WslDialogBackground());
+        FillRect(reinterpret_cast<HDC>(wparam), &r, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wparam);
+        SetTextColor(dc, WslDialogText());
+        SetBkColor(dc, WslDialogBackground());
+        SetDCBrushColor(dc, WslDialogBackground());
+        return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+    }
     case WM_COMMAND:
         if (LOWORD(wparam) == IDCANCEL)
         {
@@ -319,7 +335,7 @@ void showSettings(HWND owner, const std::wstring &distro)
     cls.lpfnWndProc = settingsProc;
     cls.lpszClassName = L"WslTools.Settings";
     cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_3DFACE + 1);
     if (!RegisterClassW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
     {
         errorBox(owner, L"Could not register the settings window.");

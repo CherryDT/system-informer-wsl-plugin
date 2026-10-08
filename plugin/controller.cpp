@@ -81,7 +81,7 @@ void run() {
                     if (stopping) break;
                     activeClient = client;
                 }
-                const auto timeout = operation == "service_details" || operation == "service_action"
+                const auto timeout = operation == "service_details" || operation == "service_action" || operation == "stacks"
                     ? std::chrono::seconds(35) : std::chrono::seconds(20);
                 reply->data = client->request(job.request, timeout);
             }

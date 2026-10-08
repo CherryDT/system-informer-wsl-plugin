@@ -8,6 +8,20 @@ namespace wsl
 namespace
 {
 constexpr wchar_t InspectorClass[] = L"WslTools.Inspector";
+constexpr int ConnectionsPage = 5;
+constexpr size_t ConnectionsTable = ConnectionsPage - 1;
+constexpr int StacksPage = ConnectionsPage + 1;
+constexpr int RawPage = StacksPage + 1;
+constexpr int PageCount = RawPage + 1;
+constexpr wchar_t OverviewClass[] = L"WslTools.Overview";
+constexpr int OverviewValueBase = 1000;
+enum class Operation
+{
+    ProcessDetails,
+    ServiceDetails,
+    Connections,
+    Stacks
+};
 enum ControlId
 {
     Banner = 201,
@@ -17,6 +31,7 @@ enum ControlId
     Modules,
     Environment,
     Threads,
+    Connections,
     Refresh,
     CopySelection,
     CopyAll,
@@ -27,7 +42,19 @@ enum ControlId
     Status,
     FilterLabel,
     Filter,
-    ClearFilter
+    ClearFilter,
+    RawDetails,
+    StackText,
+    CaptureStack
+};
+
+struct OverviewField
+{
+    const char *key;
+    const wchar_t *label;
+    bool multiline = false;
+    HWND caption = nullptr;
+    HWND value = nullptr;
 };
 
 // An inspector owns its controls and the mailbox, but never the controller's
@@ -35,12 +62,19 @@ enum ControlId
 struct Inspector
 {
     HWND window = nullptr;
-    HWND banner = nullptr, tabs = nullptr, overview = nullptr, status = nullptr;
+    HWND banner = nullptr, tabs = nullptr, overview = nullptr, raw = nullptr, status = nullptr;
+    HWND lastOverviewEdit = nullptr;
+    HWND stacks = nullptr, captureStack = nullptr;
+    HFONT uiFont = nullptr, rawFont = nullptr;
+    int overviewScroll = 0;
+    bool overviewLayoutActive = false;
+    std::vector<OverviewField> overviewFields;
+    Json overviewData;
     HWND refresh = nullptr, copy = nullptr, copyAll = nullptr, save = nullptr;
     HWND open = nullptr, path = nullptr, value = nullptr;
     HWND filterLabel = nullptr, filter = nullptr, clearFilter = nullptr;
-    std::array<Table, 4> tables;
-    std::array<std::vector<Row>, 4> snapshots;
+    std::array<Table, ConnectionsPage> tables;
+    std::array<std::vector<Row>, ConnectionsPage> snapshots;
     std::shared_ptr<Mailbox> mailbox = std::make_shared<Mailbox>();
     std::wstring distro;
     Json process;
@@ -48,10 +82,16 @@ struct Inspector
     bool isService = false;
     bool loading = false;
     bool hasData = false;
+    bool connectionsAttempted = false;
+    bool connectionsLoaded = false;
+    bool stacksLoaded = false;
+    Operation pending = Operation::ProcessDetails;
     uintptr_t requestTag = 0;
     int page = 0;
     std::wstring notice;
-    std::array<bool, 4> available{};
+    std::wstring connectionsNotice;
+    std::wstring stacksNotice;
+    std::array<bool, ConnectionsPage> available{};
 };
 
 std::wstring windowText(HWND window)
@@ -98,6 +138,306 @@ std::wstring cell(const Json &object, const char *key)
     return L"";
 }
 
+void layoutOverview(Inspector &state)
+{
+    if (state.overviewLayoutActive)
+        return;
+    RECT bounds{};
+    GetClientRect(state.overview, &bounds);
+    // Controls start at 0×0 during creation. Updating their scrollbar before
+    // the first real layout can synchronously reenter WM_SIZE; so can changing
+    // scrollbar visibility during a later resize.
+    if (bounds.right <= 0 || bounds.bottom <= 0)
+        return;
+    state.overviewLayoutActive = true;
+    int fieldHeight = editHeight(state.window);
+    int rowGap = scale(state.window, 8);
+    auto rowHeight = [&](const OverviewField &field) {
+        return field.multiline ? scale(state.window, 66) : fieldHeight + rowGap;
+    };
+    int margin = scale(state.window, 12);
+    int captionWidth = scale(state.window, 150);
+    int total = margin;
+    for (const auto &field : state.overviewFields)
+        total += rowHeight(field);
+    total += margin;
+    state.overviewScroll =
+        std::clamp(state.overviewScroll, 0, std::max(0, total - static_cast<int>(bounds.bottom)));
+    SCROLLINFO scroll{sizeof(scroll)};
+    scroll.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    scroll.nMin = 0;
+    scroll.nMax = std::max(0, total - 1);
+    scroll.nPage = static_cast<UINT>(bounds.bottom);
+    scroll.nPos = state.overviewScroll;
+    SetScrollInfo(state.overview, SB_VERT, &scroll, TRUE);
+    // GetClientRect again because showing the scrollbar can reduce the width.
+    GetClientRect(state.overview, &bounds);
+    int y = margin - state.overviewScroll;
+    for (const auto &field : state.overviewFields)
+    {
+        int height = rowHeight(field);
+        int captionHeight = fieldHeight - scale(state.window, 6);
+        place(field.caption, margin, y + (fieldHeight - captionHeight) / 2, captionWidth - margin,
+              captionHeight);
+        place(field.value, margin + captionWidth, y, bounds.right - captionWidth - 2 * margin,
+              field.multiline ? height - rowGap : fieldHeight);
+        y += height;
+    }
+    state.overviewLayoutActive = false;
+}
+
+LRESULT CALLBACK overviewProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
+{
+    auto state = reinterpret_cast<Inspector *>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (!state)
+        return DefWindowProcW(window, message, wparam, lparam);
+    switch (message)
+    {
+    case WM_SIZE:
+        layoutOverview(*state);
+        return 0;
+    case WM_VSCROLL: {
+        SCROLLINFO scroll{sizeof(scroll)};
+        scroll.fMask = SIF_ALL;
+        GetScrollInfo(window, SB_VERT, &scroll);
+        int position = state->overviewScroll;
+        switch (LOWORD(wparam))
+        {
+        case SB_LINEUP:
+            position -= scale(state->window, 32);
+            break;
+        case SB_LINEDOWN:
+            position += scale(state->window, 32);
+            break;
+        case SB_PAGEUP:
+            position -= static_cast<int>(scroll.nPage);
+            break;
+        case SB_PAGEDOWN:
+            position += static_cast<int>(scroll.nPage);
+            break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION:
+            position = scroll.nTrackPos;
+            break;
+        case SB_TOP:
+            position = scroll.nMin;
+            break;
+        case SB_BOTTOM:
+            position = scroll.nMax;
+            break;
+        }
+        state->overviewScroll = position;
+        layoutOverview(*state);
+        return 0;
+    }
+    case WM_MOUSEWHEEL:
+        state->overviewScroll -= static_cast<short>(HIWORD(wparam)) * scale(state->window, 96) / WHEEL_DELTA;
+        layoutOverview(*state);
+        return 0;
+    case WM_COMMAND:
+        if (HIWORD(wparam) == EN_SETFOCUS)
+        {
+            state->lastOverviewEdit = reinterpret_cast<HWND>(lparam);
+            RECT field{}, bounds{};
+            GetWindowRect(state->lastOverviewEdit, &field);
+            MapWindowPoints(nullptr, window, reinterpret_cast<POINT *>(&field), 2);
+            GetClientRect(window, &bounds);
+            if (field.top < 0)
+                state->overviewScroll += field.top - scale(state->window, 6);
+            else if (field.bottom > bounds.bottom)
+                state->overviewScroll += field.bottom - bounds.bottom + scale(state->window, 6);
+            layoutOverview(*state);
+        }
+        return 0;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        return SendMessageW(state->window, message, wparam, lparam);
+    case WM_ERASEBKGND: {
+        RECT bounds{};
+        GetClientRect(window, &bounds);
+        HBRUSH brush = CreateSolidBrush(WslDialogBackground());
+        FillRect(reinterpret_cast<HDC>(wparam), &bounds, brush);
+        DeleteObject(brush);
+        return 1;
+    }
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+
+std::wstring overviewValue(const Inspector &state, const OverviewField &field)
+{
+    std::wstring value = cell(state.overviewData, field.key);
+    if (value.empty())
+    {
+        if (state.isService && (std::string(field.key) == "user" || std::string(field.key) == "group"))
+            return L"Systemd default";
+        return L"Not available";
+    }
+    std::string key = field.key;
+    if (key == "rss_bytes" || key == "virtual_bytes" || key == "read_bytes" || key == "write_bytes" ||
+        key == "memory_current")
+    {
+        if (value.find_first_not_of(L"0123456789") == std::wstring::npos)
+        {
+            try
+            {
+                value = bytes(std::stoull(value)) + L" (" + value + L" bytes)";
+            }
+            catch (const std::exception &)
+            { /* Keep values outside the numeric range verbatim. */
+            }
+        }
+    }
+    if (!state.isService && key == "state")
+    {
+        const std::pair<const wchar_t *, const wchar_t *> states[] = {
+            {L"R", L"Running"}, {L"S", L"Sleeping"},     {L"D", L"Uninterruptible sleep"},
+            {L"T", L"Stopped"}, {L"t", L"Tracing stop"}, {L"Z", L"Zombie"},
+            {L"I", L"Idle"}};
+        for (const auto &entry : states)
+            if (value == entry.first)
+                return std::wstring(entry.second) + L" (" + value + L")";
+    }
+    return editText(value);
+}
+
+void updateOverview(Inspector &state, const Json &data)
+{
+    auto overview = data.find("overview");
+    if (overview != data.end() && overview->is_object())
+        state.overviewData.update(*overview);
+    for (const auto &field : state.overviewFields)
+    {
+        std::wstring value = overviewValue(state, field);
+        SetWindowTextW(field.value, value.c_str());
+    }
+    layoutOverview(state);
+}
+
+void createOverviewFields(Inspector &state)
+{
+    if (state.isService)
+    {
+        state.overviewData = {{"name", state.service}};
+        state.overviewFields = {{"name", L"Unit"},
+                                {"description", L"Description", true},
+                                {"active", L"Active state"},
+                                {"sub", L"Substate"},
+                                {"load", L"Load state"},
+                                {"enabled", L"Unit file state"},
+                                {"main_pid", L"Main PID"},
+                                {"user", L"User"},
+                                {"group", L"Group"},
+                                {"exec_start", L"Start command", true},
+                                {"fragment_path", L"Unit file"},
+                                {"active_since", L"Active since"},
+                                {"restarts", L"Restarts"},
+                                {"result", L"Last result"},
+                                {"memory_current", L"Current memory"},
+                                {"tasks_current", L"Current tasks"}};
+    }
+    else
+    {
+        state.overviewData = state.process.is_object() ? state.process : Json::object();
+        state.overviewFields = {{"name", L"Name"},
+                                {"pid", L"Process ID"},
+                                {"ppid", L"Parent process ID"},
+                                {"user", L"User"},
+                                {"uid", L"User ID"},
+                                {"state", L"State"},
+                                {"threads", L"Threads"},
+                                {"exe", L"Executable"},
+                                {"command", L"Command line", true},
+                                {"cwd", L"Working directory"},
+                                {"rss_bytes", L"Resident memory"},
+                                {"virtual_bytes", L"Virtual memory"},
+                                {"read_bytes", L"Storage reads"},
+                                {"write_bytes", L"Storage writes"},
+                                {"start_ticks", L"Start time (ticks)"},
+                                {"cgroup", L"Control groups", true},
+                                {"seccomp", L"Seccomp"},
+                                {"no_new_privs", L"No new privileges"},
+                                {"capabilities", L"Capability masks", true}};
+    }
+    for (size_t i = 0; i < state.overviewFields.size(); ++i)
+    {
+        auto &field = state.overviewFields[i];
+        field.caption = control(state.overview, WC_STATICW, field.label, SS_LEFT | SS_NOPREFIX, 0);
+        DWORD style = WS_TABSTOP | ES_READONLY;
+        if (field.multiline)
+            style |= ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL;
+        else
+            style |= ES_AUTOHSCROLL;
+        field.value = control(state.overview, WC_EDITW, L"", style, OverviewValueBase + static_cast<int>(i));
+    }
+    updateOverview(state, Json::object());
+}
+
+BOOL CALLBACK applyDialogFont(HWND child, LPARAM context)
+{
+    auto &state = *reinterpret_cast<Inspector *>(context);
+    if (child == state.raw || child == state.stacks)
+        return TRUE;
+    // The host's configurable grid font belongs only to lists and their
+    // headers. Buttons, fields, and tab captions use the normal dialog font.
+    for (const auto &table : state.tables)
+        if (table.window && (child == table.window || IsChild(table.window, child)))
+            return TRUE;
+    SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(state.uiFont ? state.uiFont : font), FALSE);
+    return TRUE;
+}
+
+void updateInspectorFonts(Inspector &state)
+{
+    HFONT previousUi = state.uiFont;
+    if (HFONT next = WslCreateUiFont(state.window))
+        state.uiFont = next;
+    EnumChildWindows(state.window, applyDialogFont, reinterpret_cast<LPARAM>(&state));
+    if (previousUi && previousUi != state.uiFont)
+        DeleteObject(previousUi);
+
+    HFONT next = WslCreateTextFont(state.window);
+    SendMessageW(state.raw, WM_SETFONT,
+                 reinterpret_cast<WPARAM>(next ? next : GetStockObject(ANSI_FIXED_FONT)), TRUE);
+    if (state.stacks)
+        SendMessageW(state.stacks, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(next ? next : GetStockObject(ANSI_FIXED_FONT)), TRUE);
+    if (state.rawFont)
+        DeleteObject(state.rawFont);
+    state.rawFont = next;
+}
+
+LRESULT dialogControlColor(HDC dc)
+{
+    SetTextColor(dc, WslDialogText());
+    SetBkColor(dc, WslDialogBackground());
+    SetBkMode(dc, TRANSPARENT);
+    SetDCBrushColor(dc, WslDialogBackground());
+    return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+}
+
+// Pages are true children of the native tab. Its clipping keeps themed hover
+// painting out of the pages; these messages still belong to the inspector.
+LRESULT CALLBACK tabPageProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR,
+                             DWORD_PTR context)
+{
+    HWND inspector = reinterpret_cast<HWND>(context);
+    switch (message)
+    {
+    case WM_NOTIFY:
+    case WM_COMMAND:
+    case WM_CONTEXTMENU:
+        return SendMessageW(inspector, message, wparam, lparam);
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        return dialogControlColor(reinterpret_cast<HDC>(wparam));
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(window, tabPageProc, 2);
+        break;
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+}
+
 std::string rowKey(const Json &object, const char *key)
 {
     return utf8(cell(object, key));
@@ -105,12 +445,15 @@ std::string rowKey(const Json &object, const char *key)
 
 Table *activeTable(Inspector &state)
 {
-    return state.page > 0 && state.page <= 4 ? &state.tables[state.page - 1] : nullptr;
+    return !state.isService && state.page > 0 && state.page <= ConnectionsPage ? &state.tables[state.page - 1]
+                                                                               : nullptr;
 }
 
 std::wstring selectedPath(Inspector &state)
 {
-    if (state.page != 1 && state.page != 2)
+    if (state.page == 0)
+        return cell(state.overviewData, state.isService ? "fragment_path" : "exe");
+    if (state.isService || (state.page != 1 && state.page != 2))
         return L"";
     const Row *row = state.tables[state.page - 1].selected();
     if (!row)
@@ -125,20 +468,61 @@ bool canOpen(const std::wstring &path)
     return !path.empty() && path.front() == L'/';
 }
 
+Operation activeOperation(const Inspector &state)
+{
+    if (state.isService)
+        return Operation::ServiceDetails;
+    if (state.page == ConnectionsPage)
+        return Operation::Connections;
+    if (state.page == StacksPage)
+        return Operation::Stacks;
+    return Operation::ProcessDetails;
+}
+
+std::wstring &operationNotice(Inspector &state, Operation operation)
+{
+    if (operation == Operation::Connections)
+        return state.connectionsNotice;
+    if (operation == Operation::Stacks)
+        return state.stacksNotice;
+    return state.notice;
+}
+
 void updateActions(Inspector &state)
 {
-    bool pathTab = state.page == 1 || state.page == 2;
-    ShowWindow(state.open, pathTab ? SW_SHOW : SW_HIDE);
-    ShowWindow(state.path, pathTab ? SW_SHOW : SW_HIDE);
+    bool pathTab = !state.isService && (state.page == 1 || state.page == 2);
+    bool overviewPage = state.page == 0;
+    SetWindowTextW(state.open, overviewPage ? (state.isService ? L"Open &unit file" : L"Open &executable")
+                                            : L"&Open location");
+    SetWindowTextW(state.path, overviewPage ? L"Copy co&mmand" : L"Copy &path");
+    ShowWindow(state.open, pathTab || overviewPage ? SW_SHOW : SW_HIDE);
+    ShowWindow(state.path, pathTab || overviewPage ? SW_SHOW : SW_HIDE);
     ShowWindow(state.value, state.page == 3 ? SW_SHOW : SW_HIDE);
     std::wstring path = selectedPath(state);
     EnableWindow(state.open, !state.loading && canOpen(path));
-    EnableWindow(state.path, !path.empty());
+    EnableWindow(state.path,
+                 overviewPage ? !cell(state.overviewData, state.isService ? "exec_start" : "command").empty()
+                              : !path.empty());
     EnableWindow(state.value, state.page == 3 && state.tables[2].selected());
     EnableWindow(state.refresh, !state.loading);
+    bool stackAction = !state.isService && (state.page == 4 || state.page == StacksPage);
+    ShowWindow(state.captureStack, stackAction ? SW_SHOW : SW_HIDE);
+    EnableWindow(state.captureStack, !state.loading);
+    SetWindowTextW(state.captureStack, state.page == 4 && state.tables[3].selected()
+                                           ? L"View &thread stack…"
+                                           : L"Capture all &stacks…");
 
-    std::wstring message = state.notice;
-    if (message.empty() && state.page > 0)
+    // Each snapshot keeps its own notice. Switching tabs while a request is
+    // running must neither relabel an old snapshot nor parse the wrong reply.
+    bool networkPage = state.page == ConnectionsPage;
+    const auto &notice = operationNotice(state, activeOperation(state));
+    std::wstring message = notice;
+    if (state.loading && activeOperation(state) == state.pending)
+        message = state.pending == Operation::Stacks ? L"Capturing stacks with GDB…"
+                                                     : L"Loading from " + state.distro + L"…";
+    else if (state.loading && networkPage && !state.connectionsAttempted)
+        message = L"Connections will load after the current request finishes…";
+    if (message.empty() && activeTable(state))
     {
         if (!state.available[state.page - 1])
             message = L"This information is unavailable.";
@@ -153,27 +537,48 @@ void updateActions(Inspector &state)
                 message += L" — no entries reported";
         }
     }
-    if (state.notice.empty() && state.page == 3)
+    if (notice.empty() && !state.loading && networkPage)
+        message += L"  •  Current distro network namespace only  •  Blue = listening";
+    if (notice.empty() && !state.loading && state.page == 3)
         message += L"  •  Ctrl+Shift+C copies the selected value";
-    if (state.notice.empty() && pathTab)
+    if (notice.empty() && !state.loading && pathTab)
         message += L"  •  Enter opens location  •  Ctrl+Shift+C copies path";
     if (message.empty())
         message = L"Ctrl+R refresh  •  Ctrl+C copy selection  •  Ctrl+S save this view";
     SetWindowTextW(state.status, message.c_str());
 }
 
+void refresh(Inspector &state);
+void layout(Inspector &state);
+
+void ensureConnections(Inspector &state)
+{
+    // Defer the first network request if the initial process details are still
+    // loading. The completed reply will return here; cached rows stay intact.
+    if (state.page == ConnectionsPage && !state.connectionsAttempted && !state.loading)
+        refresh(state);
+}
+
 void showPage(Inspector &state)
 {
     ShowWindow(state.overview, state.page == 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(state.raw, state.page == (state.isService ? 1 : RawPage) ? SW_SHOW : SW_HIDE);
+    ShowWindow(state.stacks, !state.isService && state.page == StacksPage ? SW_SHOW : SW_HIDE);
     for (size_t i = 0; i < state.tables.size(); ++i)
         if (state.tables[i].window)
             ShowWindow(state.tables[i].window, state.page == static_cast<int>(i + 1) ? SW_SHOW : SW_HIDE);
     if (state.filter)
     {
-        EnableWindow(state.filter, state.page > 0);
-        EnableWindow(state.clearFilter, state.page > 0);
+        int visibility = activeTable(state) ? SW_SHOW : SW_HIDE;
+        ShowWindow(state.filterLabel, visibility);
+        ShowWindow(state.filter, visibility);
+        ShowWindow(state.clearFilter, visibility);
+        EnableWindow(state.filter, activeTable(state) != nullptr);
+        EnableWindow(state.clearFilter, activeTable(state) != nullptr);
     }
+    ensureConnections(state);
     updateActions(state);
+    layout(state);
 }
 
 void applyFilter(Inspector &state)
@@ -219,56 +624,121 @@ void layout(Inspector &state)
     button(state.copyAll, 80);
     button(state.save, 80);
     int contextualX = x;
-    button(state.open, 108);
-    button(state.path, 88);
+    button(state.open, 130);
+    button(state.path, 122);
     x = contextualX;
     button(state.value, 100);
+    x = contextualX;
+    button(state.captureStack, 175);
     int contentY = buttonsY + buttonHeight + gap;
-    if (!state.isService)
+    if (activeTable(state))
     {
         int labelWidth = scale(state.window, 43);
         int clearWidth = scale(state.window, 70);
-        place(state.filterLabel, gap, contentY + scale(state.window, 4), labelWidth, buttonHeight);
-        place(state.filter, gap + labelWidth, contentY, width - gap * 3 - labelWidth - clearWidth,
-              buttonHeight);
-        place(state.clearFilter, width - gap - clearWidth, contentY, clearWidth, buttonHeight);
-        contentY += buttonHeight + gap;
+        int fieldHeight = editHeight(state.window);
+        int rowHeight = std::max(buttonHeight, fieldHeight);
+        int captionHeight = fieldHeight - scale(state.window, 6);
+        place(state.filterLabel, gap, contentY + (rowHeight - captionHeight) / 2, labelWidth, captionHeight);
+        place(state.filter, gap + labelWidth, contentY + (rowHeight - fieldHeight) / 2,
+              width - gap * 3 - labelWidth - clearWidth, fieldHeight);
+        place(state.clearFilter, width - gap - clearWidth, contentY + (rowHeight - buttonHeight) / 2,
+              clearWidth, buttonHeight);
+        contentY += rowHeight + gap;
     }
     int statusHeight = scale(state.window, 23);
     place(state.status, gap, height - gap - statusHeight, width - 2 * gap, statusHeight);
     RECT body{gap, contentY, width - gap, height - 2 * gap - statusHeight};
-    if (!state.isService)
-    {
-        place(state.tabs, body.left, body.top, body.right - body.left, body.bottom - body.top);
-        RECT tabClient{};
-        GetClientRect(state.tabs, &tabClient);
-        TabCtrl_AdjustRect(state.tabs, FALSE, &tabClient);
-        MapWindowPoints(state.tabs, state.window, reinterpret_cast<POINT *>(&tabClient), 2);
-        body = tabClient;
-    }
+    place(state.tabs, body.left, body.top, body.right - body.left, body.bottom - body.top);
+    // TabCtrl_AdjustRect returns the native page frame in tab-client coordinates;
+    // all pages are children of the tab, so no screen-coordinate conversion is needed.
+    GetClientRect(state.tabs, &body);
+    TabCtrl_AdjustRect(state.tabs, FALSE, &body);
+    InflateRect(&body, -scale(state.window, 4), -scale(state.window, 4));
     place(state.overview, body.left, body.top, body.right - body.left, body.bottom - body.top);
+    place(state.raw, body.left, body.top, body.right - body.left, body.bottom - body.top);
+    if (state.stacks)
+        place(state.stacks, body.left, body.top, body.right - body.left, body.bottom - body.top);
     for (auto &table : state.tables)
         if (table.window)
             place(table.window, body.left, body.top, body.right - body.left, body.bottom - body.top);
+}
+
+void captureStacks(Inspector &state)
+{
+    if (state.loading || state.isService)
+        return;
+    Json request = {{"op", "stacks"}};
+    for (const char *key : {"pid", "start_ticks"})
+    {
+        auto value = state.process.find(key);
+        if (value == state.process.end() || (!value->is_number_integer() && !value->is_string()))
+        {
+            errorBox(
+                state.window,
+                L"The process identity is unavailable. Refresh the process list and open a new inspector.");
+            return;
+        }
+        request[key] = *value;
+    }
+    std::wstring target = L"all threads";
+    if (state.page == 4)
+    {
+        const Row *thread = state.tables[3].selected();
+        if (thread)
+        {
+            auto tid = thread->data.find("tid");
+            if (tid == thread->data.end() || !tid->is_number_integer() || *tid <= 0)
+            {
+                errorBox(state.window,
+                         L"The selected thread identity is unavailable. Refresh the thread list.");
+                return;
+            }
+            request["tid"] = *tid;
+            target = L"thread " + cell(thread->data, "tid");
+        }
+    }
+    std::wstring prompt =
+        L"Attach GDB as root to PID " + cell(state.process, "pid") + L" in " + state.distro +
+        L" and capture " + target +
+        L"?\r\n\r\nGDB pauses the process while attached. The capture has a 15-second time limit.";
+    // Captures are deliberately never triggered by selecting the tab. Every
+    // attach, including Refresh/Ctrl+R on Stacks, requires this confirmation.
+    if (MessageBoxW(state.window, prompt.c_str(), L"Capture process stacks",
+                    MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK)
+        return;
+    state.loading = true;
+    state.pending = Operation::Stacks;
+    state.page = StacksPage;
+    TabCtrl_SetCurSel(state.tabs, StacksPage);
+    showPage(state);
+    submit(state.distro, std::move(request), state.mailbox, ++state.requestTag);
 }
 
 void refresh(Inspector &state)
 {
     if (state.loading)
         return;
+    Operation operation = activeOperation(state);
+    if (operation == Operation::Stacks)
+    {
+        captureStacks(state);
+        return;
+    }
     Json request;
+    auto &notice = operationNotice(state, operation);
     if (state.isService)
         request = {{"op", "service_details"}, {"name", state.service}};
     else
     {
-        request = {{"op", "details"}};
+        request = {{"op", operation == Operation::Connections ? "connections" : "details"}};
         for (const char *key : {"pid", "start_ticks"})
         {
             auto value = state.process.find(key);
             if (value == state.process.end() || (!value->is_number_integer() && !value->is_string()))
             {
-                state.notice = L"This process has no valid identity. Refresh the process list and try again.";
-                SetWindowTextW(state.overview, state.notice.c_str());
+                notice = L"This process has no valid identity. Refresh the process list and try again.";
+                if (operation != Operation::Connections)
+                    SetWindowTextW(state.raw, notice.c_str());
                 updateActions(state);
                 return;
             }
@@ -276,7 +746,9 @@ void refresh(Inspector &state)
         }
     }
     state.loading = true;
-    state.notice = L"Loading from " + state.distro + L"…";
+    state.pending = operation;
+    if (operation == Operation::Connections)
+        state.connectionsAttempted = true;
     updateActions(state);
     submit(state.distro, std::move(request), state.mailbox, ++state.requestTag);
 }
@@ -285,7 +757,12 @@ std::wstring allText(Inspector &state)
 {
     if (auto *table = activeTable(state))
         return table->exportText();
-    return windowText(state.overview);
+    if (state.page != 0)
+        return windowText(!state.isService && state.page == StacksPage ? state.stacks : state.raw);
+    std::wstring result;
+    for (const auto &field : state.overviewFields)
+        result += std::wstring(field.label) + L":\t" + windowText(field.value) + L"\r\n";
+    return result;
 }
 
 std::wstring selectionText(Inspector &state)
@@ -311,9 +788,14 @@ std::wstring selectionText(Inspector &state)
         }
         return result.empty() ? allText(state) : result;
     }
+    HWND edit = state.page == 0                                ? state.lastOverviewEdit
+                : !state.isService && state.page == StacksPage ? state.stacks
+                                                               : state.raw;
+    if (!edit)
+        return allText(state);
     DWORD start = 0, end = 0;
-    SendMessageW(state.overview, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
-    std::wstring result = windowText(state.overview);
+    SendMessageW(edit, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+    std::wstring result = windowText(edit);
     if (end > start && start < result.size())
         return result.substr(start, end - start);
     return result;
@@ -326,6 +808,9 @@ void command(Inspector &state, int id)
     case Refresh:
         refresh(state);
         break;
+    case CaptureStack:
+        captureStacks(state);
+        break;
     case ClearFilter:
         SetWindowTextW(state.filter, L"");
         SetFocus(state.filter);
@@ -337,12 +822,17 @@ void command(Inspector &state, int id)
         copyText(state.window, allText(state));
         break;
     case Save:
-        saveText(state.window, allText(state), state.isService ? L"wsl-service.txt" : L"wsl-process.txt");
+        saveText(state.window, allText(state),
+                 state.isService            ? L"wsl-service.txt"
+                 : state.page == StacksPage ? L"wsl-stacks.txt"
+                                            : L"wsl-process.txt");
         break;
     case CopyPath: {
-        std::wstring path = selectedPath(state);
-        if (!path.empty())
-            copyText(state.window, path);
+        std::wstring value = state.page == 0
+                                 ? cell(state.overviewData, state.isService ? "exec_start" : "command")
+                                 : selectedPath(state);
+        if (!value.empty())
+            copyText(state.window, value);
         break;
     }
     case CopyValue:
@@ -404,49 +894,25 @@ void contextMenu(Inspector &state, HWND source, LPARAM position)
         command(state, selected);
 }
 
-void loadReply(Inspector &state, const Reply &reply)
+void loadProcessDetails(Inspector &state, const Json &data)
 {
-    if (reply.tag != state.requestTag)
-        return;
-    state.loading = false;
-    if (!reply.error.empty())
-    {
-        // Keep the previous snapshot visible when a refresh fails; label it
-        // explicitly so it cannot be mistaken for current process information.
-        state.notice =
-            state.hasData ? L"Refresh failed (displayed data may be stale): " : L"Could not load details: ";
-        state.notice += wide(reply.error);
-        if (!state.hasData)
-            SetWindowTextW(state.overview, editText(state.notice).c_str());
-        updateActions(state);
-        return;
-    }
-    state.notice.clear();
-    state.hasData = true;
-    if (state.isService)
-    {
-        std::wstring content = cell(reply.data, "text");
-        SetWindowTextW(state.overview,
-                       content.empty() ? L"No service details were returned." : editText(content).c_str());
-        updateActions(state);
-        return;
-    }
-    std::wstring summary = cell(reply.data, "summary");
-    SetWindowTextW(state.overview,
+    updateOverview(state, data);
+    std::wstring summary = cell(data, "summary");
+    SetWindowTextW(state.raw,
                    summary.empty() ? L"No process summary was returned." : editText(summary).c_str());
     const char *sections[] = {"files", "modules", "environment", "threads"};
     const std::vector<std::vector<const char *>> fields = {{"fd", "target", "flags"},
                                                            {"path", "start", "end", "permissions"},
                                                            {"name", "value"},
                                                            {"tid", "name", "state", "wchan"}};
-    for (size_t section = 0; section < state.tables.size(); ++section)
+    for (size_t section = 0; section < ConnectionsTable; ++section)
     {
         std::vector<Row> rows;
-        auto values = reply.data.find(sections[section]);
-        state.available[section] = reply.data.is_object() && values != reply.data.end() && values->is_array();
+        auto values = data.find(sections[section]);
+        state.available[section] = data.is_object() && values != data.end() && values->is_array();
         std::string accessibleKey = std::string(sections[section]) + "_accessible";
-        auto accessible = reply.data.find(accessibleKey);
-        if (accessible != reply.data.end() && accessible->is_boolean() && !accessible->get<bool>())
+        auto accessible = data.find(accessibleKey);
+        if (accessible != data.end() && accessible->is_boolean() && !accessible->get<bool>())
             state.available[section] = false;
         if (state.available[section])
         {
@@ -467,7 +933,132 @@ void loadReply(Inspector &state, const Reply &reply)
         }
         state.snapshots[section] = std::move(rows);
     }
-    applyFilter(state);
+}
+
+void loadConnections(Inspector &state, const Json &data)
+{
+    auto connections = data.find("connections");
+    state.available[ConnectionsTable] = connections != data.end() && connections->is_array();
+    if (!state.available[ConnectionsTable])
+    {
+        state.connectionsNotice =
+            state.connectionsLoaded ? L"No connection information was returned (displayed data may be stale)."
+                                    : L"No connection information was returned.";
+        return;
+    }
+    std::vector<Row> rows;
+    for (const auto &connection : *connections)
+    {
+        if (!connection.is_object())
+            continue;
+        Row row;
+        row.data = connection;
+        for (const char *field :
+             {"protocol", "local_address", "local_port", "remote_address", "remote_port", "state", "inode"})
+            row.cells.push_back(cell(connection, field));
+        // Inode is the socket's identity; protocol distinguishes its display
+        // entry without using an endpoint that can change during connect().
+        row.key = rowKey(connection, "protocol") + ":" + rowKey(connection, "inode");
+        rows.push_back(std::move(row));
+    }
+    state.snapshots[ConnectionsTable] = std::move(rows);
+    state.connectionsLoaded = true;
+    auto inaccessible = data.find("inaccessible_processes");
+    if (inaccessible != data.end() && inaccessible->is_number_integer() && *inaccessible > 0)
+        state.connectionsNotice =
+            L"Some process descriptors were inaccessible; connection ownership may be incomplete.";
+    auto tablesRead = data.find("tables_read");
+    if (tablesRead != data.end() && tablesRead->is_number_integer() && *tablesRead == 0)
+    {
+        state.available[ConnectionsTable] = false;
+        state.connectionsNotice = L"Network tables are unavailable in the collector's namespace.";
+    }
+    auto truncated = data.find("connections_truncated");
+    if (truncated != data.end() && truncated->is_boolean() && truncated->get<bool>())
+    {
+        if (!state.connectionsNotice.empty())
+            state.connectionsNotice += L" ";
+        state.connectionsNotice += L"Connection results reached the collection limit and are incomplete.";
+    }
+}
+
+void loadStacks(Inspector &state, const Json &data)
+{
+    std::wstring output = cell(data, "text");
+    std::wstring message = cell(data, "message");
+    auto available = data.find("available");
+    bool supported = available != data.end() && available->is_boolean() && available->get<bool>();
+    auto timedOut = data.find("timed_out");
+    bool timeout = timedOut != data.end() && timedOut->is_boolean() && timedOut->get<bool>();
+    auto exitCode = data.find("exit_code");
+    bool failed = exitCode != data.end() && exitCode->is_number_integer() && *exitCode != 0;
+    if (!supported || timeout || failed)
+    {
+        state.stacksNotice = !message.empty() ? message
+                             : !supported     ? L"GDB stack capture is unavailable."
+                             : timeout ? L"Stack capture timed out; any output shown may be incomplete."
+                                       : L"GDB could not complete the capture.";
+    }
+    else
+        state.stacksNotice = message.empty() ? L"Stack capture complete." : message;
+    if (output.empty())
+    {
+        if (state.stacksLoaded)
+            state.stacksNotice += L" The previous capture is still displayed.";
+        else
+            SetWindowTextW(state.stacks, editText(state.stacksNotice).c_str());
+        return;
+    }
+    if (timeout || failed)
+        output = state.stacksNotice + L"\r\n\r\n" + output;
+    SetWindowTextW(state.stacks, editText(output).c_str());
+    state.stacksLoaded = true;
+}
+
+void loadReply(Inspector &state, const Reply &reply)
+{
+    if (reply.tag != state.requestTag)
+        return;
+    const Operation completed = state.pending;
+    const bool network = completed == Operation::Connections;
+    const bool stacks = completed == Operation::Stacks;
+    auto &notice = operationNotice(state, completed);
+    state.loading = false;
+    if (!reply.error.empty())
+    {
+        // A failed refresh leaves the last successful snapshot available for
+        // inspection and copying, with a notice scoped to that snapshot.
+        bool hadData = stacks ? state.stacksLoaded : network ? state.connectionsLoaded : state.hasData;
+        notice = hadData ? L"Refresh failed (displayed data may be stale): " : L"Could not load details: ";
+        notice += wide(reply.error);
+        if (!network && !hadData)
+            SetWindowTextW(stacks ? state.stacks : state.raw, editText(notice).c_str());
+    }
+    else
+    {
+        notice.clear();
+        if (stacks)
+            loadStacks(state, reply.data);
+        else if (network)
+            loadConnections(state, reply.data);
+        else if (completed == Operation::ServiceDetails)
+        {
+            updateOverview(state, reply.data);
+            std::wstring content = cell(reply.data, "text");
+            SetWindowTextW(state.raw, content.empty() ? L"No service details were returned."
+                                                      : editText(content).c_str());
+            state.hasData = true;
+        }
+        else
+        {
+            loadProcessDetails(state, reply.data);
+            state.hasData = true;
+        }
+        if (!state.isService && !stacks)
+            applyFilter(state);
+    }
+    ensureConnections(state);
+    updateActions(state);
 }
 
 // The host owns the message loop; subclass child controls so shortcuts also
@@ -479,7 +1070,7 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
     if (message == WM_CONTEXTMENU)
     {
         int id = GetDlgCtrlID(window);
-        if (id >= Files && id <= Threads)
+        if (id >= Files && id <= Connections)
         {
             SendMessageW(inspector, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(window), lParam);
             return 0;
@@ -491,7 +1082,9 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         int controlId = GetDlgCtrlID(window);
-        if (ctrl && wParam == 'A' && (controlId == Overview || controlId == Filter))
+        if (ctrl && wParam == 'A' &&
+            (controlId == RawDetails || controlId == StackText || controlId == Filter ||
+             controlId >= OverviewValueBase))
         {
             SendMessageW(window, EM_SETSEL, 0, -1);
             return 0;
@@ -501,7 +1094,7 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         if (ctrl && wParam == 'S')
             id = Save;
         // Let the filter edit keep its normal text-copy shortcut.
-        if (ctrl && wParam == 'C' && controlId != Filter)
+        if (ctrl && wParam == 'C' && controlId != Filter && controlId < OverviewValueBase)
         {
             id = CopySelection;
             HWND tabs = GetDlgItem(inspector, Tabs);
@@ -529,7 +1122,8 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
                 if (tabs)
                 {
                     int direction = (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1;
-                    int page = (TabCtrl_GetCurSel(tabs) + direction + 5) % 5;
+                    int count = TabCtrl_GetItemCount(tabs);
+                    int page = (TabCtrl_GetCurSel(tabs) + direction + count) % count;
                     TabCtrl_SetCurSel(tabs, page);
                     NMHDR notice{tabs, Tabs, TCN_SELCHANGE};
                     SendMessageW(inspector, WM_NOTIFY, Tabs, reinterpret_cast<LPARAM>(&notice));
@@ -548,7 +1142,8 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         {
             if (controlId == Files || controlId == Modules)
                 id = OpenLocation;
-            else if ((controlId >= Refresh && controlId <= CopyValue) || controlId == ClearFilter)
+            else if ((controlId >= Refresh && controlId <= CopyValue) || controlId == ClearFilter ||
+                     controlId == CaptureStack)
                 id = controlId;
         }
         if (wParam == VK_ESCAPE)
@@ -585,6 +1180,8 @@ void createControls(Inspector &state)
     state.open = control(window, WC_BUTTONW, L"&Open location", BS_PUSHBUTTON | WS_TABSTOP, OpenLocation);
     state.path = control(window, WC_BUTTONW, L"Copy &path", BS_PUSHBUTTON | WS_TABSTOP, CopyPath);
     state.value = control(window, WC_BUTTONW, L"Copy &value", BS_PUSHBUTTON | WS_TABSTOP, CopyValue);
+    state.captureStack =
+        control(window, WC_BUTTONW, L"Capture all &stacks…", BS_PUSHBUTTON | WS_TABSTOP, CaptureStack);
     if (!state.isService)
     {
         state.filterLabel = control(window, WC_STATICW, L"Filter:", SS_LEFT, FilterLabel);
@@ -592,40 +1189,67 @@ void createControls(Inspector &state)
         SendMessageW(state.filter, EM_SETCUEBANNER, TRUE,
                      reinterpret_cast<LPARAM>(L"Search all columns in this view (Ctrl+F)"));
         state.clearFilter = control(window, WC_BUTTONW, L"Clear", BS_PUSHBUTTON | WS_TABSTOP, ClearFilter);
-        state.tabs =
-            control(window, WC_TABCONTROLW, L"Process detail categories", WS_TABSTOP | WS_CLIPSIBLINGS, Tabs);
-        const wchar_t *names[] = {L"Overview", L"Open files", L"Modules", L"Environment", L"Threads"};
-        for (int i = 0; i < 5; ++i)
-        {
-            TCITEMW item{};
-            item.mask = TCIF_TEXT;
-            item.pszText = const_cast<wchar_t *>(names[i]);
-            TabCtrl_InsertItem(state.tabs, i, &item);
-        }
     }
-    state.overview = control(window, WC_EDITW, L"Loading…",
-                             WS_TABSTOP | WS_BORDER | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY |
-                                 ES_AUTOVSCROLL | ES_AUTOHSCROLL,
-                             Overview);
-    SendMessageW(state.overview, EM_SETLIMITTEXT, 16 * 1024 * 1024, 0);
+    state.tabs = control(window, WC_TABCONTROLW, L"Detail categories",
+                         WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, Tabs);
+    SetWindowLongPtrW(state.tabs, GWL_EXSTYLE,
+                      GetWindowLongPtrW(state.tabs, GWL_EXSTYLE) | WS_EX_CONTROLPARENT);
+    SetWindowSubclass(state.tabs, tabPageProc, 2, reinterpret_cast<DWORD_PTR>(window));
+    const wchar_t *processNames[] = {L"Overview", L"Open files",  L"Modules", L"Environment",
+                                     L"Threads",  L"Connections", L"Stacks",  L"Details"};
+    const wchar_t *serviceNames[] = {L"Overview", L"Details"};
+    for (int i = 0; i < (state.isService ? 2 : PageCount); ++i)
+    {
+        TCITEMW item{};
+        item.mask = TCIF_TEXT;
+        item.pszText = const_cast<wchar_t *>(state.isService ? serviceNames[i] : processNames[i]);
+        TabCtrl_InsertItem(state.tabs, i, &item);
+    }
+    state.overview = control(state.tabs, OverviewClass, L"Overview properties",
+                             WS_VSCROLL | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, Overview);
+    SetWindowLongPtrW(state.overview, GWL_EXSTYLE,
+                      GetWindowLongPtrW(state.overview, GWL_EXSTYLE) | WS_EX_CONTROLPARENT);
+    SetWindowLongPtrW(state.overview, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
+    createOverviewFields(state);
+    state.raw = control(state.tabs, WC_EDITW, L"Loading…",
+                        WS_TABSTOP | WS_BORDER | WS_VSCROLL | WS_HSCROLL | WS_CLIPSIBLINGS | ES_MULTILINE |
+                            ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                        RawDetails);
+    SendMessageW(state.raw, EM_SETLIMITTEXT, 16 * 1024 * 1024, 0);
     if (!state.isService)
     {
-        state.tables[0].create(window, Files, {{L"FD", 65, true}, {L"Target", 520}, {L"Flags", 170}});
+        state.stacks =
+            control(state.tabs, WC_EDITW, L"No stack captured. Use Capture all stacks… to attach GDB.",
+                    WS_TABSTOP | WS_BORDER | WS_VSCROLL | WS_HSCROLL | WS_CLIPSIBLINGS | ES_MULTILINE |
+                        ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                    StackText);
+        SendMessageW(state.stacks, EM_SETLIMITTEXT, 16 * 1024 * 1024, 0);
+        state.tables[0].create(state.tabs, Files, {{L"FD", 65, true}, {L"Target", 520}, {L"Flags", 170}});
         state.tables[1].create(
-            window, Modules, {{L"Mapped file", 460}, {L"Start", 130}, {L"End", 130}, {L"Permissions", 100}});
-        state.tables[2].create(window, Environment, {{L"Variable", 230}, {L"Value", 600}});
-        state.tables[3].create(window, Threads,
+            state.tabs, Modules,
+            {{L"Mapped file", 460}, {L"Start", 130}, {L"End", 130}, {L"Permissions", 100}});
+        state.tables[2].create(state.tabs, Environment, {{L"Variable", 230}, {L"Value", 600}});
+        state.tables[3].create(state.tabs, Threads,
                                {{L"TID", 85, true}, {L"Name", 210}, {L"State", 100}, {L"Wait channel", 390}});
+        state.tables[ConnectionsTable].create(state.tabs, Connections,
+                                              {{L"Protocol", 85},
+                                               {L"Local address", 195},
+                                               {L"Local port", 90, true},
+                                               {L"Remote address", 195},
+                                               {L"Remote port", 95, true},
+                                               {L"State", 125},
+                                               {L"Socket inode", 130, true}});
         const wchar_t *labels[] = {L"Open file descriptors", L"Memory mapped modules",
-                                   L"Environment variables", L"Process threads"};
+                                   L"Environment variables", L"Process threads",
+                                   L"Process network connections"};
         for (size_t i = 0; i < state.tables.size(); ++i)
             SetWindowTextW(state.tables[i].window, labels[i]);
     }
     state.status = control(window, WC_STATICW, L"", SS_LEFT | SS_NOPREFIX, Status);
     EnumChildWindows(window, installShortcuts, reinterpret_cast<LPARAM>(window));
     WslApplyTheme(window);
+    updateInspectorFonts(state);
     showPage(state);
-    layout(state);
     refresh(state);
 }
 
@@ -645,6 +1269,19 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
         return DefWindowProcW(window, message, wParam, lParam);
     switch (message)
     {
+    case WM_GETFONT:
+        return reinterpret_cast<LRESULT>(state->uiFont ? state->uiFont : font);
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        return dialogControlColor(reinterpret_cast<HDC>(wParam));
+    case WM_ERASEBKGND: {
+        RECT bounds{};
+        GetClientRect(window, &bounds);
+        HBRUSH brush = CreateSolidBrush(WslDialogBackground());
+        FillRect(reinterpret_cast<HDC>(wParam), &bounds, brush);
+        DeleteObject(brush);
+        return 1;
+    }
     case WM_CREATE:
         createControls(*state);
         return 0;
@@ -653,13 +1290,14 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
         return 0;
     case WM_GETMINMAXINFO: {
         auto *info = reinterpret_cast<MINMAXINFO *>(lParam);
-        info->ptMinTrackSize = {scale(window, 700), scale(window, 420)};
+        info->ptMinTrackSize = {scale(window, 780), scale(window, 460)};
         return 0;
     }
     case WM_DPICHANGED: {
         const RECT *rect = reinterpret_cast<RECT *>(lParam);
         SetWindowPos(window, nullptr, rect->left, rect->top, rect->right - rect->left,
                      rect->bottom - rect->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        updateInspectorFonts(*state);
         layout(*state);
         return 0;
     }
@@ -684,6 +1322,8 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
         {
             if (hdr->hwndFrom != table.window)
                 continue;
+            if (hdr->code == NM_CUSTOMDRAW)
+                return table.customDraw(reinterpret_cast<NMLVCUSTOMDRAW *>(hdr));
             table.notify(hdr);
             if (hdr->code == NM_DBLCLK && (state->page == 1 || state->page == 2))
                 command(*state, OpenLocation);
@@ -703,11 +1343,18 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
+        for (auto &table : state->tables)
+            if (table.window)
+                table.saveLayout();
         state->mailbox->detach();
         drainReplies(window);
         return 0;
     case WM_NCDESTROY:
         SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        if (state->rawFont)
+            DeleteObject(state->rawFont);
+        if (state->uiFont)
+            DeleteObject(state->uiFont);
         delete state;
         return DefWindowProcW(window, message, wParam, lParam);
     }
@@ -716,13 +1363,23 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
 
 void openInspector(HWND owner, std::unique_ptr<Inspector> state)
 {
+    WNDCLASSEXW panel{sizeof(panel)};
+    panel.hInstance = instance;
+    panel.lpfnWndProc = overviewProc;
+    panel.lpszClassName = OverviewClass;
+    panel.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    if (!RegisterClassExW(&panel) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        errorBox(owner, L"Could not register the overview panel.");
+        return;
+    }
     WNDCLASSEXW cls{sizeof(cls)};
     cls.hInstance = instance;
     cls.lpfnWndProc = inspectorProc;
     cls.lpszClassName = InspectorClass;
     cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     cls.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    cls.hbrBackground = nullptr;
     if (!RegisterClassExW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
     {
         errorBox(owner, L"Could not register the WSL inspector window.");
@@ -741,7 +1398,7 @@ void openInspector(HWND owner, std::unique_ptr<Inspector> state)
         return;
     }
     ShowWindow(window, SW_SHOW);
-    SetFocus(raw->overview);
+    SetFocus(raw->overviewFields.empty() ? raw->tabs : raw->overviewFields.front().value);
 }
 } // namespace
 

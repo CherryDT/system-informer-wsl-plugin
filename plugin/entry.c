@@ -2,24 +2,48 @@
  * bridge in C lets the UI and transport use ordinary C++ and Win32 headers. */
 #include <phdk.h>
 #include <settings.h>
+#include <toolstatusintf.h>
 
 extern HWND WslCreateView(HWND parent, HINSTANCE instance);
 extern void WslSetActive(BOOL active);
 extern void WslShutdown(void);
+extern void WslFocusContent(BOOL select);
+extern void WslSearchChanged(void);
 
 static HINSTANCE PluginModule;
 static PH_CALLBACK_REGISTRATION MainWindowRegistration;
 static PH_CALLBACK_REGISTRATION UnloadRegistration;
 static HWND ViewWindow;
+static PTOOLSTATUS_INTERFACE ToolStatus;
+static PH_CALLBACK_REGISTRATION SearchChangedRegistration;
+static BOOLEAN SearchCallbackRegistered;
+static PH_STRINGREF SearchBanner = PH_STRINGREF_INIT(L"Search WSL");
 
 void WslApplyTheme(HWND window)
 {
     PhInitializeWindowTheme(window, !!PhGetIntegerSetting(L"EnableThemeSupport"));
 }
 
+COLORREF WslDialogBackground(void)
+{
+    if (PhGetIntegerSetting(L"EnableThemeSupport"))
+        return PhGetWindowThemePalette()->BackgroundColor;
+    return GetSysColor(COLOR_3DFACE);
+}
+
+COLORREF WslDialogText(void)
+{
+    if (PhGetIntegerSetting(L"EnableThemeSupport"))
+        return PhGetWindowThemePalette()->TextColor;
+    return GetSysColor(COLOR_WINDOWTEXT);
+}
+
 BOOL WslIsDarkTheme(void)
 {
-    return !!PhGetIntegerSetting(L"EnableThemeSupport");
+    COLORREF background = WslDialogBackground();
+    // The host's custom theme support also includes light palettes.
+    ULONG luminance = 299 * GetRValue(background) + 587 * GetGValue(background) + 114 * GetBValue(background);
+    return luminance < 128000;
 }
 
 HFONT WslGetHostFont(void)
@@ -27,12 +51,89 @@ HFONT WslGetHostFont(void)
     return SystemInformer_GetFont();
 }
 
-static BOOLEAN TabCallback(
-    PPH_MAIN_TAB_PAGE page,
-    PH_MAIN_TAB_PAGE_MESSAGE message,
-    PVOID parameter1,
-    PVOID parameter2
-    )
+/* These factories return owned font handles. The main grid retains the host's
+ * borrowed font; normal controls and text panes have separate font roles. */
+HFONT WslCreateUiFont(HWND window)
+{
+    LONG dpi = (LONG)GetDpiForWindow(window);
+    HFONT result = PhCreateApplicationFont(dpi ? dpi : 96);
+    HFONT stock = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    if (!result || result == stock)
+    {
+        LOGFONTW font;
+        if (GetObjectW(stock, sizeof(font), &font))
+            return CreateFontIndirectW(&font);
+        return NULL;
+    }
+    return result;
+}
+
+HFONT WslCreateTextFont(HWND window)
+{
+    LONG dpi = (LONG)GetDpiForWindow(window);
+    LOGFONTW font = {0};
+    HFONT result = NULL;
+    PPH_STRING setting = PhGetStringSetting(L"FontMonospace");
+
+    // Match the host's serialized LOGFONT format, including a custom face and
+    // size. A length check is required before decoding into the fixed struct.
+    if (setting->Length == sizeof(font) * 2 * sizeof(WCHAR) &&
+        PhHexStringToBuffer(&setting->sr, (PUCHAR)&font))
+    {
+        font.lfFaceName[LF_FACESIZE - 1] = UNICODE_NULL;
+        result = CreateFontIndirectW(&font);
+    }
+    PhDereferenceObject(setting);
+    if (result)
+        return result;
+
+    RtlZeroMemory(&font, sizeof(font));
+    font.lfHeight = -MulDiv(9, dpi ? dpi : 96, 72);
+    font.lfWeight = FW_NORMAL;
+    font.lfCharSet = DEFAULT_CHARSET;
+    font.lfQuality = CLEARTYPE_QUALITY;
+    font.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
+    wcscpy_s(font.lfFaceName, RTL_NUMBER_OF(font.lfFaceName), L"Consolas");
+    return CreateFontIndirectW(&font);
+}
+
+BOOL WslHasGlobalSearch(void)
+{
+    // ToolStatus.Config bit 1 is its public SearchBoxEnabled setting.
+    return ToolStatus != NULL && (PhGetIntegerSetting(L"ToolStatus.Config") & 2) != 0;
+}
+
+BOOL WslMatchesGlobalSearch(PCWSTR text)
+{
+    PH_STRINGREF value;
+    if (!ToolStatus || !ToolStatus->GetSearchMatchHandle())
+        return TRUE;
+    PhInitializeStringRef(&value, text ? text : L"");
+    return ToolStatus->WordMatch(&value);
+}
+
+static VOID NTAPI SearchChanged(PVOID parameter, PVOID context)
+{
+    UNREFERENCED_PARAMETER(parameter);
+    UNREFERENCED_PARAMETER(context);
+    // ToolStatus raises this event synchronously on the main window thread.
+    WslSearchChanged();
+}
+
+static VOID NTAPI ActivateContent(BOOLEAN select)
+{
+    WslFocusContent(select);
+}
+
+static HWND NTAPI GetTreeNewHandle(VOID)
+{
+    // ToolStatus calls this callback unconditionally for registered tabs.
+    // Returning NULL opts out of TreeNew-only selection restoration safely.
+    return NULL;
+}
+
+static BOOLEAN TabCallback(PPH_MAIN_TAB_PAGE page, PH_MAIN_TAB_PAGE_MESSAGE message, PVOID parameter1,
+                           PVOID parameter2)
 {
     UNREFERENCED_PARAMETER(page);
     switch (message)
@@ -40,7 +141,7 @@ static BOOLEAN TabCallback(
     case MainTabPageCreateWindow:
         ViewWindow = WslCreateView((HWND)parameter2, PluginModule);
         if (parameter1)
-            *(HWND*)parameter1 = ViewWindow;
+            *(HWND *)parameter1 = ViewWindow;
         return ViewWindow != NULL;
     case MainTabPageSelected:
         WslSetActive(parameter1 != NULL);
@@ -60,18 +161,44 @@ static BOOLEAN TabCallback(
 
 static VOID NTAPI MainWindowShowing(PVOID parameter, PVOID context)
 {
-    PH_MAIN_TAB_PAGE page = { 0 };
+    PH_MAIN_TAB_PAGE page = {0};
+    PPH_MAIN_TAB_PAGE addedPage;
+    PTOOLSTATUS_TAB_INFO tabInfo;
     UNREFERENCED_PARAMETER(parameter);
     UNREFERENCED_PARAMETER(context);
+    ToolStatus = PhGetPluginInterfaceZ(TOOLSTATUS_INTERFACE_NAME, TOOLSTATUS_INTERFACE_VERSION);
+    if (ToolStatus && (!ToolStatus->GetSearchMatchHandle || !ToolStatus->WordMatch ||
+                       !ToolStatus->RegisterTabInfo || !ToolStatus->SearchChangedEvent))
+        ToolStatus = NULL;
     PhInitializeStringRef(&page.Name, L"WSL");
     page.Callback = TabCallback;
-    PhPluginCreateTabPage(&page);
+    addedPage = PhPluginCreateTabPage(&page);
+    if (addedPage && ToolStatus)
+    {
+        tabInfo = ToolStatus->RegisterTabInfo(addedPage->Index, &SearchBanner);
+        if (tabInfo)
+        {
+            tabInfo->ActivateContent = ActivateContent;
+            tabInfo->GetTreeNewHandle = GetTreeNewHandle;
+            PhRegisterCallback(ToolStatus->SearchChangedEvent, SearchChanged, NULL,
+                               &SearchChangedRegistration);
+            SearchCallbackRegistered = TRUE;
+        }
+        else
+            ToolStatus = NULL;
+    }
 }
 
 static VOID NTAPI PluginUnloading(PVOID parameter, PVOID context)
 {
     UNREFERENCED_PARAMETER(parameter);
     UNREFERENCED_PARAMETER(context);
+    if (SearchCallbackRegistered)
+    {
+        PhUnregisterCallback(ToolStatus->SearchChangedEvent, &SearchChangedRegistration);
+        SearchCallbackRegistered = FALSE;
+    }
+    ToolStatus = NULL;
     /* Join workers here, never under the loader lock in DllMain. */
     WslShutdown();
 }
@@ -90,12 +217,13 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
         return FALSE;
     information->DisplayName = L"WSL Tools";
     information->Author = L"David Trapp";
-    information->Description = L"Processes, connections, open files, modules and systemd services for WSL 2. MIT licensed.";
+    information->Description =
+        L"Processes, connections, open files, modules and systemd services for WSL 2. MIT licensed.";
     information->HasOptions = FALSE;
 
-    PhRegisterCallback(PhGetGeneralCallback(GeneralCallbackMainWindowShowing),
-        MainWindowShowing, NULL, &MainWindowRegistration);
-    PhRegisterCallback(PhGetPluginCallback(plugin, PluginCallbackUnload),
-        PluginUnloading, NULL, &UnloadRegistration);
+    PhRegisterCallback(PhGetGeneralCallback(GeneralCallbackMainWindowShowing), MainWindowShowing, NULL,
+                       &MainWindowRegistration);
+    PhRegisterCallback(PhGetPluginCallback(plugin, PluginCallbackUnload), PluginUnloading, NULL,
+                       &UnloadRegistration);
     return TRUE;
 }
