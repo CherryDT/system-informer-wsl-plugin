@@ -255,7 +255,10 @@ void menu(View &v, POINT point)
         AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(popup, MF_STRING, EnableService, L"Enable at boot");
         AppendMenuW(popup, MF_STRING, DisableService, L"Disable at boot");
-
+        const auto unit = row ? row->data.value("name", std::string{}) : std::string{};
+        if (unit.size() >= 9 && unit.compare(unit.size() - 9, 9, "@.service") == 0)
+            for (int command : {StartService, StopService, RestartService, ReloadService})
+                EnableMenuItem(popup, command, MF_BYCOMMAND | MF_GRAYED);
     }
     if (!v.table().selectedActionable())
         for (int id : {Inspect, OpenExecutable, Terminate, InterruptSignal, Kill, Suspend, Resume, Hangup,

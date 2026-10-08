@@ -371,17 +371,49 @@ Json services(const Json& request) {
 Json service_details(const Json& request) {
     const auto name = unit_name(request);
     if (!systemd_available()) throw std::runtime_error("systemd is not running in this distribution");
+    auto format = [](const CommandResult& result) {
+        auto text = result.output.substr(0, 128 * 1024);
+        if (text.size() < result.output.size()) text += "\n[Display truncated]\n";
+        return text + (result.timed_out ? "\n[Command timed out]\n" : "");
+    };
+    const bool is_template = name.size() >= 9 && name.compare(name.size() - 9, 9, "@.service") == 0;
+    if (is_template) {
+        // A template is a unit definition, not a runtime unit. systemctl show
+        // rejects the bare @.service name; never invent an instance to query.
+        const auto unit = run_command({"systemctl", "cat", "--no-pager", "--", name});
+        checked_output(unit);
+        const auto files = run_command({"systemctl", "list-unit-files", "--no-pager", "--no-legend", "--full", "--", name});
+        std::string enabled = "unknown", listed_name;
+        if (!files.timed_out && files.exit_code == 0) {
+            std::istringstream row(files.output);
+            row >> listed_name >> enabled;
+            if (listed_name != name) enabled = "unknown";
+        }
+        std::string path;
+        std::istringstream lines(unit.output);
+        std::string line;
+        while (std::getline(lines, line)) {
+            if (line.rfind("# /", 0) == 0) { path = line.substr(2); break; }
+        }
+        const std::string explanation = "This is a service template. Choose a named instance to inspect runtime properties or control its process.";
+        auto pattern = name;
+        pattern.insert(pattern.size() - 8, "*");
+        const auto journal = run_command({"journalctl", "--unit=" + pattern, "--lines=100", "--no-pager", "--output=short-iso"});
+        Json overview{{"name", name}, {"is_template", true}, {"description", explanation},
+            {"load", "Unit definition"}, {"active", "Template"}, {"sub", "Not an instance"},
+            {"enabled", enabled}, {"fragment_path", path}, {"main_pid", "Not instantiated"},
+            {"user", "Instance-specific"}, {"group", "Instance-specific"},
+            {"exec_start", "See the unit definition; instance specifiers are not expanded."}};
+        return {{"overview", overview},
+            {"journal", "Recent entries for instances matching " + pattern + "\n\n" + format(journal)},
+            {"text", explanation + "\n\nUnit files\n" + format(unit)}};
+    }
     const auto properties = run_command({"systemctl", "show", "--no-pager", "--", name});
     checked_output(properties);
     // Keep journal history in its own response field and inspector page.
     const auto status = run_command({"systemctl", "status", "--no-pager", "--full", "--lines=0", "--", name});
     const auto unit = run_command({"systemctl", "cat", "--no-pager", "--", name});
     const auto journal = run_command({"journalctl", "--unit=" + name, "--lines=100", "--no-pager", "--output=short-iso"});
-    auto format = [](const CommandResult& result) {
-        auto text = result.output.substr(0, 128 * 1024);
-        if (text.size() < result.output.size()) text += "\n[Display truncated]\n";
-        return text + (result.timed_out ? "\n[Command timed out]\n" : "");
-    };
     // systemctl show properties are one key=value per line. Split once so
     // commands and descriptions containing '=' retain their complete value.
     std::map<std::string, std::string> property_values;
@@ -413,6 +445,9 @@ Json service_action(const Json& request) {
     const auto action = request.at("action").get<std::string>();
     const std::vector<std::string> allowed{"start", "stop", "restart", "reload", "enable", "disable"};
     if (std::find(allowed.begin(), allowed.end(), action) == allowed.end()) throw std::runtime_error("Unsupported service action");
+    if (name.size() >= 9 && name.compare(name.size() - 9, 9, "@.service") == 0 &&
+        action != "enable" && action != "disable")
+        throw std::runtime_error("Choose a named service instance; a template has no running process to control.");
     if (!systemd_available()) throw std::runtime_error("systemd is not running in this distribution");
     // --no-block returns once a job is queued. The UI refresh reports its actual
     // state; a service with a long startup must not freeze the transport.
