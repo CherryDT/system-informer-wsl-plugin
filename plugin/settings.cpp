@@ -1,6 +1,8 @@
 #include "settings.hpp"
+#include "host_bridge.h"
+#include "options.h"
+#include "transport.hpp"
 #include <algorithm>
-#include <cerrno>
 #include <stdexcept>
 
 namespace wsl
@@ -61,7 +63,7 @@ void writeSetting(const wchar_t *name, DWORD value)
         RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE *>(&value), sizeof(value));
     RegCloseKey(key);
     if (result != ERROR_SUCCESS)
-        throw std::runtime_error("Unable to save the refresh interval.");
+        throw std::runtime_error("Unable to save the WSL setting.");
 }
 std::wstring distroPrefix(const std::wstring &distro)
 {
@@ -151,234 +153,215 @@ std::wstring windowsPath(const std::wstring &distro, const std::wstring &linuxPa
 
 namespace
 {
-enum SettingsControl
+std::wstring preferredOptionsDistro;
+
+struct OptionsState
 {
-    PrefixEdit = 10,
-    IntervalEdit,
-    CpuMode
-};
-struct SettingsWindow
-{
-    HWND heading{}, edit{}, hint{}, label{}, interval{}, cpuLabel{}, cpuMode{}, status{}, save{}, cancel{};
-    std::wstring distro;
+    std::vector<std::wstring> distros;
+    int selected = -1;
+    bool loading = false;
 };
 
-void layoutSettings(HWND window, const SettingsWindow &state)
+std::wstring optionText(HWND window, int controlId)
+{
+    HWND control = GetDlgItem(window, controlId);
+    std::wstring result(static_cast<size_t>(GetWindowTextLengthW(control)) + 1, L'\0');
+    GetWindowTextW(control, result.data(), static_cast<int>(result.size()));
+    result.resize(wcslen(result.c_str()));
+    return result;
+}
+
+void optionsStatus(HWND window, const std::wstring &message)
+{
+    SetDlgItemTextW(window, IDC_WSL_OPTIONS_STATUS, message.c_str());
+}
+
+void loadPrefix(HWND window, OptionsState &state)
+{
+    state.loading = true;
+    const bool available = state.selected >= 0 && static_cast<size_t>(state.selected) < state.distros.size();
+    auto prefix = available ? distroPrefix(state.distros[state.selected]) : std::wstring{};
+    SetDlgItemTextW(window, IDC_WSL_PREFIX, prefix.c_str());
+    EnableWindow(GetDlgItem(window, IDC_WSL_PREFIX), available);
+    EnableWindow(GetDlgItem(window, IDC_WSL_APPLY_PREFIX), FALSE);
+    state.loading = false;
+}
+
+bool applyPrefix(HWND window, OptionsState &state)
+{
+    if (state.selected < 0 || static_cast<size_t>(state.selected) >= state.distros.size())
+        return true;
+    try
+    {
+        setDistroPrefix(state.distros[state.selected], optionText(window, IDC_WSL_PREFIX));
+        EnableWindow(GetDlgItem(window, IDC_WSL_APPLY_PREFIX), FALSE);
+        optionsStatus(window, L"Explorer path prefix saved.");
+        return true;
+    }
+    catch (const std::exception &error)
+    {
+        optionsStatus(window, wide(error.what()));
+        SetFocus(GetDlgItem(window, IDC_WSL_PREFIX));
+        return false;
+    }
+}
+
+void layoutOptions(HWND window)
 {
     RECT bounds{};
     GetClientRect(window, &bounds);
-    int margin = scale(window, 18);
-    int width = bounds.right - 2 * margin;
-    place(state.heading, margin, margin, width, scale(window, 24));
-    place(state.edit, margin, scale(window, 48), width, editHeight(window));
-    place(state.hint, margin, scale(window, 86), width, scale(window, 50));
-    int intervalWidth = scale(window, 138);
-    place(state.label, margin, scale(window, 144), width - intervalWidth - margin, scale(window, 24));
-    place(state.interval, bounds.right - margin - intervalWidth, scale(window, 142), intervalWidth,
-          editHeight(window));
-    place(state.cpuLabel, margin, scale(window, 183), scale(window, 160), scale(window, 22));
-    place(state.cpuMode, margin + scale(window, 170), scale(window, 180), width - scale(window, 170),
-          scale(window, 120));
-    place(state.status, margin, scale(window, 220), width, scale(window, 56));
-    int buttonWidth = scale(window, 94), buttonHeight = scale(window, 23);
-    int bottom = bounds.bottom - margin - buttonHeight;
-    place(state.save, bounds.right - margin - 2 * buttonWidth - scale(window, 12), bottom, buttonWidth,
-          buttonHeight);
-    place(state.cancel, bounds.right - margin - buttonWidth, bottom, buttonWidth, buttonHeight);
+    auto position = [&](int id, int x, int y, int rightMargin, int height) {
+        RECT units{x, y, rightMargin, height};
+        MapDialogRect(window, &units);
+        place(GetDlgItem(window, id), units.left, units.top, bounds.right - units.left - units.right,
+              units.bottom);
+    };
+    position(IDC_WSL_GENERAL_GROUP, 7, 7, 7, 92);
+    position(IDC_WSL_CPU_LABEL, 14, 20, 14, 10);
+    position(IDC_WSL_CPU_MODE, 14, 33, 14, 70);
+    position(IDC_WSL_NODE_INSPECTOR, 14, 53, 14, 20);
+    position(IDC_WSL_REFRESH_NOTE, 14, 77, 14, 16);
+    position(IDC_WSL_PATH_GROUP, 7, 106, 7, 99);
+    position(IDC_WSL_DISTRO_LABEL, 14, 119, 14, 10);
+    position(IDC_WSL_DISTRO, 14, 132, 14, 70);
+    position(IDC_WSL_PREFIX_LABEL, 14, 152, 14, 10);
+    position(IDC_WSL_PREFIX, 14, 165, 89, 14);
+    RECT button{0, 164, 70, 16};
+    MapDialogRect(window, &button);
+    RECT margin{14, 0, 0, 0};
+    MapDialogRect(window, &margin);
+    place(GetDlgItem(window, IDC_WSL_APPLY_PREFIX), bounds.right - margin.left - button.right, button.top,
+          button.right, button.bottom);
+    position(IDC_WSL_PREFIX_HINT, 14, 185, 14, 14);
+    position(IDC_WSL_OPTIONS_STATUS, 7, 211, 7, 18);
 }
 
-LRESULT CALLBACK settingsKeys(HWND child, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR,
-                              DWORD_PTR reference)
+INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
 {
-    HWND parent = reinterpret_cast<HWND>(reference);
-    if (message == WM_KEYDOWN)
+    UNREFERENCED_PARAMETER(lparam);
+    auto state = reinterpret_cast<OptionsState *>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_INITDIALOG)
     {
-        if (wparam == VK_TAB)
-        {
-            HWND next = GetNextDlgTabItem(parent, child, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
-            if (next)
-                SetFocus(next);
-            return 0;
-        }
-        if (wparam == VK_RETURN || wparam == VK_ESCAPE)
-        {
-            int command = wparam == VK_ESCAPE || GetDlgCtrlID(child) == IDCANCEL ? IDCANCEL : IDOK;
-            SendMessageW(parent, WM_COMMAND, command, 0);
-            return 0;
-        }
-        if (wparam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000) &&
-            (GetDlgCtrlID(child) == PrefixEdit || GetDlgCtrlID(child) == IntervalEdit))
-        {
-            SendMessageW(child, EM_SETSEL, 0, -1);
-            return 0;
-        }
-    }
-    if (message == WM_NCDESTROY)
-        RemoveWindowSubclass(child, settingsKeys, 1);
-    return DefSubclassProc(child, message, wparam, lparam);
-}
-
-LRESULT CALLBACK settingsProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
-{
-    auto state = reinterpret_cast<SettingsWindow *>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    if (message == WM_NCCREATE)
-    {
-        auto incoming = static_cast<std::unique_ptr<SettingsWindow> *>(
-            reinterpret_cast<CREATESTRUCTW *>(lparam)->lpCreateParams);
-        state = incoming->release();
+        state = new OptionsState;
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        state->loading = true;
+        for (auto label : {L"100% = one vCPU (Linux convention)", L"100% = all WSL vCPUs"})
+            SendDlgItemMessageW(window, IDC_WSL_CPU_MODE, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+        SendDlgItemMessageW(window, IDC_WSL_CPU_MODE, CB_SETCURSEL,
+                            readSetting(L"CpuPercentOfTotal", 1) ? 1 : 0, 0);
+        CheckDlgButton(window, IDC_WSL_NODE_INSPECTOR,
+                       readSetting(L"UseNodeInspectorWithoutAsking", 0) ? BST_CHECKED : BST_UNCHECKED);
+        SendDlgItemMessageW(window, IDC_WSL_PREFIX, EM_SETLIMITTEXT, 32760, 0);
+        try
+        {
+            // Registration discovery only reads HKCU. Opening Options must not
+            // start a stopped distro or launch a Linux process.
+            state->distros = registeredWsl2Distros();
+            std::sort(state->distros.begin(), state->distros.end());
+            for (size_t i = 0; i < state->distros.size(); ++i)
+            {
+                SendDlgItemMessageW(window, IDC_WSL_DISTRO, CB_ADDSTRING, 0,
+                                    reinterpret_cast<LPARAM>(state->distros[i].c_str()));
+                if (state->distros[i] == preferredOptionsDistro)
+                    state->selected = static_cast<int>(i);
+            }
+            if (!state->distros.empty() && state->selected < 0)
+                state->selected = 0;
+            SendDlgItemMessageW(window, IDC_WSL_DISTRO, CB_SETCURSEL, state->selected, 0);
+            if (state->distros.empty())
+                optionsStatus(window, L"No registered WSL 2 distributions were found.");
+        }
+        catch (const std::exception &error)
+        {
+            optionsStatus(window, wide(error.what()));
+        }
+        EnableWindow(GetDlgItem(window, IDC_WSL_DISTRO), !state->distros.empty());
+        loadPrefix(window, *state);
+        layoutOptions(window);
+        return TRUE;
     }
     if (!state)
-        return DefWindowProcW(window, message, wparam, lparam);
+        return FALSE;
     switch (message)
     {
-    case WM_CREATE: {
-        state->heading = control(window, L"STATIC", (L"Explorer path prefix for " + state->distro).c_str(),
-                                 SS_NOPREFIX, 0);
-        state->edit = control(window, L"EDIT", distroPrefix(state->distro).c_str(),
-                              WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, PrefixEdit);
-        SendMessageW(state->edit, EM_SETLIMITTEXT, 32760, 0);
-        SendMessageW(state->edit, EM_SETCUEBANNER, TRUE,
-                     reinterpret_cast<LPARAM>(L"Default: \\\\wsl.localhost\\<distribution>\\"));
-        state->hint = control(window, L"STATIC",
-                              L"Example: R:\\ maps /home/user to R:\\home\\user.\r\nLeave blank to use "
-                              L"\\\\wsl.localhost\\<distribution>\\.",
-                              SS_NOPREFIX, 0);
-        state->label =
-            control(window, L"STATIC", L"Refresh interval (milliseconds, 500–60000)", SS_NOPREFIX, 0);
-        auto refresh = std::clamp(readSetting(L"RefreshInterval", 2000), 500ul, 60000ul);
-        state->interval = control(window, L"EDIT", std::to_wstring(refresh).c_str(),
-                                  WS_BORDER | WS_TABSTOP | ES_NUMBER, IntervalEdit);
-        SendMessageW(state->interval, EM_SETLIMITTEXT, 5, 0);
-        state->cpuLabel = control(window, L"STATIC", L"Process CPU percentage", SS_NOPREFIX, 0);
-        state->cpuMode = control(window, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, CpuMode);
-        for (auto label : {L"100% = one vCPU (Linux convention)", L"100% = all WSL vCPUs"})
-            SendMessageW(state->cpuMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
-        SendMessageW(state->cpuMode, CB_SETCURSEL, readSetting(L"CpuPercentOfTotal", 1) ? 1 : 0, 0);
-        state->status =
-            control(window, L"STATIC",
-                    L"Collectors always run as Linux root. Only the selected running distro is "
-                    L"monitored.\r\nSwitching away from WSL or pausing disconnects the collector.\r\nA saved "
-                    L"refresh interval applies automatically to ongoing monitoring.",
-                    SS_NOPREFIX, 0);
-        state->save = control(window, L"BUTTON", L"Save", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK);
-        state->cancel = control(window, L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, IDCANCEL);
-        for (HWND child : {state->edit, state->interval, state->cpuMode, state->save, state->cancel})
-            SetWindowSubclass(child, settingsKeys, 1, reinterpret_cast<DWORD_PTR>(window));
-        layoutSettings(window, *state);
-        WslApplyTheme(window);
-        return 0;
-    }
     case WM_SIZE:
-        layoutSettings(window, *state);
-        return 0;
-    case WM_DPICHANGED: {
-        const RECT *bounds = reinterpret_cast<RECT *>(lparam);
-        SetWindowPos(window, nullptr, bounds->left, bounds->top, bounds->right - bounds->left,
-                     bounds->bottom - bounds->top, SWP_NOZORDER | SWP_NOACTIVATE);
-        layoutSettings(window, *state);
-        return 0;
-    }
-    case WM_GETFONT:
-        return reinterpret_cast<LRESULT>(font);
-    case WM_ERASEBKGND: {
-        RECT r{};
-        GetClientRect(window, &r);
-        SetDCBrushColor(reinterpret_cast<HDC>(wparam), WslDialogBackground());
-        FillRect(reinterpret_cast<HDC>(wparam), &r, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-        return 1;
-    }
-    case WM_CTLCOLORSTATIC: {
+        layoutOptions(window);
+        return TRUE;
+    case WM_COMMAND:
+        if (state->loading)
+            return FALSE;
+        try
+        {
+            int id = LOWORD(wparam), event = HIWORD(wparam);
+            if (id == IDC_WSL_CPU_MODE && event == CBN_SELCHANGE)
+            {
+                writeSetting(L"CpuPercentOfTotal",
+                             SendDlgItemMessageW(window, id, CB_GETCURSEL, 0, 0) == 1 ? 1 : 0);
+                optionsStatus(window, L"CPU percentage display saved.");
+                return TRUE;
+            }
+            if (id == IDC_WSL_NODE_INSPECTOR && event == BN_CLICKED)
+            {
+                writeSetting(L"UseNodeInspectorWithoutAsking",
+                             IsDlgButtonChecked(window, id) == BST_CHECKED ? 1 : 0);
+                optionsStatus(window, L"Node Inspector preference saved.");
+                return TRUE;
+            }
+            if (id == IDC_WSL_PREFIX && event == EN_CHANGE)
+            {
+                EnableWindow(GetDlgItem(window, IDC_WSL_APPLY_PREFIX), state->selected >= 0);
+                optionsStatus(window, L"Choose Apply prefix to save this path.");
+                return TRUE;
+            }
+            if (id == IDC_WSL_APPLY_PREFIX && event == BN_CLICKED)
+            {
+                applyPrefix(window, *state);
+                return TRUE;
+            }
+            if (id == IDC_WSL_DISTRO && event == CBN_SELCHANGE)
+            {
+                int next = static_cast<int>(SendDlgItemMessageW(window, id, CB_GETCURSEL, 0, 0));
+                if (IsWindowEnabled(GetDlgItem(window, IDC_WSL_APPLY_PREFIX)) && !applyPrefix(window, *state))
+                {
+                    SendDlgItemMessageW(window, id, CB_SETCURSEL, state->selected, 0);
+                    return TRUE;
+                }
+                state->selected = next;
+                loadPrefix(window, *state);
+                optionsStatus(window, L"");
+                return TRUE;
+            }
+        }
+        catch (const std::exception &error)
+        {
+            optionsStatus(window, wide(error.what()));
+        }
+        break;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORDLG: {
         HDC dc = reinterpret_cast<HDC>(wparam);
         SetTextColor(dc, WslDialogText());
         SetBkColor(dc, WslDialogBackground());
         SetDCBrushColor(dc, WslDialogBackground());
-        return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+        return reinterpret_cast<INT_PTR>(GetStockObject(DC_BRUSH));
     }
-    case WM_COMMAND:
-        if (LOWORD(wparam) == IDCANCEL)
-        {
-            DestroyWindow(window);
-            return 0;
-        }
-        if (LOWORD(wparam) == IDOK)
-        {
-            wchar_t prefix[32768]{}, interval[32]{};
-            GetWindowTextW(state->edit, prefix, static_cast<int>(std::size(prefix)));
-            GetWindowTextW(state->interval, interval, static_cast<int>(std::size(interval)));
-            std::wstring value = prefix;
-            if (!validPrefix(value))
-            {
-                errorBox(window, L"Enter an absolute Windows drive path (for example R:\\), a UNC path with "
-                                 L"a server and share (\\\\server\\share\\), or leave the prefix blank.");
-                SetFocus(state->edit);
-                SendMessageW(state->edit, EM_SETSEL, 0, -1);
-                return 0;
-            }
-            wchar_t *end = nullptr;
-            errno = 0;
-            unsigned long refresh = wcstoul(interval, &end, 10);
-            if (errno == ERANGE || end == interval || *end != L'\0' || refresh < 500 || refresh > 60000)
-            {
-                errorBox(window, L"Enter a whole-number refresh interval from 500 to 60000 milliseconds.");
-                SetFocus(state->interval);
-                SendMessageW(state->interval, EM_SETSEL, 0, -1);
-                return 0;
-            }
-            try
-            {
-                setDistroPrefix(state->distro, value);
-                writeSetting(L"RefreshInterval", static_cast<DWORD>(refresh));
-                writeSetting(L"CpuPercentOfTotal",
-                             SendMessageW(state->cpuMode, CB_GETCURSEL, 0, 0) == 1 ? 1 : 0);
-                DestroyWindow(window);
-            }
-            catch (const std::exception &error)
-            {
-                errorBox(window, wide(error.what()));
-            }
-            return 0;
-        }
-        break;
-    case WM_CLOSE:
-        DestroyWindow(window);
-        return 0;
     case WM_NCDESTROY:
         delete state;
         SetWindowLongPtrW(window, GWLP_USERDATA, 0);
         break;
     }
-    return DefWindowProcW(window, message, wparam, lparam);
+    return FALSE;
 }
 } // namespace
 
 void showSettings(HWND owner, const std::wstring &distro)
 {
-    WNDCLASSW cls{};
-    cls.hInstance = instance;
-    cls.lpfnWndProc = settingsProc;
-    cls.lpszClassName = L"WslTools.Settings";
-    cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_3DFACE + 1);
-    if (!RegisterClassW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-    {
-        errorBox(owner, L"Could not register the settings window.");
-        return;
-    }
-    auto state = std::make_unique<SettingsWindow>();
-    state->distro = distro;
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT bounds{0, 0, scale(owner, 636), scale(owner, 340)};
-    AdjustWindowRectExForDpi(&bounds, style, FALSE, WS_EX_CONTROLPARENT, GetDpiForWindow(owner));
-    HWND window = CreateWindowExW(WS_EX_CONTROLPARENT, cls.lpszClassName, L"WSL Tools settings", style,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, bounds.right - bounds.left,
-                                  bounds.bottom - bounds.top, owner, nullptr, instance, &state);
-    if (!window)
-    {
-        errorBox(owner, L"Could not create the settings window.");
-        return;
-    }
-    ShowWindow(window, SW_SHOW);
-    SetFocus(GetDlgItem(window, PrefixEdit));
+    preferredOptionsDistro = distro;
+    WslOpenHostOptions(owner);
 }
 } // namespace wsl
+
+extern "C" INT_PTR CALLBACK WslOptionsDialogProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
+{
+    return wsl::optionsProc(window, message, wparam, lparam);
+}

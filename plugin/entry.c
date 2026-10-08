@@ -4,6 +4,7 @@
 #include <settings.h>
 #include <toolstatusintf.h>
 #include "host_bridge.h"
+#include "options.h"
 
 extern HWND WslCreateView(HWND parent, HINSTANCE instance);
 extern void WslSetActive(BOOL active);
@@ -12,16 +13,39 @@ extern void WslFocusContent(BOOL select);
 extern void WslSearchChanged(void);
 extern void WslHostRefreshChanged(BOOL automatic);
 extern void WslHostRefresh(void);
+extern INT_PTR CALLBACK WslOptionsDialogProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
 
 static HINSTANCE PluginModule;
 static PH_CALLBACK_REGISTRATION MainWindowRegistration;
 static PH_CALLBACK_REGISTRATION UnloadRegistration;
+static PH_CALLBACK_REGISTRATION OptionsRegistration;
+static PH_CALLBACK_REGISTRATION PluginOptionsRegistration;
 static HWND ViewWindow;
 static HWND HostWindow;
 static PTOOLSTATUS_INTERFACE ToolStatus;
 static PH_CALLBACK_REGISTRATION SearchChangedRegistration;
 static BOOLEAN SearchCallbackRegistered;
 static PH_STRINGREF SearchBanner = PH_STRINGREF_INIT(L"Search WSL");
+
+void WslOpenHostOptions(HWND owner)
+{
+    UNREFERENCED_PARAMETER(owner);
+    SystemInformer_ShowOptions(L"WSL");
+}
+
+static VOID NTAPI OptionsInitializing(PVOID parameter, PVOID context)
+{
+    PPH_PLUGIN_OPTIONS_POINTERS options = (PPH_PLUGIN_OPTIONS_POINTERS)parameter;
+    UNREFERENCED_PARAMETER(context);
+    options->CreateSection(L"WSL", PluginModule, MAKEINTRESOURCEW(IDD_WSL_OPTIONS), WslOptionsDialogProc,
+                           NULL);
+}
+
+static VOID NTAPI ShowPluginOptions(PVOID parameter, PVOID context)
+{
+    UNREFERENCED_PARAMETER(context);
+    WslOpenHostOptions((HWND)parameter);
+}
 
 DWORD WslHostIntegerSetting(PCWSTR name)
 {
@@ -292,11 +316,15 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     information->Author = L"David Trapp";
     information->Description =
         L"Processes, connections, open files, modules and systemd services for WSL 2. MIT licensed.";
-    information->HasOptions = FALSE;
+    information->HasOptions = TRUE;
 
     PhRegisterCallback(PhGetGeneralCallback(GeneralCallbackMainWindowShowing), MainWindowShowing, NULL,
                        &MainWindowRegistration);
     PhRegisterCallback(PhGetPluginCallback(plugin, PluginCallbackUnload), PluginUnloading, NULL,
                        &UnloadRegistration);
+    PhRegisterCallback(PhGetGeneralCallback(GeneralCallbackOptionsWindowInitializing), OptionsInitializing,
+                       NULL, &OptionsRegistration);
+    PhRegisterCallback(PhGetPluginCallback(plugin, PluginCallbackShowOptions), ShowPluginOptions, NULL,
+                       &PluginOptionsRegistration);
     return TRUE;
 }

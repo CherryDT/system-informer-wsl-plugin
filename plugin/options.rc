@@ -1,0 +1,22 @@
+#include <windows.h>
+#include "options.h"
+
+IDD_WSL_OPTIONS DIALOGEX 0, 0, 275, 233
+STYLE DS_SETFONT | DS_FIXEDSYS | DS_CONTROL | WS_CHILD
+FONT 8, "MS Shell Dlg", 400, 0, 1
+BEGIN
+    GROUPBOX "Monitoring", IDC_WSL_GENERAL_GROUP, 7, 7, 261, 92
+    LTEXT "Process CPU percentage:", IDC_WSL_CPU_LABEL, 14, 20, 220, 10
+    COMBOBOX IDC_WSL_CPU_MODE, 14, 33, 247, 70, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL "Use Node Inspector for JS stacks without asking", IDC_WSL_NODE_INSPECTOR, "Button", BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP, 14, 53, 247, 20
+    LTEXT "Refresh speed and automatic updates follow the main View menu.", IDC_WSL_REFRESH_NOTE, 14, 77, 247, 16
+
+    GROUPBOX "Explorer paths", IDC_WSL_PATH_GROUP, 7, 106, 261, 99
+    LTEXT "WSL 2 distribution:", IDC_WSL_DISTRO_LABEL, 14, 119, 230, 10
+    COMBOBOX IDC_WSL_DISTRO, 14, 132, 247, 70, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT "Windows prefix (blank uses the normal WSL share):", IDC_WSL_PREFIX_LABEL, 14, 152, 247, 10
+    EDITTEXT IDC_WSL_PREFIX, 14, 165, 172, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    PUSHBUTTON "Apply prefix", IDC_WSL_APPLY_PREFIX, 191, 164, 70, 16
+    LTEXT "Example: U:\\ maps /home/user to U:\\home\\user.", IDC_WSL_PREFIX_HINT, 14, 185, 247, 14
+    LTEXT "", IDC_WSL_OPTIONS_STATUS, 7, 211, 261, 18, SS_NOPREFIX
+END

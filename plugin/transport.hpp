@@ -21,6 +21,9 @@ struct Distro {
     std::wstring name;
 };
 
+// Reads registered WSL2 names without starting any distribution.
+std::vector<std::wstring> registeredWsl2Distros();
+
 // Lists already-running WSL2 distributions. Discovery never launches a distro.
 std::vector<Distro> runningDistros(const std::function<bool()>& cancelled = {});
 

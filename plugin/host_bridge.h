@@ -11,6 +11,7 @@ extern "C"
     DWORD WslHostRefreshInterval(void);
     BOOL WslHostRefreshAutomatically(void);
     DWORD WslHostIntegerSetting(PCWSTR name);
+    void WslOpenHostOptions(HWND owner);
 
 #ifdef __cplusplus
 }

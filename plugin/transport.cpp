@@ -305,7 +305,7 @@ std::wstring decodeList(const std::string& bytes) {
     return result;
 }
 
-std::vector<std::wstring> registeredWsl2Distros() {
+std::vector<std::wstring> enumerateRegisteredWsl2Distros() {
     HKEY root = nullptr;
     const LSTATUS status = RegOpenKeyExW(HKEY_CURRENT_USER,
         L"Software\\Microsoft\\Windows\\CurrentVersion\\Lxss", 0, KEY_READ, &root);
@@ -478,6 +478,10 @@ std::wstring quoteArg(const std::wstring& value) {
     result.append(slashes * 2, L'\\');
     result.push_back(L'\"');
     return result;
+}
+
+std::vector<std::wstring> registeredWsl2Distros() {
+    return enumerateRegisteredWsl2Distros();
 }
 
 std::vector<Distro> runningDistros(const std::function<bool()>& cancelled) {
