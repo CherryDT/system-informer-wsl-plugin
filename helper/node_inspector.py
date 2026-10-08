@@ -400,6 +400,109 @@ def discover(target, deadline):
             raise CaptureError("The process owns more than 32 listeners; Inspector discovery was incomplete")
     return endpoints
 
+
+def debugger_event(session, message):
+    method = message.get("method")
+    params = message.get("params", {})
+    if not isinstance(params, dict):
+        raise CaptureError("Invalid Node Inspector event")
+    if method == "Debugger.scriptParsed" and len(session.scripts) < 4096:
+        session.scripts[str(params.get("scriptId", ""))] = str(params.get("url", ""))[:2048]
+    elif method == "Debugger.paused":
+        session.paused = params
+    elif method == "Debugger.resumed":
+        session.paused = None
+
+
+def debugger_stack(session, heading, deadline):
+    session.command("Debugger.enable", {}, deadline)
+    session.debugger_enabled = True
+    # Enable replays an existing pause. Capture it without sending pause/resume
+    # commands which would interfere with another debugger's stopped thread.
+    session.preexisting_pause = session.paused is not None
+    if not session.preexisting_pause:
+        session.pause_requested = True
+        session.command("Debugger.pause", {}, deadline)
+        while session.paused is None:
+            session.pump(deadline)
+    frames = session.paused.get("callFrames", [])
+    if not isinstance(frames, list):
+        raise CaptureError("Invalid JavaScript stack response")
+    lines = [heading, ""]
+    for index, frame in enumerate(frames[:256]):
+        location = frame.get("location", {})
+        url = frame.get("url") or session.scripts.get(str(location.get("scriptId", ""))) or "<unknown script>"
+        name = frame.get("functionName") or "<anonymous>"
+        line = int(location.get("lineNumber", 0)) + 1
+        column = int(location.get("columnNumber", 0)) + 1
+        lines.append("#%d %s at %s:%d:%d" % (index, str(name)[:500], str(url)[:2048], line, column))
+    if len(frames) > 256:
+        lines.append("[Only the first 256 JavaScript frames are shown]")
+    if not frames:
+        lines.append("No JavaScript frames were present at the pause point.")
+    if session.preexisting_pause:
+        lines.append("[Already paused by another debugger; this session did not resume it]")
+    return "\n".join(lines)
+
+
+def resume_debugger(session, deadline):
+    if session.pause_requested and not session.preexisting_pause:
+        session.command("Debugger.resume", {}, deadline)
+        session.pause_requested = False
+
+
+class WorkerSession:
+    """One NodeWorker session multiplexed over the verified parent connection."""
+    def __init__(self, parent, identifier, info):
+        self.parent = parent
+        self.identifier = identifier
+        self.title = str(info.get("title", ""))[:500]
+        self.worker_id = str(info.get("workerId", identifier))[:100]
+        self.scripts = {}
+        self.paused = None
+        self.preexisting_pause = False
+        self.pause_requested = False
+        self.debugger_enabled = False
+        self.detached = False
+        self.next_id = 1
+        self.responses = {}
+
+    def event(self, message):
+        debugger_event(self, message)
+        if "id" in message:
+            # One command is outstanding per worker. Retain a few late replies
+            # after a timeout without allowing unsolicited replies to grow memory.
+            if len(self.responses) >= 8:
+                self.responses.pop(next(iter(self.responses)))
+            self.responses[message["id"]] = message
+
+    def pump(self, deadline):
+        if self.detached:
+            raise CaptureError("Worker exited or its Inspector session detached")
+        self.parent.pump(deadline)
+
+    def command(self, method, params, deadline):
+        if self.detached:
+            raise CaptureError("Worker exited or its Inspector session detached")
+        identifier = self.next_id
+        self.next_id += 1
+        request = json.dumps({"id": identifier, "method": method, "params": params}, separators=(",", ":"))
+        self.parent.command("NodeWorker.sendMessageToWorker", {"sessionId": self.identifier, "message": request}, deadline)
+        while identifier not in self.responses:
+            self.pump(deadline)
+        message = self.responses.pop(identifier)
+        if "error" in message:
+            raise CaptureError("Worker %s failed: %s" % (method, str(message["error"].get("message", "protocol error"))[:500]))
+        result = message.get("result", {})
+        if not isinstance(result, dict):
+            raise CaptureError("Invalid worker Inspector command result")
+        return result
+
+    def detach(self, deadline):
+        if not self.detached:
+            self.parent.command("NodeWorker.detach", {"sessionId": self.identifier}, deadline)
+            self.detached = True
+
 class Inspector:
     def __init__(self, target, endpoint, deadline):
         self.listener, self.path = endpoint
@@ -415,6 +518,11 @@ class Inspector:
         self.pause_requested = False
         self.debugger_enabled = False
         self.verified = False
+        self.workers = {}
+        self.worker_domain = False
+        self.worker_limit = False
+        self.worker_notes = []
+        self.captured_workers = 0
         try:
             nonce = base64.b64encode(os.urandom(16)).decode("ascii")
             request = ("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -507,16 +615,39 @@ class Inspector:
                 return message
 
     def event(self, message):
+        debugger_event(self, message)
         method = message.get("method")
         params = message.get("params", {})
-        if not isinstance(params, dict):
-            raise CaptureError("Invalid Node Inspector event")
-        if method == "Debugger.scriptParsed" and len(self.scripts) < 4096:
-            self.scripts[str(params.get("scriptId", ""))] = str(params.get("url", ""))[:2048]
-        elif method == "Debugger.paused":
-            self.paused = params
-        elif method == "Debugger.resumed":
-            self.paused = None
+        if method == "NodeWorker.attachedToWorker":
+            identifier = params.get("sessionId")
+            info = params.get("workerInfo", {})
+            if not isinstance(identifier, str) or not isinstance(info, dict):
+                raise CaptureError("Invalid Node worker attachment event")
+            if info.get("type") != "worker":
+                return
+            if len(self.workers) >= 32:
+                self.worker_limit = True
+                return
+            self.workers[identifier] = WorkerSession(self, identifier, info)
+        elif method == "NodeWorker.detachedFromWorker":
+            worker = self.workers.get(params.get("sessionId"))
+            if worker is not None:
+                worker.detached = True
+                # An exited worker no longer needs a resume command.
+                worker.pause_requested = False
+        elif method == "NodeWorker.receivedMessageFromWorker":
+            worker = self.workers.get(params.get("sessionId"))
+            if worker is not None:
+                nested = params.get("message")
+                if not isinstance(nested, str) or len(nested) > FRAME_LIMIT:
+                    raise CaptureError("Invalid Node worker protocol message")
+                decoded = json.loads(nested)
+                if not isinstance(decoded, dict):
+                    raise CaptureError("Invalid Node worker protocol message")
+                worker.event(decoded)
+
+    def pump(self, deadline):
+        self.event(self.message(deadline))
 
     def command(self, method, params, deadline):
         identifier = self.send(method, params, deadline)
@@ -533,39 +664,59 @@ class Inspector:
 
     def capture(self, target, deadline):
         target.check()
-        self.command("Debugger.enable", {}, deadline)
-        self.debugger_enabled = True
-        # A debugger already paused by another client must remain paused. Node
-        # sends its existing paused state as part of Debugger.enable's events.
-        self.preexisting_pause = self.paused is not None
-        if not self.preexisting_pause:
-            self.pause_requested = True
-            self.command("Debugger.pause", {}, deadline)
-            while self.paused is None:
-                self.event(self.message(deadline))
-        frames = self.paused.get("callFrames", [])
-        if not isinstance(frames, list):
-            raise CaptureError("Invalid JavaScript stack response")
-        lines = ["Node Inspector: main JavaScript thread", ""]
-        for index, frame in enumerate(frames[:256]):
-            location = frame.get("location", {})
-            url = frame.get("url") or self.scripts.get(str(location.get("scriptId", ""))) or "<unknown script>"
-            name = frame.get("functionName") or "<anonymous>"
-            line = int(location.get("lineNumber", 0)) + 1
-            column = int(location.get("columnNumber", 0)) + 1
-            lines.append("#%d %s at %s:%d:%d" % (index, str(name)[:500], str(url)[:2048], line, column))
-        if len(frames) > 256:
-            lines.append("[Only the first 256 JavaScript frames are shown]")
-        if not frames:
-            lines.append("No JavaScript frames were present at the pause point.")
-        lines += ["", "Worker threads, native frames and asynchronous task history are not included."]
+        try:
+            # This subscription belongs to our CDP session. It never asks Node
+            # to pause newly created workers or changes another client's policy.
+            self.command("NodeWorker.enable", {"waitForDebuggerOnStart": False}, min(deadline, time.monotonic() + 0.5))
+            self.worker_domain = True
+        except (CaptureError, OSError, ValueError, TypeError) as error:
+            self.worker_notes.append("Worker stacks unavailable: " + str(error))
+        sections = [debugger_stack(self, "Node Inspector: main JavaScript thread", deadline)]
+        # Resume the main thread promptly rather than holding it stopped while
+        # potentially slower worker captures consume the rest of the deadline.
+        resume_debugger(self, min(deadline, time.monotonic() + 0.5))
+        for worker in list(self.workers.values()):
+            if time.monotonic() + 0.4 >= deadline:
+                self.worker_notes.append("Worker capture reached the time limit; remaining workers were not captured.")
+                break
+            heading = "Worker %s%s" % (worker.worker_id, " (" + worker.title + ")" if worker.title else "")
+            try:
+                sections.append(debugger_stack(worker, heading, min(deadline - 0.3, time.monotonic() + 1.0)))
+                self.captured_workers += 1
+            except (CaptureError, OSError, ValueError, TypeError) as error:
+                self.worker_notes.append(heading + ": " + str(error))
+            try:
+                resume_debugger(worker, min(deadline, time.monotonic() + 0.3))
+                worker.detach(min(deadline, time.monotonic() + 0.2))
+            except (CaptureError, OSError, ValueError, TypeError) as error:
+                self.worker_notes.append(heading + " cleanup: " + str(error))
+                # Keep at most one possibly paused worker outstanding. Final
+                # cleanup retries it using the separate two-second reserve.
+                break
+        if self.worker_limit:
+            self.worker_notes.append("Only the first 32 attached workers were considered.")
+        if self.worker_domain and not self.workers:
+            sections.append("No existing worker threads were reported by Node Inspector.")
+        sections.extend(self.worker_notes)
+        sections.append("Threads are sampled sequentially, not at one simultaneous instant. Native frames and asynchronous task history are not included.")
         target.check()
-        return "\n".join(lines)
+        return "\n\n".join(sections)
 
     def resume_ours(self, deadline):
-        if self.pause_requested and not self.preexisting_pause:
-            self.command("Debugger.resume", {}, deadline)
-            self.pause_requested = False
+        resume_debugger(self, deadline)
+        for worker in self.workers.values():
+            if worker.pause_requested and not worker.detached:
+                resume_debugger(worker, deadline)
+
+    def detach_workers(self, deadline):
+        if self.worker_domain:
+            for worker in self.workers.values():
+                if not worker.detached:
+                    worker.detach(deadline)
+            # NodeWorker.disable affects only this client's auto-attach handle.
+            # Socket disconnect also releases any untracked, never-paused workers.
+            self.command("NodeWorker.disable", {}, deadline)
+            self.worker_domain = False
 
     def disconnect(self, deadline):
         try:
@@ -624,8 +775,13 @@ def capture(request):
                     time.sleep(min(0.05, remaining(capture_deadline)))
         session = connect_matching(target, endpoints, capture_deadline)
         result["text"] = session.capture(target, capture_deadline)
-        result["success"] = True
-        result["message"] = "Captured main-thread JavaScript stacks."
+        result["success"] = not session.worker_notes
+        if session.worker_notes:
+            result["message"] = "Captured main-thread JavaScript stacks; worker capture was partial. " + session.worker_notes[0]
+        elif session.captured_workers:
+            result["message"] = "Captured JavaScript stacks for the main thread and %d worker%s." % (session.captured_workers, "" if session.captured_workers == 1 else "s")
+        else:
+            result["message"] = "Captured main-thread JavaScript stacks."
         if session.preexisting_pause:
             result["message"] += " The process was already paused; this session did not resume it."
     except (CaptureError, OSError, ValueError, UnicodeError, TypeError, KeyError) as error:
@@ -642,6 +798,11 @@ def capture(request):
             except (CaptureError, OSError, ValueError, TypeError) as error:
                 cleanup_failed = True
                 cleanup_notes.append("Could not confirm the process was resumed after capture: %s" % error)
+            try:
+                session.detach_workers(min(cleanup_deadline, time.monotonic() + 0.25))
+            except (CaptureError, OSError, ValueError, TypeError) as error:
+                cleanup_failed = True
+                cleanup_notes.append("Could not confirm worker Inspector sessions detached: %s" % error)
             skip_close = False
             if enabled_by_us and session.verified:
                 try:
