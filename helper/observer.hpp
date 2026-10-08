@@ -16,7 +16,10 @@ struct ProcessIdentity {
     uint64_t start_ticks;
 };
 struct ProcessStat {
-    int pid = 0, ppid = 0, threads = 0;
+    int pid = 0, ppid = 0, threads = 0, pgrp = 0, session = 0;
+    int nice = 0, priority = 0, processor = -1, policy = 0;
+    int64_t tty_nr = 0;
+    uint64_t minor_faults = 0, major_faults = 0, user_ticks = 0, kernel_ticks = 0;
     std::string name, state;
     uint64_t start_ticks = 0, cpu_ticks = 0, virtual_bytes = 0, rss_bytes = 0;
 };
@@ -39,7 +42,7 @@ ProcessIdentity request_identity(const Json& request);
 void require_identity(const ProcessIdentity& identity);
 std::string boot_id();
 Json hello();
-Json snapshot();
+Json snapshot(const Json& request);
 Json process_details(const Json& request);
 Json send_signal(const Json& request);
 Json process_stacks(const Json& request);
@@ -54,7 +57,7 @@ CommandResult run_command(const std::vector<std::string>& arguments, int timeout
     size_t output_limit = 2 * 1024 * 1024,
     std::optional<CommandCredentials> credentials = std::nullopt,
     const std::string& java_tool = {});
-Json services();
+Json services(const Json& request);
 Json service_details(const Json& request);
 Json service_action(const Json& request);
 } // namespace observer

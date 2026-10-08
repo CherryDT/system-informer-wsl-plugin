@@ -187,7 +187,7 @@ CommandResult run_command(const std::vector<std::string>& arguments, int timeout
     if (result.output.size() == output_limit) result.output += "\n[Output truncated]\n";
     return result;
 }
-Json services() {
+Json services(const Json& request) {
     if (!systemd_available()) return {{"available", false}, {"services", Json::array()},
         {"message", "systemd is not running in this distribution"}};
     std::map<std::string, Json> units;
@@ -255,8 +255,14 @@ Json services() {
         }
     }
     Json rows = Json::array();
-    for (auto& entry : units) rows.push_back(std::move(entry.second));
-    return {{"available", true}, {"services", rows}, {"message", warning}};
+    const bool identities_only = request.value("identities_only", false);
+    // Both enumerations are required: loaded transient units and unloaded unit
+    // files have different lifetimes. Their normal output contains properties
+    // incidentally; background monitoring retains only the names it needs.
+    for (auto& entry : units)
+        rows.push_back(identities_only ? Json{{"name", entry.first}} : std::move(entry.second));
+    return {{"available", true}, {"services", rows}, {"message", warning},
+            {"identities_only", identities_only}};
 }
 Json service_details(const Json& request) {
     const auto name = unit_name(request);

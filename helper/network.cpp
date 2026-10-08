@@ -47,6 +47,7 @@ std::string socket_state(unsigned state, bool udp) {
 }
 Json connections(const Json& request) {
     const bool filtered = request.contains("pid");
+    const bool identities_only = request.value("identities_only", false);
     ProcessIdentity identity{0, 0};
     if (filtered) { identity = request_identity(request); require_identity(identity); }
     std::map<uint64_t, std::vector<Owner>> owners;
@@ -79,6 +80,10 @@ Json connections(const Json& request) {
     size_t response_budget = 12 * 1024 * 1024;
     bool truncated = false;
     auto append = [&](Json item) {
+        if (identities_only) {
+            item.erase("process");
+            item.erase("state");
+        }
         if (!append_with_budget(result, std::move(item), response_budget)) truncated = true;
     };
     unsigned tables_read = 0;
@@ -156,7 +161,7 @@ Json connections(const Json& request) {
         } catch (...) { }
     }
     if (filtered) require_identity(identity);
-    return {{"connections", result}, {"connections_truncated", truncated}, {"inaccessible_processes", inaccessible},
+    return {{"identities_only", identities_only}, {"connections", result}, {"connections_truncated", truncated}, {"inaccessible_processes", inaccessible},
             {"tables_read", tables_read}, {"network_namespace", read_link("/proc/self/ns/net")},
             {"coverage", "Current network namespace only. PID 0 means no visible owner (including TIME_WAIT sockets)."}};
 }

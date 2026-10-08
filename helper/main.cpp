@@ -24,13 +24,13 @@ void check_nesting(const std::string& line) {
 observer::Json dispatch(const observer::Json& request) {
     const auto operation = request.at("op").get<std::string>();
     if (operation == "hello") return observer::hello();
-    if (operation == "snapshot") return observer::snapshot();
+    if (operation == "snapshot") return observer::snapshot(request);
     if (operation == "details") return observer::process_details(request);
     if (operation == "connections") return observer::connections(request);
     if (operation == "signal") return observer::send_signal(request);
     if (operation == "stacks") return observer::process_stacks(request);
     if (operation == "script_stacks") return observer::script_stacks(request);
-    if (operation == "services") return observer::services();
+    if (operation == "services") return observer::services(request);
     if (operation == "service_details") return observer::service_details(request);
     if (operation == "service_action") return observer::service_action(request);
     throw std::runtime_error("Unknown operation: " + operation);
