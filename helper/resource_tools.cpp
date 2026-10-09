@@ -262,7 +262,6 @@ Json memory_read(const ProcessIdentity& identity, const Mapping& mapping, const 
     mapping_fields(result, mapping);
     field(result, "Read address", hex(address));
     field(result, "Bytes read", std::to_string(memory.bytes.size()) + " / " + std::to_string(requested));
-    field(result, "Consistency", "Live memory; the process was not suspended and contents may change while reading.");
     if (!memory.note.empty()) field(result, "Read result", memory.note);
     constexpr char digits[] = "0123456789abcdef";
     std::string data_hex;
@@ -303,7 +302,6 @@ Json memory_strings(const ProcessIdentity& identity, const Mapping& mapping, con
     field(result, "Bytes scanned", std::to_string(memory.bytes.size()) + " / " + std::to_string(mapping.end - mapping.start));
     field(result, "Minimum length", std::to_string(minimum));
     field(result, "Encodings", "Printable ASCII and UTF-16LE (ASCII character range), at either byte alignment");
-    field(result, "Consistency", "Live memory; the process was not suspended.");
     std::string text = "Address             Encoding  String\n";
     size_t matches = 0;
     bool output_full = false;
@@ -543,8 +541,6 @@ Json module_inspect(const ProcessIdentity& identity, const Json& row, const std:
     field(result, "Base address", row.at("base").get<std::string>());
     field(result, "Device / inode", representative->device + " / " + std::to_string(representative->inode));
     field(result, "File size", std::to_string(file_before.st_size) + " bytes");
-    field(result, "Inspection", "readelf parses the mapped file; no code in the target image is executed.");
-    if (action == "dependencies") field(result, "Dependency resolution", "DT_NEEDED names and embedded search paths only. Resolved library paths are available in Modules; ldd is not executed.");
     std::istringstream lines(output.output);
     std::string line;
     bool header = false;

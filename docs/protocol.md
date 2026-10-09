@@ -251,7 +251,7 @@ returns the kernel stack/wait diagnostics as text. Scheduling actions are
 (`inputs.class`: `none`, `best-effort`, or `idle`; best-effort also uses
 `inputs.level`, 0 through 7). Real-time and deadline policies cannot be changed
 through this interface. CPU affinity accepts only online CPUs, with IDs up to
-8191. I/O-priority effects depend on the block-device scheduler.
+8191; CPU-list input is capped at 64 KiB. I/O-priority effects depend on the block-device scheduler.
 
 For example, inspect one thread with:
 
@@ -259,7 +259,13 @@ For example, inspect one thread with:
 {"id":7,"op":"thread","pid":123,"start_ticks":4567,"action":"properties","row":{"tid":124,"start_ticks":9876}}
 ```
 
-`all_threads:true` is supported for the four scheduling actions only. It takes
+`action:"settings"` is a read-only query for the affinity editor. It returns
+`online_cpus`, `affinity_cpus` (CPUs selected by every inspected thread), and
+`mixed_cpus` (selected by only some threads). It supports a single `row` or
+`all_threads:true`, validates identity, and reads up to 8,192 threads within two
+seconds. CPU IDs can be sparse. This runs only when opening the affinity editor.
+
+`all_threads:true` is also supported for the four scheduling actions. It takes
 one initial snapshot of the process's current TIDs and thread start times, then
 attempts the setting separately for each captured thread. `expected_exe`, when
 provided, must be an absolute path and must exactly match the process's current
@@ -542,7 +548,9 @@ matching JDK is needed if a custom JRE does not include `jcmd`. See Oracle's
 
 The stack pages are passive; their capture buttons and Ctrl+R start collection
 without a separate confirmation dialog. Node's method-choice dialog appears only
-when the automatic Inspector route has no verified listener. The page text
+when automatic Inspector use is disabled and there is no verified listener.
+Automatic Inspector use is enabled by default unless a saved preference overrides
+it. The page text
 explains the button, possible pause, and tool requirements. Java capture can
 pause threads at a JVM safepoint. Native GDB, py-spy, and llnode can briefly
 pause the target. Tools and runtime versions must be installed and compatible;

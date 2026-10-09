@@ -77,7 +77,8 @@ std::string input(const Json& request, const char* key) {
     if (!values.is_object() || values.size() > 8 || !values.contains(key) || !values.at(key).is_string())
         throw std::runtime_error(std::string("Missing input: ") + key);
     const auto value = values.at(key).get<std::string>();
-    if (value.empty() || value.size() > 4096 || value.find('\0') != std::string::npos)
+    const size_t limit = std::string(key) == "cpus" ? 65536 : 4096;
+    if (value.empty() || value.size() > limit || value.find('\0') != std::string::npos)
         throw std::runtime_error(std::string("Invalid input: ") + key);
     return value;
 }
@@ -111,7 +112,7 @@ void add_cpu(CpuMask& mask, int cpu) { mask[cpu / (8 * sizeof(unsigned long))] |
 bool has_cpu(const CpuMask& mask, int cpu) { return (mask[cpu / (8 * sizeof(unsigned long))] & (1UL << (cpu % (8 * sizeof(unsigned long))))) != 0; }
 CpuMask parse_cpus(const std::string& text) {
     auto mask = empty_mask();
-    if (text.empty() || text.size() > 4096 || text.back() == ',') throw std::runtime_error("Enter CPUs such as 0-3,5");
+    if (text.empty() || text.size() > 65536 || text.back() == ',') throw std::runtime_error("Enter CPUs such as 0-3,5");
     std::istringstream parts(text);
     std::string part;
     while (std::getline(parts, part, ',')) {
@@ -142,7 +143,7 @@ CpuMask affinity(int tid) {
     return mask;
 }
 CpuMask online_cpus() {
-    auto value = read_text("/sys/devices/system/cpu/online", 4096);
+    auto value = read_text("/sys/devices/system/cpu/online", 65536);
     while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) value.pop_back();
     return parse_cpus(value);
 }
@@ -453,7 +454,67 @@ Json process_thread_tool(const Json& request) {
 }
 } // namespace
 
+// Affinity controls need the actual online CPU IDs, not an assumed 0..N-1
+// range. This query runs only when opening the editor and never changes a task.
+static Json affinity_settings(const Json& request) {
+    const auto identity = request_identity(request);
+    require_target(identity, request);
+    const auto online = online_cpus();
+    auto common = empty_mask(), any = empty_mask();
+    size_t observed = 0;
+    auto collect = [&](int tid, std::optional<uint64_t> expected) {
+        File task(open(("/proc/" + std::to_string(identity.pid) + "/task/" + std::to_string(tid)).c_str(),
+                       O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        if (task.fd < 0) throw error("Cannot open thread");
+        const auto start = number(stat_fields(read_at(task.fd, "stat", 16384))[19]);
+        if (expected && start != *expected) throw std::runtime_error("Thread identity changed; reopen the affinity editor");
+        const auto mask = affinity(tid);
+        if (number(stat_fields(read_at(task.fd, "stat", 16384))[19]) != start)
+            throw std::runtime_error("Thread identity changed while reading CPU affinity");
+        if (!observed) common = mask;
+        for (size_t i = 0; i < mask.size(); ++i) { common[i] &= mask[i]; any[i] |= mask[i]; }
+        ++observed;
+    };
+    if (request.value("all_threads", false)) {
+        struct Tasks { DIR* value; ~Tasks() { if (value) closedir(value); } } tasks{
+            opendir(("/proc/" + std::to_string(identity.pid) + "/task").c_str())};
+        if (!tasks.value) throw error("Cannot enumerate process threads");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (const auto* entry = readdir(tasks.value)) {
+            const std::string name(entry->d_name);
+            if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos) continue;
+            if (observed >= 8192 || std::chrono::steady_clock::now() >= deadline)
+                throw std::runtime_error("Reading process CPU affinity exceeded the collection limit");
+            const auto tid = number(name);
+            if (tid > static_cast<uint64_t>(std::numeric_limits<int>::max())) continue;
+            // Threads that exit during enumeration do not make the remaining
+            // live masks ambiguous. Other failures are reported by collect.
+            if (access(("/proc/" + std::to_string(identity.pid) + "/task/" + name).c_str(), F_OK) != 0) continue;
+            try { collect(static_cast<int>(tid), std::nullopt); }
+            catch (const std::exception&) {
+                if (access(("/proc/" + std::to_string(identity.pid) + "/task/" + name).c_str(), F_OK) == 0) throw;
+            }
+        }
+    } else {
+        const auto& row = request.at("row");
+        const auto tid = requested_number(row.at("tid"), "thread ID");
+        if (!tid || tid > static_cast<uint64_t>(std::numeric_limits<int>::max())) throw std::runtime_error("Invalid thread ID");
+        collect(static_cast<int>(tid), requested_number(row.at("start_ticks"), "thread start time"));
+    }
+    if (!observed) throw std::runtime_error("No live threads were available to inspect");
+    require_target(identity, request);
+    Json result{{"online_cpus", Json::array()}, {"affinity_cpus", Json::array()}, {"mixed_cpus", Json::array()}};
+    for (int cpu = 0; cpu < MaxCpus; ++cpu) {
+        if (!has_cpu(online, cpu)) continue;
+        result["online_cpus"].push_back(cpu);
+        if (has_cpu(common, cpu)) result["affinity_cpus"].push_back(cpu);
+        else if (has_cpu(any, cpu)) result["mixed_cpus"].push_back(cpu);
+    }
+    return result;
+}
+
 Json thread_tool(const Json& request) {
+    if (request.value("action", "") == "settings") return affinity_settings(request);
     if (request.value("all_threads", false)) return process_thread_tool(request);
     bool changed = false;
     try { return thread_tool_one(request, true, changed); }

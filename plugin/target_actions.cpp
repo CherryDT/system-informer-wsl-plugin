@@ -160,13 +160,15 @@ bool openProcessScheduling(HWND owner, const std::wstring &distro, const Json &p
     case ProcessPolicy:
         request["action"] = "set_policy";
         title = L"Process scheduling policy";
-        inputs = {{L"Policy (other, batch, idle)", "policy", L"other"}};
+        inputs = {{L"Scheduling policy", "policy",
+                   target.value("policy", 0) == 3   ? L"batch"
+                   : target.value("policy", 0) == 5 ? L"idle"
+                                                    : L"other"}};
         break;
     case ProcessIoPriority:
         request["action"] = "set_io_priority";
         title = L"Process I/O priority";
-        inputs = {{L"Class (none, best-effort, idle)", "class", L"best-effort"},
-                  {L"Level (0 highest, 7 lowest)", "level", L"4"}};
+        inputs = {{L"I/O class", "class", L"best-effort"}, {L"Level (0 highest, 7 lowest)", "level", L"4"}};
         break;
     }
     title += L" — all current threads — " + text(target, "name") + L" (" + text(target, "pid") + L" @ " +

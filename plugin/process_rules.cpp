@@ -87,7 +87,8 @@ Json schedulerInputs(const std::string &action, const Json &inputs)
         if (!inputs.contains(field) || !inputs.at(field).is_string())
             throw std::runtime_error("A saved scheduling input is missing or is not text.");
         const auto value = inputs.at(field).get<std::string>();
-        if (value.empty() || value.size() > 4096 || value.find('\0') != std::string::npos)
+        const size_t limit = std::string(field) == "cpus" ? 65536 : 4096;
+        if (value.empty() || value.size() > limit || value.find('\0') != std::string::npos)
             throw std::runtime_error("A saved scheduling input is invalid.");
         result[field] = value;
     }

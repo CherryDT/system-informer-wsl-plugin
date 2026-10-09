@@ -67,6 +67,7 @@ enum ControlId
     JournalText,
     PageOptions,
     TargetOptions,
+    CopySaveMenu,
     ResourceProperties = 400,
     ReadMemory,
     MemoryStrings,
@@ -79,7 +80,6 @@ enum ControlId
     CopyIdentifier,
     CopyAssignment,
     CopyShellAssignment,
-    ViewPathEntries,
     Statistics,
     KernelStack,
     ThreadNice,
@@ -114,8 +114,7 @@ struct Inspector
     bool overviewLayoutActive = false;
     std::vector<OverviewField> overviewFields;
     Json overviewData;
-    HWND refresh = nullptr, copy = nullptr, copyAll = nullptr, save = nullptr;
-    HWND open = nullptr, path = nullptr, value = nullptr;
+    HWND refresh = nullptr, copy = nullptr, copyAll = nullptr, save = nullptr, copySave = nullptr;
     HWND filterLabel = nullptr, filter = nullptr, clearFilter = nullptr;
     HWND pageOptions = nullptr, targetOptions = nullptr, closeButton = nullptr;
     std::set<int> enabledOptions;
@@ -792,19 +791,6 @@ void layout(Inspector &state);
 
 void updateActions(Inspector &state)
 {
-    bool overviewPage = state.page == 0;
-    SetWindowTextW(state.open, overviewPage ? (state.isService ? L"Open &unit file" : L"Open &executable")
-                                            : L"&Open location");
-    SetWindowTextW(state.path, overviewPage ? L"Copy co&mmand" : L"Copy &path");
-    ShowWindow(state.open, SW_HIDE);
-    ShowWindow(state.path, SW_HIDE);
-    ShowWindow(state.value, SW_HIDE);
-    std::wstring path = selectedPath(state);
-    EnableWindow(state.open, !state.loading && canOpen(selectedPath(state, true)));
-    EnableWindow(state.path,
-                 overviewPage ? !cell(state.overviewData, state.isService ? "exec_start" : "command").empty()
-                              : !path.empty());
-    EnableWindow(state.value, state.page == 3 && state.tables[2].selected());
     EnableWindow(state.refresh, !state.loading);
     bool stackAction = !state.isService && (state.page == StacksPage || state.page == RuntimeStacksPage);
     ShowWindow(state.captureStack, stackAction ? SW_SHOW : SW_HIDE);
@@ -968,42 +954,37 @@ void layout(Inspector &state)
     const int buttonHeight = scale(state.window, 21);
     int width = rect.right - rect.left;
     int height = rect.bottom - rect.top;
-    int buttonsY = toolbarMargin;
+    const int footerY = height - toolbarMargin - buttonHeight;
+    int buttonsY = state.isService ? toolbarMargin : footerY;
     int x = toolbarMargin;
     HDC dc = GetDC(state.window);
     HGDIOBJ previousFont = SelectObject(dc, state.uiFont ? state.uiFont : font);
     auto button = [&](HWND handle) {
-        int length = GetWindowTextLengthW(handle);
-        std::wstring label(static_cast<size_t>(length) + 1, L'\0');
-        GetWindowTextW(handle, label.data(), length + 1);
-        label.resize(static_cast<size_t>(length));
-        SIZE textSize{};
-        GetTextExtentPoint32W(dc, label.c_str(), length, &textSize);
-        // Fit each caption to the ordinary dialog font. The grid font is
-        // intentionally reserved for rows and tooltips, not toolbar buttons.
-        int buttonWidth =
-            std::max(scale(state.window, 58), static_cast<int>(textSize.cx) + scale(state.window, 20));
+        const auto label = windowText(handle);
+        SIZE extent{};
+        GetTextExtentPoint32W(dc, label.c_str(), static_cast<int>(label.size()), &extent);
+        const int buttonWidth =
+            std::max(scale(state.window, 58), static_cast<int>(extent.cx) + scale(state.window, 20));
         place(handle, x, buttonsY, buttonWidth, buttonHeight);
         x += buttonWidth + toolbarGap;
     };
+    if (!state.isService)
+        button(state.targetOptions);
     button(state.refresh);
-    button(state.copy);
-    button(state.copyAll);
-    button(state.save);
-    int contextualX = x;
-    button(state.open);
-    button(state.path);
-    x = contextualX;
-    button(state.value);
-    x = contextualX;
-    button(state.captureStack);
+    if (state.isService)
+    {
+        button(state.copy);
+        button(state.copyAll);
+        button(state.save);
+        place(state.targetOptions, toolbarMargin, footerY, scale(state.window, 80), buttonHeight);
+    }
+    else
+        button(state.copySave);
     SelectObject(dc, previousFont);
     ReleaseDC(state.window, dc);
-    int contentY = buttonsY + buttonHeight + toolbarGap;
-    const int footerY = height - toolbarMargin - buttonHeight;
-    place(state.targetOptions, toolbarMargin, footerY, scale(state.window, 80), buttonHeight);
     place(state.closeButton, width - toolbarMargin - scale(state.window, 80), footerY,
           scale(state.window, 80), buttonHeight);
+    const int contentY = state.isService ? toolbarMargin + buttonHeight + toolbarGap : toolbarMargin;
     RECT body{pageMargin, contentY, width - pageMargin, footerY - toolbarGap};
     // The tab frame never moves when changing pages. Search and status belong
     // inside that frame, like native Threads/Modules/Handles property pages.
@@ -1279,7 +1260,10 @@ void showStatistics(Inspector &state)
         field(L"Mapped virtual bytes", bytes(virtualBytes));
     if (!state.snapshotComplete[index])
         report["text"] = "This collection is incomplete. Counts cover only the collected objects.";
-    openResourceReport(state.window, L"Statistics — " + state.distro, std::move(report));
+    const auto summary = cell(report, "text");
+    report.erase("text");
+    openResourceReport(state.window, L"Statistics — " + state.distro, std::move(report),
+                       ResourceView::PropertiesOnly, summary);
 }
 
 void resourceAction(Inspector &state, int id)
@@ -1330,16 +1314,15 @@ void resourceAction(Inspector &state, int id)
                   {{"name", "Value length (UTF-16 units)"}, {"value", std::to_string(value.size())}},
                   {{"name", "Environment classification"}, {"value", row.value("scope", "process")}}})},
             {"text", utf8(value)}};
-        if (id == ViewPathEntries)
+        if (value.find(L':') != std::wstring::npos)
         {
-            report["fields"] = Json::array();
             size_t begin = 0, part = 1;
             do
             {
                 const auto end = value.find(L':', begin);
                 auto entry = value.substr(begin, end == std::wstring::npos ? end : end - begin);
-                report["fields"].push_back({{"name", std::to_string(part++)},
-                                            {"value", utf8(entry.empty() ? L"(current directory)" : entry)}});
+                report["fields"].push_back({{"name", "Subitem " + std::to_string(part++)},
+                                            {"value", utf8(entry.empty() ? L"(empty)" : entry)}});
                 if (end == std::wstring::npos)
                     break;
                 begin = end + 1;
@@ -1408,7 +1391,23 @@ void resourceAction(Inspector &state, int id)
                     {"action", "properties"}};
     if (state.page != 4)
         request["kind"] = state.page == 1 ? "handle" : state.page == 2 ? "module" : "memory";
-    std::wstring title = L"Properties";
+    std::wstring title;
+    ResourceView view = ResourceView::Both;
+    if (state.page == 4)
+    {
+        title = L"Thread " + cell(row, "tid");
+        view = ResourceView::PropertiesOnly;
+    }
+    else if (state.page == 2)
+    {
+        const auto path = cell(row, "path");
+        const auto slash = path.find_last_of(L'/');
+        title = L"Module " + (slash == std::wstring::npos ? path : path.substr(slash + 1));
+    }
+    else if (state.page == 1)
+        title = L"FD " + cell(row, "fd");
+    else
+        title = L"Mapping properties";
     std::vector<ResourceInput> inputs;
     bool mutation = false;
     switch (id)
@@ -1416,6 +1415,7 @@ void resourceAction(Inspector &state, int id)
     case ReadMemory:
         request["action"] = "read";
         title = L"Read memory";
+        view = ResourceView::DetailsFirst;
         inputs = {{L"Address (hex)", "address", L"0x" + cell(row, "start")},
                   {L"Bytes (maximum 1 MB)", "length", L"4096"}};
         break;
@@ -1430,14 +1430,17 @@ void resourceAction(Inspector &state, int id)
         request["action"] = "symbols";
         request["inputs"]["symbols"] = id == ModuleExports ? "exports" : "imports";
         title = id == ModuleExports ? L"Exported ELF symbols" : L"Imported ELF symbols";
+        view = ResourceView::DetailsOnly;
         break;
     case ModuleDependencies:
         request["action"] = "dependencies";
         title = L"Declared ELF dependencies";
+        view = ResourceView::DetailsOnly;
         break;
     case KernelStack:
         request["action"] = "kernel_stack";
         title = L"Kernel stack and wait diagnostics";
+        view = ResourceView::DetailsOnly;
         break;
     case ThreadNice:
         request["action"] = "set_nice";
@@ -1455,19 +1458,22 @@ void resourceAction(Inspector &state, int id)
         request["action"] = "set_policy";
         title = L"Thread scheduling policy";
         mutation = true;
-        inputs = {{L"Policy (other, batch, idle)", "policy", L"other"}};
+        inputs = {{L"Scheduling policy", "policy",
+                   row.value("policy", 0) == 3   ? L"batch"
+                   : row.value("policy", 0) == 5 ? L"idle"
+                                                 : L"other"}};
         break;
     case ThreadIoPriority:
         request["action"] = "set_io_priority";
         title = L"Thread I/O priority";
         mutation = true;
-        inputs = {{L"Class (none, best-effort, idle)", "class", L"best-effort"},
-                  {L"Level (0 highest, 7 lowest)", "level", L"4"}};
+        inputs = {{L"I/O class", "class", L"best-effort"}, {L"Level (0 highest, 7 lowest)", "level", L"4"}};
         break;
     }
     title += L" — " + cell(state.process, "name") + L" (" + cell(state.process, "pid") + L" @ " +
              state.distro + L")";
-    openResourceTool(state.window, state.distro, std::move(request), title, std::move(inputs), mutation);
+    openResourceTool(state.window, state.distro, std::move(request), title, std::move(inputs), mutation,
+                     view);
 }
 
 void appendResourceActions(Inspector &state, HMENU menu)
@@ -1518,7 +1524,6 @@ void appendResourceActions(Inspector &state, HMENU menu)
         add(CopyValue, L"Copy value\tCtrl+Shift+C");
         add(CopyAssignment, L"Copy NAME=value");
         add(CopyShellAssignment, L"Copy shell assignment");
-        add(ViewPathEntries, L"View colon-separated entries…");
     }
     if (state.page == 1 || state.page == 2 || state.page == MemoryPage)
     {
@@ -1597,6 +1602,25 @@ void commandImpl(Inspector &state, int id)
     case PageOptions:
         showPageOptions(state);
         break;
+    case CopySaveMenu: {
+        const HWND owner = state.window;
+        const auto identity = reinterpret_cast<LONG_PTR>(&state);
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING, CopySelection, L"Copy Selection\tCtrl+C");
+        AppendMenuW(menu, MF_STRING, CopyAll, L"Copy All");
+        AppendMenuW(menu, MF_STRING, Save, L"Save…\tCtrl+S");
+        RECT button{};
+        GetWindowRect(state.copySave, &button);
+        TPMPARAMS placement{sizeof(placement)};
+        placement.rcExclude = button;
+        const auto choice =
+            TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_VERTICAL, button.left,
+                             button.bottom, owner, &placement);
+        DestroyMenu(menu);
+        if (choice && IsWindow(owner) && GetWindowLongPtrW(owner, GWLP_USERDATA) == identity)
+            command(state, choice);
+        break;
+    }
     case TargetOptions: {
         const HWND owner = state.window;
         const auto identity = reinterpret_cast<LONG_PTR>(&state);
@@ -2283,7 +2307,8 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
                 id = ReadMemory;
             if (ctrl && (controlId == Files || controlId == Modules || controlId == Memory))
                 id = OpenLocation;
-            else if (controlId == PageOptions || controlId == TargetOptions || controlId == IDCANCEL)
+            else if (controlId == PageOptions || controlId == TargetOptions || controlId == CopySaveMenu ||
+                     controlId == IDCANCEL)
                 id = controlId;
             else if ((controlId >= Refresh && controlId <= CopyValue) || controlId == ClearFilter ||
                      controlId == CaptureStack)
@@ -2395,6 +2420,8 @@ std::wstring tooltipText(const Inspector &state, int id)
             return L"Capture runtime stacks (Ctrl+R)";
         return state.page == StacksPage && !state.isService ? L"Capture native thread stacks (Ctrl+R)"
                                                             : L"Refresh (Ctrl+R)";
+    case CopySaveMenu:
+        return L"Copy selected content, copy all, or save this view";
     case CopySelection:
         return L"Copy the selected text or row (Ctrl+C)";
     case CopyAll:
@@ -2431,8 +2458,8 @@ void createTooltips(Inspector &state)
     if (!state.tooltips)
         return;
     SendMessageW(state.tooltips, TTM_SETMAXTIPWIDTH, 0, scale(state.window, 380));
-    for (HWND child : {state.refresh, state.copy, state.copyAll, state.save, state.open, state.path,
-                       state.value, state.captureStack, state.clearFilter, state.filter, state.status})
+    for (HWND child : {state.refresh, state.copy, state.copyAll, state.save, state.copySave,
+                       state.captureStack, state.clearFilter, state.filter, state.status})
     {
         if (!child)
             continue;
@@ -2495,12 +2522,15 @@ void createControls(Inspector &state)
         }
     }
     state.refresh = control(window, WC_BUTTONW, L"&Refresh", BS_PUSHBUTTON | WS_TABSTOP, Refresh);
-    state.copy = control(window, WC_BUTTONW, L"&Copy selection", BS_PUSHBUTTON | WS_TABSTOP, CopySelection);
-    state.copyAll = control(window, WC_BUTTONW, L"Copy &all", BS_PUSHBUTTON | WS_TABSTOP, CopyAll);
-    state.save = control(window, WC_BUTTONW, L"&Save…", BS_PUSHBUTTON | WS_TABSTOP, Save);
-    state.open = control(window, WC_BUTTONW, L"&Open location", BS_PUSHBUTTON | WS_TABSTOP, OpenLocation);
-    state.path = control(window, WC_BUTTONW, L"Copy &path", BS_PUSHBUTTON | WS_TABSTOP, CopyPath);
-    state.value = control(window, WC_BUTTONW, L"Copy &value", BS_PUSHBUTTON | WS_TABSTOP, CopyValue);
+    if (state.isService)
+    {
+        state.copy =
+            control(window, WC_BUTTONW, L"&Copy selection", BS_PUSHBUTTON | WS_TABSTOP, CopySelection);
+        state.copyAll = control(window, WC_BUTTONW, L"Copy &all", BS_PUSHBUTTON | WS_TABSTOP, CopyAll);
+        state.save = control(window, WC_BUTTONW, L"&Save…", BS_PUSHBUTTON | WS_TABSTOP, Save);
+    }
+    else
+        state.copySave = control(window, WC_BUTTONW, L"Copy/&Save", BS_PUSHBUTTON | WS_TABSTOP, CopySaveMenu);
     state.captureStack =
         control(window, WC_BUTTONW, L"Capture all &stacks…", BS_PUSHBUTTON | WS_TABSTOP, CaptureStack);
     state.targetOptions = control(window, WC_BUTTONW, L"&Options", BS_PUSHBUTTON | WS_TABSTOP, TargetOptions);
