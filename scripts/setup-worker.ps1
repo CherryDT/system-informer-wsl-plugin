@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [ValidateSet('Install', 'Uninstall')] [string] $Mode,
-    [Parameter(Mandatory)] [ValidateSet('Windows', 'Companions', 'PluginSettings')] [string] $Phase,
+    [Parameter(Mandatory)] [ValidateSet('Windows', 'Companions', 'PluginSettings', 'ImageLoadProtection', 'ResetPluginSettings', 'RestoreImageLoadProtection')] [string] $Phase,
     [string] $SystemInformerDirectory,
     [string] $DistributionDirectory,
     [string] $SettingsFile,
@@ -33,17 +33,22 @@ try {
         Invoke-WindowsFileAction $Mode $SystemInformerDirectory $DistributionDirectory $ProgressFile
         # A copy already in progress finishes before cancellation takes effect.
         Test-SetupCancelled $CancelFile
-    } elseif ($Phase -eq 'PluginSettings') {
-        if ($Mode -ne 'Install') { throw 'Plugin settings can only be enabled during installation.' }
+    } elseif ($Phase -in @('PluginSettings', 'ImageLoadProtection', 'ResetPluginSettings', 'RestoreImageLoadProtection')) {
+        $Reset = $Phase -in @('ResetPluginSettings', 'RestoreImageLoadProtection')
+        $Operation = if ($Phase -in @('ImageLoadProtection', 'RestoreImageLoadProtection')) { 'ImageLoadProtection' } else { 'PluginLoading' }
+        if (($Reset -and $Mode -ne 'Uninstall') -or (-not $Reset -and $Mode -ne 'Install')) {
+            throw 'Settings action does not match the setup mode.'
+        }
         Test-SetupCancelled $CancelFile
         $Report = $ProgressFile + '.ini'
         & (Join-Path $PSScriptRoot 'setup-settings.ps1') -Mode Enable `
-            -SystemInformerDirectory $SystemInformerDirectory -ExpectedSettingsPath $SettingsFile -ResultFile $Report
+            -SystemInformerDirectory $SystemInformerDirectory -ExpectedSettingsPath $SettingsFile -ResultFile $Report `
+            -Operation $Operation -Reset:$Reset
         $ResultCode = $LASTEXITCODE
         $Message = (Get-Content -LiteralPath $Report | Where-Object { $_.StartsWith('Message=') } |
             Select-Object -First 1)
         if ($Message) { $Message = $Message.Substring(8) }
-        else { $Message = 'Could not enable third-party plugins. Check the System Informer settings file.' }
+        else { $Message = 'Could not update the selected host setting. Check the System Informer settings file.' }
         if ($ResultCode -ne 0) { throw $Message }
         Write-SetupProgress $Message $ProgressFile
         Test-SetupCancelled $CancelFile

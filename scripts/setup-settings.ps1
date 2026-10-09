@@ -5,16 +5,46 @@ param(
     [Parameter(Mandatory)] [string] $SystemInformerDirectory,
     [Parameter(Mandatory)] [string] $ResultFile,
     [string] $ExpectedSettingsPath,
+    [ValidateSet('PluginLoading', 'ImageLoadProtection')] [string] $Operation = 'PluginLoading',
+    [switch] $Reset,
     # Private continuation: never rediscover an alternate administrator's profile.
     [switch] $Elevated
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $script:SettingsPath = ''
+$script:KphEnabled = $true
+
+# System Informer treats these integer settings as booleans (any nonzero
+# value is true). Resetting plugin policy must not change EnablePlugins.
+if ($Operation -eq 'ImageLoadProtection') {
+    $Wanted = if ($Reset) { 0 } else { 1 }
+    $Targets = @([pscustomobject]@{ Name = 'KsiDisableImageLoadProtection'; Default = 0; Wanted = $Wanted })
+    $ActionDescription = if ($Reset) { 'Restore image-load protection by setting KsiDisableImageLoadProtection to 0.' }
+                         else { 'Allow DLLs not trusted by the kernel driver by setting KsiDisableImageLoadProtection to 1.' }
+    $CompletedDescription = if ($Reset) { 'Image-load protection is configured to be restored at the next kernel-driver reload.' }
+                            else { 'Untrusted DLL loading is configured for the next kernel-driver reload.' }
+    $UnchangedDescription = if ($Reset) { 'Image-load protection is already configured as enabled.' }
+                            else { 'Untrusted DLL loading is already configured as allowed.' }
+} elseif ($Reset) {
+    $Targets = @([pscustomobject]@{ Name = 'EnableDefaultSafePlugins'; Default = 1; Wanted = 1 })
+    $ActionDescription = 'Restore the default safe-plugin policy by setting EnableDefaultSafePlugins to 1. EnablePlugins is preserved.'
+    $CompletedDescription = 'Default safe-plugin policy restored. EnablePlugins is preserved.'
+    $UnchangedDescription = 'Default safe-plugin policy is already enabled. EnablePlugins is preserved.'
+} else {
+    $Targets = @(
+        [pscustomobject]@{ Name = 'EnableDefaultSafePlugins'; Default = 1; Wanted = 0 },
+        [pscustomobject]@{ Name = 'EnablePlugins'; Default = 1; Wanted = 1 }
+    )
+    $ActionDescription = 'Allow third-party plugins by setting EnableDefaultSafePlugins to 0 and EnablePlugins to 1.'
+    $CompletedDescription = 'Third-party plugin loading enabled.'
+    $UnchangedDescription = 'Third-party plugin loading is already enabled.'
+}
+$ManualDescription = "Configure the selected settings manually in System Informer: $ActionDescription"
 
 function Write-Result([bool] $Supported, [bool] $NeedsChange, [string] $Message) {
     $Message = $Message -replace '[\r\n]+', ' '
-    $Text = "[Plugins]`r`nSupported=$([int]$Supported)`r`nNeedsChange=$([int]$NeedsChange)`r`nPath=$script:SettingsPath`r`nMessage=$Message`r`n"
+    $Text = "[Plugins]`r`nSupported=$([int]$Supported)`r`nNeedsChange=$([int]$NeedsChange)`r`nPath=$script:SettingsPath`r`nKphEnabled=$([int]$script:KphEnabled)`r`nMessage=$Message`r`n"
     [IO.File]::WriteAllText($ResultFile, $Text, [Text.Encoding]::Unicode)
 }
 
@@ -76,10 +106,10 @@ function Get-SettingInteger($Value, [bool] $IsString) {
     if ($IsString) {
         [uint32] $Number = 0
         if (-not [uint32]::TryParse([string]$Value, [Globalization.NumberStyles]::AllowHexSpecifier,
-            [Globalization.CultureInfo]::InvariantCulture, [ref]$Number)) { throw 'A plugin-enable setting is not a valid hexadecimal integer.' }
+            [Globalization.CultureInfo]::InvariantCulture, [ref]$Number)) { throw 'A selected setting is not a valid hexadecimal integer.' }
         return $Number
     }
-    if ([string]$Value -notmatch '^(0|[1-9][0-9]*)$') { throw 'A plugin-enable setting is not an unsigned integer.' }
+    if ([string]$Value -notmatch '^(0|[1-9][0-9]*)$') { throw 'A selected setting is not an unsigned integer.' }
     return [uint32]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture)
 }
 
@@ -113,25 +143,41 @@ function Edit-Json([string] $Text) {
         }
     }
     if ($Position -ge $Text.Length -or $Text.Substring($Position) -notmatch '^}\s*$') { throw 'The JSON settings have unexpected trailing content.' }
+    # KsiEnable defaults to true. A disabled driver needs no relaxation of
+    # its image policy; leave that preference untouched even if it is stricter.
+    if ($Operation -eq 'ImageLoadProtection' -and -not $Reset) {
+        $Driver = @($Pairs | Where-Object { $_.Name -ceq 'KsiEnable' })
+        if ($Driver.Count) {
+            $Token = $Driver[0].Token.Value
+            $IsString = $Token.StartsWith('"')
+            $Value = if ($IsString) { $Json.DeserializeObject($Token) } else { $Token }
+            $script:KphEnabled = (Get-SettingInteger $Value $IsString) -ne 0
+        } elseif ($Names.Contains('KsiEnable')) { throw 'Unexpected capitalization of setting: KsiEnable' }
+    }
     $Edits = New-Object 'Collections.Generic.List[object]'
     $Missing = New-Object 'Collections.Generic.List[string]'
     $NeedsChange = $false
-    foreach ($Name in @('EnableDefaultSafePlugins', 'EnablePlugins')) {
-        $Wanted = if ($Name -eq 'EnablePlugins') { 1 } else { 0 }
+    foreach ($Target in $Targets) {
+        $Name = $Target.Name
+        $Wanted = $Target.Wanted
         $Entry = @($Pairs | Where-Object { $_.Name -ceq $Name })
         if ($Entry.Count -eq 0) {
             if ($Names.Contains($Name)) { throw "Unexpected capitalization of setting: $Name" }
-            $Current = 1
-            $Missing.Add('"' + $Name + '": "' + $Wanted + '"')
+            $Current = $Target.Default
         } else {
             $Token = $Entry[0].Token
             $IsString = $Token.Value.StartsWith('"')
             $Value = if ($IsString) { $Json.DeserializeObject($Token.Value) } else { $Token.Value }
             $Current = Get-SettingInteger $Value $IsString
-            $Edits.Add([pscustomobject]@{ Index = $Token.Index; Length = $Token.Length; Value = '"' + $Wanted + '"' })
         }
-        if (($Name -eq 'EnablePlugins' -and $Current -eq 0) -or
-            ($Name -eq 'EnableDefaultSafePlugins' -and $Current -ne 0)) { $NeedsChange = $true }
+        if (($Current -ne 0) -ne ($Wanted -ne 0)) {
+            $NeedsChange = $true
+            if ($Entry.Count -eq 0) {
+                $Missing.Add('"' + $Name + '": "' + $Wanted + '"')
+            } else {
+                $Edits.Add([pscustomobject]@{ Index = $Token.Index; Length = $Token.Length; Value = '"' + $Wanted + '"' })
+            }
+        }
     }
     if ($Missing.Count) {
         $Insert = if ($Pairs.Count) { ', ' } else { '' }
@@ -169,29 +215,37 @@ function Edit-Xml([string] $Text) {
         if ($Entries.ContainsKey($Name)) { throw "Duplicate XML settings name: $Name" }
         $Entries[$Name] = $Node
     }
+    if ($Operation -eq 'ImageLoadProtection' -and -not $Reset -and $Entries.ContainsKey('KsiEnable')) {
+        $Driver = $Entries['KsiEnable']
+        if ($Driver.GetAttribute('name') -cne 'KsiEnable') { throw 'Unexpected capitalization of setting: KsiEnable' }
+        $script:KphEnabled = (Get-SettingInteger $Driver.get_InnerText() $true) -ne 0
+    }
     $NeedsChange = $false
-    foreach ($Name in @('EnableDefaultSafePlugins', 'EnablePlugins')) {
-        $Wanted = if ($Name -eq 'EnablePlugins') { 1 } else { 0 }
-        $Current = 1
+    foreach ($Target in $Targets) {
+        $Name = $Target.Name
+        $Wanted = $Target.Wanted
+        $Current = $Target.Default
         if ($Entries.ContainsKey($Name)) {
             $Node = $Entries[$Name]
             if ($Node.GetAttribute('name') -cne $Name) { throw "Unexpected capitalization of setting: $Name" }
             $Current = Get-SettingInteger $Node.get_InnerText() $true
-        } else {
-            $Node = $Document.CreateElement('setting')
-            $Node.SetAttribute('name', $Name)
-            [void] $Document.DocumentElement.AppendChild($Node)
         }
-        if (($Name -eq 'EnablePlugins' -and $Current -eq 0) -or
-            ($Name -eq 'EnableDefaultSafePlugins' -and $Current -ne 0)) { $NeedsChange = $true }
-        $Node.set_InnerText([string]$Wanted)
+        if (($Current -ne 0) -ne ($Wanted -ne 0)) {
+            $NeedsChange = $true
+            if (-not $Entries.ContainsKey($Name)) {
+                $Node = $Document.CreateElement('setting')
+                $Node.SetAttribute('name', $Name)
+                [void] $Document.DocumentElement.AppendChild($Node)
+            }
+            $Node.set_InnerText([string]$Wanted)
+        }
     }
     return [pscustomobject]@{ NeedsChange = $NeedsChange; Text = $Document.OuterXml }
 }
 
 function Read-Settings($Store) {
     if ($Store.Kind -eq 'Registry' -or $Store.Extension -notin @('.json', '.xml')) {
-        return [pscustomobject]@{ Supported = $false; NeedsChange = $false; Message = 'This settings store is not editable by setup. Enable plugins and set EnableDefaultSafePlugins to 0 in System Informer manually.' }
+        return [pscustomobject]@{ Supported = $false; NeedsChange = $false; Message = "This settings store is not editable by setup. $ManualDescription" }
     }
     # Access failures are operational errors; malformed/unknown contents are a
     # supported inspection outcome and must never trigger a reset or migration.
@@ -200,12 +254,12 @@ function Read-Settings($Store) {
         return [pscustomobject]@{ Supported = $false; NeedsChange = $false; Message = $_.Exception.Message }
     }
     catch [Text.DecoderFallbackException] {
-        return [pscustomobject]@{ Supported = $false; NeedsChange = $false; Message = 'The settings text encoding is invalid; configure plugin loading manually in System Informer.' }
+        return [pscustomobject]@{ Supported = $false; NeedsChange = $false; Message = "The settings text encoding is invalid. $ManualDescription" }
     }
     try {
         $Edit = if ($Store.Extension -eq '.json') { Edit-Json $Source.Text } else { Edit-Xml $Source.Text }
     } catch {
-        return [pscustomobject]@{ Supported = $false; NeedsChange = $false; Message = "Settings were left unchanged: $($_.Exception.Message) Configure plugin loading manually in System Informer." }
+        return [pscustomobject]@{ Supported = $false; NeedsChange = $false; Message = "Settings were left unchanged: $($_.Exception.Message) $ManualDescription" }
     }
     return [pscustomobject]@{ Supported = $true; NeedsChange = $Edit.NeedsChange; Source = $Source; Text = $Edit.Text; Message = '' }
 }
@@ -213,6 +267,7 @@ function Read-Settings($Store) {
 function Assert-Closed([string] $Kind) {
     $Processes = @(Get-Process -Name SystemInformer -ErrorAction SilentlyContinue)
     if (-not $Processes.Count) { return }
+    if ($Operation -eq 'ImageLoadProtection') { throw 'Close all System Informer instances before changing image-load protection; the kernel driver is shared across instances.' }
     if ($Kind -eq 'Roaming') { throw 'Close all System Informer instances before changing shared roaming settings.' }
     if (-not ('WslSettings.NativeProcess' -as [type])) {
         Add-Type -TypeDefinition @'
@@ -276,11 +331,11 @@ function Save-Settings($Store, $Settings) {
                 throw 'The settings file changed during setup. Run setup again.'
             }
             [IO.File]::Replace($Temporary, $Store.Path, $Backup)
-            return "Plugin loading enabled. Backup: $Backup"
+            return "$CompletedDescription Backup: $Backup"
         }
         # Move refuses to overwrite a file created after inspection.
         [IO.File]::Move($Temporary, $Store.Path)
-        return "Plugin loading enabled in new settings file: $($Store.Path)"
+        return "$CompletedDescription New settings file: $($Store.Path)"
     } finally {
         if ([IO.File]::Exists($Temporary)) { [IO.File]::Delete($Temporary) }
     }
@@ -299,19 +354,23 @@ try {
     $script:SettingsPath = $Store.Path
     if ($Mode -eq 'Enable' -and (-not $ExpectedSettingsPath -or
         -not [string]::Equals($ExpectedSettingsPath, $Store.Path, [StringComparison]::OrdinalIgnoreCase))) {
-        throw 'The active settings store changed or was not inspected. Run setup again before enabling plugin loading.'
+        throw 'The active settings store changed or was not inspected. Run setup again before changing settings.'
     }
     $Settings = Read-Settings $Store
+    if ($Settings.Supported -and $Operation -eq 'ImageLoadProtection' -and -not $Reset -and -not $script:KphEnabled) {
+        Write-Result $true $false 'Not required (KPH disabled). Image-load protection settings were unchanged.'
+        exit 0
+    }
     if ($Mode -eq 'Inspect') {
         $Message = if (-not $Settings.Supported) { $Settings.Message }
-                   elseif ($Settings.NeedsChange) { 'Allow third-party plugins by setting EnableDefaultSafePlugins to 0 and EnablePlugins to 1. Other settings, including DisabledPlugins, are preserved.' }
-                   else { 'Plugin loading is already enabled. DisabledPlugins entries are preserved.' }
+                   elseif ($Settings.NeedsChange) { "$ActionDescription Other settings, including DisabledPlugins, are preserved." }
+                   else { "$UnchangedDescription Other settings, including DisabledPlugins, are preserved." }
         Write-Result $Settings.Supported $Settings.NeedsChange $Message
         exit 0
     }
     if (-not $Settings.Supported) { throw $Settings.Message }
     if (-not $Settings.NeedsChange) {
-        Write-Result $true $false 'Plugin loading is already enabled; settings were unchanged.'
+        Write-Result $true $false "$UnchangedDescription Settings were unchanged."
         exit 0
     }
     try { $Message = Save-Settings $Store $Settings }
@@ -320,8 +379,9 @@ try {
         # Only the portable file operation may elevate; all paths are fixed in
         # the original user context and the child requires the same store.
         $Arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
-            '-Mode', 'Enable', '-SystemInformerDirectory', $SystemInformerDirectory,
+            '-Mode', 'Enable', '-Operation', $Operation, '-SystemInformerDirectory', $SystemInformerDirectory,
             '-ResultFile', $ResultFile, '-ExpectedSettingsPath', $Store.Path, '-Elevated')
+        if ($Reset) { $Arguments += '-Reset' }
         $Start = New-Object Diagnostics.ProcessStartInfo
         $Start.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $Start.Arguments = ($Arguments | ForEach-Object { Quote-Argument $_ }) -join ' '
