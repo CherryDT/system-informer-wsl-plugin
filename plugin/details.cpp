@@ -21,6 +21,22 @@ constexpr int RawPage = StacksPage + 1;
 constexpr int RuntimeStacksPage = RawPage + 1;
 constexpr int MemoryPage = RuntimeStacksPage + 1;
 constexpr int JournalPage = MemoryPage + 1;
+// Preserve existing page IDs: additional runtime panes do not renumber Memory or Journal.
+constexpr int PythonStacksPage = JournalPage + 1;
+constexpr int JavaStacksPage = PythonStacksPage + 1;
+constexpr std::array<int, 3> RuntimePages = {RuntimeStacksPage, PythonStacksPage, JavaStacksPage};
+constexpr std::array<const char *, 3> RuntimeNames = {"node", "python", "java"};
+
+int runtimeIndex(int page)
+{
+    auto found = std::find(RuntimePages.begin(), RuntimePages.end(), page);
+    return found == RuntimePages.end() ? -1 : static_cast<int>(found - RuntimePages.begin());
+}
+
+bool isRuntimePage(int page)
+{
+    return runtimeIndex(page) >= 0;
+}
 constexpr size_t MemoryTable = ConnectionsTable + 1;
 constexpr size_t TableCount = MemoryTable + 1;
 // Keep model indices stable while presenting the available native property pages
@@ -68,6 +84,8 @@ enum ControlId
     PageOptions,
     TargetOptions,
     CopySaveMenu,
+    PythonStackText,
+    JavaStackText,
     ResourceProperties = 400,
     ReadMemory,
     MemoryStrings,
@@ -98,6 +116,15 @@ struct OverviewField
     HWND value = nullptr;
 };
 
+struct RuntimePane
+{
+    HWND window = nullptr;
+    bool loaded = false;
+    bool nodeChoiceOffered = false;
+    std::wstring capture, notice;
+    Json request;
+};
+
 // An inspector owns its controls and the mailbox, but never the controller's
 // worker. Closing a window therefore never waits for a slow WSL command.
 struct Inspector
@@ -108,7 +135,7 @@ struct Inspector
     std::wstring tooltipText;
     bool statusVisible = false;
     HWND lastOverviewEdit = nullptr;
-    HWND stacks = nullptr, runtimeStacks = nullptr, journal = nullptr, captureStack = nullptr;
+    HWND stacks = nullptr, journal = nullptr, captureStack = nullptr;
     HFONT uiFont = nullptr, rawFont = nullptr;
     int overviewScroll = 0;
     bool overviewLayoutActive = false;
@@ -128,6 +155,9 @@ struct Inspector
     Json process;
     std::string service;
     std::string runtime;
+    std::array<RuntimePane, 3> runtimePanes;
+    bool scriptStacksForced = false;
+    int pendingRuntimePage = RuntimeStacksPage;
     std::vector<int> pages;
     bool isService = false;
     bool loading = false;
@@ -135,17 +165,13 @@ struct Inspector
     bool connectionsAttempted = false;
     bool connectionsLoaded = false;
     bool stacksLoaded = false;
-    bool runtimeStacksLoaded = false;
-    std::wstring nativeCapture, runtimeCapture;
-    bool nodeChoiceOffered = false;
-    Json runtimeRequest;
+    std::wstring nativeCapture;
     Operation pending = Operation::ProcessDetails;
     uintptr_t requestTag = 0;
     int page = 0;
     std::wstring notice;
     std::wstring connectionsNotice;
     std::wstring stacksNotice;
-    std::wstring runtimeStacksNotice;
     std::array<bool, TableCount> available{};
     std::array<bool, TableCount> snapshotReady{};
     std::array<bool, TableCount> snapshotComplete{};
@@ -173,23 +199,23 @@ int tabFromPage(const Inspector &state, int page)
     return position == state.pages.end() ? 0 : static_cast<int>(position - state.pages.begin());
 }
 
-const wchar_t *runtimeLabel(const Inspector &state)
+const wchar_t *runtimeLabel(int page)
 {
-    if (state.runtime == "node")
+    if (page == RuntimeStacksPage)
         return L"JS";
-    if (state.runtime == "python")
+    if (page == PythonStacksPage)
         return L"Python";
     return L"Java";
 }
 
-std::wstring runtimeStackIntro(const Inspector &state)
+std::wstring runtimeStackIntro(int page)
 {
-    std::wstring intro = std::wstring(L"Press \"Capture ") + runtimeLabel(state) +
+    std::wstring intro = std::wstring(L"Press \"Capture ") + runtimeLabel(page) +
                          L" stacks…\" to collect a stack trace.\r\n\r\n";
-    if (state.runtime == "java")
+    if (page == JavaStacksPage)
         return intro +
                L"The JVM may briefly pause threads at a safepoint.\r\nRequires jcmd from a matching JDK.";
-    if (state.runtime == "python")
+    if (page == PythonStacksPage)
         return intro + L"The process briefly pauses during capture.\r\nRequires py-spy in this distribution.";
     return intro + L"The process briefly pauses during capture.\r\nInspector capture requires Python 3; the "
                    L"fallback requires LLDB + llnode.";
@@ -201,11 +227,11 @@ const wchar_t *nativeStackIntro()
            L"The process pauses while GDB is attached.\r\nRequires GDB in this distribution.";
 }
 
-const wchar_t *runtimeExportName(const Inspector &state)
+const wchar_t *runtimeExportName(int page)
 {
-    if (state.runtime == "node")
+    if (page == RuntimeStacksPage)
         return L"wsl-js-stacks.txt";
-    if (state.runtime == "python")
+    if (page == PythonStacksPage)
         return L"wsl-python-stacks.txt";
     return L"wsl-java-stacks.txt";
 }
@@ -214,8 +240,8 @@ HWND activeTextControl(const Inspector &state)
 {
     if (state.isService && state.page == JournalPage)
         return state.journal;
-    if (!state.isService && state.page == RuntimeStacksPage)
-        return state.runtimeStacks;
+    if (!state.isService && isRuntimePage(state.page))
+        return state.runtimePanes[runtimeIndex(state.page)].window;
     if (!state.isService && state.page == StacksPage)
         return state.stacks;
     return state.raw;
@@ -528,7 +554,9 @@ void createOverviewFields(Inspector &state)
 BOOL CALLBACK applyDialogFont(HWND child, LPARAM context)
 {
     auto &state = *reinterpret_cast<Inspector *>(context);
-    if (child == state.raw || child == state.stacks || child == state.runtimeStacks)
+    if (child == state.raw || child == state.stacks ||
+        std::any_of(state.runtimePanes.begin(), state.runtimePanes.end(),
+                    [child](const RuntimePane &pane) { return child == pane.window; }))
         return TRUE;
     // The host's configurable grid font belongs only to lists and their
     // headers. Buttons, fields, and tab captions use the normal dialog font.
@@ -554,9 +582,10 @@ void updateInspectorFonts(Inspector &state)
     if (state.stacks)
         SendMessageW(state.stacks, WM_SETFONT,
                      reinterpret_cast<WPARAM>(next ? next : GetStockObject(ANSI_FIXED_FONT)), TRUE);
-    if (state.runtimeStacks)
-        SendMessageW(state.runtimeStacks, WM_SETFONT,
-                     reinterpret_cast<WPARAM>(next ? next : GetStockObject(ANSI_FIXED_FONT)), TRUE);
+    for (const auto &pane : state.runtimePanes)
+        if (pane.window)
+            SendMessageW(pane.window, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(next ? next : GetStockObject(ANSI_FIXED_FONT)), TRUE);
     if (state.journal)
         SendMessageW(state.journal, WM_SETFONT,
                      reinterpret_cast<WPARAM>(next ? next : GetStockObject(ANSI_FIXED_FONT)), TRUE);
@@ -774,7 +803,7 @@ Operation activeOperation(const Inspector &state)
         return Operation::Connections;
     if (state.page == StacksPage)
         return Operation::Stacks;
-    if (state.page == RuntimeStacksPage)
+    if (isRuntimePage(state.page))
         return Operation::RuntimeStacks;
     return Operation::ProcessDetails;
 }
@@ -786,7 +815,7 @@ std::wstring &operationNotice(Inspector &state, Operation operation)
     if (operation == Operation::Stacks)
         return state.stacksNotice;
     if (operation == Operation::RuntimeStacks)
-        return state.runtimeStacksNotice;
+        return state.runtimePanes[runtimeIndex(state.page)].notice;
     return state.notice;
 }
 
@@ -795,13 +824,13 @@ void layout(Inspector &state);
 void updateActions(Inspector &state)
 {
     EnableWindow(state.refresh, !state.loading);
-    bool stackAction = !state.isService && (state.page == StacksPage || state.page == RuntimeStacksPage);
+    bool stackAction = !state.isService && (state.page == StacksPage || isRuntimePage(state.page));
     ShowWindow(state.captureStack, stackAction ? SW_SHOW : SW_HIDE);
     bool removedThread =
         state.page == 4 && state.tables[3].selected() && !state.tables[3].selectedActionable();
     EnableWindow(state.captureStack, !state.loading && !removedThread);
-    std::wstring captureLabel = state.page == RuntimeStacksPage
-                                    ? std::wstring(L"Capture ") + runtimeLabel(state) + L" &stacks…"
+    std::wstring captureLabel = isRuntimePage(state.page)
+                                    ? std::wstring(L"Capture ") + runtimeLabel(state.page) + L" &stacks…"
                                 : state.page == 4 && state.tables[3].selected() ? L"View &thread stack…"
                                                                                 : L"Capture all &stacks…";
     SetWindowTextW(state.captureStack, captureLabel.c_str());
@@ -811,10 +840,11 @@ void updateActions(Inspector &state)
     bool networkPage = state.page == ConnectionsPage;
     const auto &notice = operationNotice(state, activeOperation(state));
     std::wstring message = notice;
-    if (state.loading && activeOperation(state) == state.pending)
+    if (state.loading && activeOperation(state) == state.pending &&
+        (state.pending != Operation::RuntimeStacks || state.page == state.pendingRuntimePage))
         message = state.pending == Operation::Stacks ? L"Capturing stacks with GDB…"
                   : state.pending == Operation::RuntimeStacks
-                      ? std::wstring(L"Capturing ") + runtimeLabel(state) + L" stacks…"
+                      ? std::wstring(L"Capturing ") + runtimeLabel(state.page) + L" stacks…"
                       : L"Loading from " + state.distro + L"…";
     else if (state.loading && networkPage && !state.connectionsAttempted)
         message = L"Connections will load after the current request finishes…";
@@ -857,6 +887,7 @@ void updateActions(Inspector &state)
 }
 
 void refresh(Inspector &state);
+void forceRuntimeTabs(Inspector &state);
 void layout(Inspector &state);
 
 void ensureConnections(Inspector &state)
@@ -874,7 +905,9 @@ void showPage(Inspector &state)
     if (state.journal)
         ShowWindow(state.journal, state.page == JournalPage ? SW_SHOW : SW_HIDE);
     ShowWindow(state.stacks, !state.isService && state.page == StacksPage ? SW_SHOW : SW_HIDE);
-    ShowWindow(state.runtimeStacks, !state.isService && state.page == RuntimeStacksPage ? SW_SHOW : SW_HIDE);
+    for (size_t i = 0; i < state.runtimePanes.size(); ++i)
+        if (state.runtimePanes[i].window)
+            ShowWindow(state.runtimePanes[i].window, state.page == RuntimePages[i] ? SW_SHOW : SW_HIDE);
     for (size_t i = 0; i < state.tables.size(); ++i)
         if (state.tables[i].window)
             ShowWindow(state.tables[i].window,
@@ -1000,7 +1033,7 @@ void layout(Inspector &state)
               fieldHeight);
         body.top += rowHeight + scale(state.window, 4);
     }
-    else if (!state.isService && (state.page == StacksPage || state.page == RuntimeStacksPage))
+    else if (!state.isService && (state.page == StacksPage || isRuntimePage(state.page)))
     {
         place(state.captureStack, body.left, body.top, scale(state.window, 170), buttonHeight);
         body.top += buttonHeight + scale(state.window, 4);
@@ -1017,8 +1050,9 @@ void layout(Inspector &state)
         place(state.journal, body.left, body.top, body.right - body.left, body.bottom - body.top);
     if (state.stacks)
         place(state.stacks, body.left, body.top, body.right - body.left, body.bottom - body.top);
-    if (state.runtimeStacks)
-        place(state.runtimeStacks, body.left, body.top, body.right - body.left, body.bottom - body.top);
+    for (const auto &pane : state.runtimePanes)
+        if (pane.window)
+            place(pane.window, body.left, body.top, body.right - body.left, body.bottom - body.top);
     for (auto &table : state.tables)
         if (table.window)
             place(table.window, body.left, body.top, body.right - body.left, body.bottom - body.top);
@@ -1030,23 +1064,25 @@ void showCaptureProgress(HWND pane)
     RedrawWindow(pane, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
-void queueRuntimeCapture(Inspector &state, Json request)
+void queueRuntimeCapture(Inspector &state, int page, Json request)
 {
     // Retain the exact identity for a possible Node backend choice. A later
     // explicit capture builds a fresh automatic request instead of reusing it.
-    state.runtimeRequest = request;
+    auto &pane = state.runtimePanes[runtimeIndex(page)];
+    pane.request = request;
+    state.pendingRuntimePage = page;
     state.loading = true;
     state.pending = Operation::RuntimeStacks;
-    state.page = RuntimeStacksPage;
-    TabCtrl_SetCurSel(state.tabs, tabFromPage(state, RuntimeStacksPage));
+    state.page = page;
+    TabCtrl_SetCurSel(state.tabs, tabFromPage(state, page));
     showPage(state);
-    showCaptureProgress(state.runtimeStacks);
+    showCaptureProgress(pane.window);
     submit(state.distro, std::move(request), state.mailbox, ++state.requestTag);
 }
 
 void captureRuntimeStacks(Inspector &state)
 {
-    if (state.loading || state.isService || state.runtime.empty())
+    if (state.loading || state.isService || !isRuntimePage(state.page))
         return;
     Json request = {{"op", "script_stacks"}};
     for (const char *key : {"pid", "start_ticks"})
@@ -1061,16 +1097,19 @@ void captureRuntimeStacks(Inspector &state)
         }
         request[key] = *value;
     }
-    // The runtime hint only controls presentation. The helper revalidates the
-    // executable and process identity before choosing a diagnostic tool.
-    bool useInspector = state.runtime == "node" && readSetting(L"UseNodeInspectorWithoutAsking", 1) != 0;
+    // An explicit override selects the tool, while the observer still validates
+    // process identity and guards against an executable changing during capture.
+    if (state.scriptStacksForced)
+        request["force_runtime"] = RuntimeNames[runtimeIndex(state.page)];
+    bool useInspector =
+        state.page == RuntimeStacksPage && readSetting(L"UseNodeInspectorWithoutAsking", 1) != 0;
     if (useInspector)
     {
         request["backend"] = "inspector";
         request["enable_inspector"] = true;
     }
-    state.nodeChoiceOffered = useInspector;
-    queueRuntimeCapture(state, std::move(request));
+    state.runtimePanes[runtimeIndex(state.page)].nodeChoiceOffered = useInspector;
+    queueRuntimeCapture(state, state.page, std::move(request));
 }
 
 void captureStacks(Inspector &state)
@@ -1621,14 +1660,19 @@ void commandImpl(Inspector &state, int id)
         Json target = state.process.is_object() ? state.process : Json::object();
         if (state.overviewData.is_object())
             target.update(state.overviewData);
-        auto request = targetOptions(state.window, state.targetOptions, state.distro, target, state.service,
-                                     state.loading);
-        if (request && IsWindow(owner) && GetWindowLongPtrW(owner, GWLP_USERDATA) == identity)
+        auto result = targetOptions(state.window, state.targetOptions, state.distro, target, state.service,
+                                    state.loading, state.scriptStacksForced);
+        if (IsWindow(owner) && GetWindowLongPtrW(owner, GWLP_USERDATA) == identity)
         {
-            state.loading = true;
-            state.pending = Operation::TargetAction;
-            updateActions(state);
-            submit(state.distro, std::move(*request), state.mailbox, ++state.requestTag);
+            if (result.forceScriptStacks)
+                forceRuntimeTabs(state);
+            if (result.request)
+            {
+                state.loading = true;
+                state.pending = Operation::TargetAction;
+                updateActions(state);
+                submit(state.distro, std::move(*result.request), state.mailbox, ++state.requestTag);
+            }
         }
         break;
     }
@@ -1636,7 +1680,7 @@ void commandImpl(Inspector &state, int id)
         refresh(state);
         break;
     case CaptureStack:
-        if (state.page == RuntimeStacksPage)
+        if (isRuntimePage(state.page))
             captureRuntimeStacks(state);
         else
             captureStacks(state);
@@ -1655,7 +1699,7 @@ void commandImpl(Inspector &state, int id)
         saveText(state.window, allText(state),
                  state.isService && state.page == JournalPage ? L"wsl-service-journal.txt"
                  : state.isService                            ? L"wsl-service.txt"
-                 : state.page == RuntimeStacksPage            ? runtimeExportName(state)
+                 : isRuntimePage(state.page)                  ? runtimeExportName(state.page)
                  : state.page == StacksPage                   ? L"wsl-stacks.txt"
                                                               : L"wsl-process.txt");
         break;
@@ -1993,6 +2037,7 @@ void loadStacks(Inspector &state, const Json &data)
 
 void loadRuntimeStacks(Inspector &state, const Json &data)
 {
+    auto &pane = state.runtimePanes[runtimeIndex(state.pendingRuntimePage)];
     std::wstring message = cell(data, "message");
     std::wstring output = cell(data, "text");
     auto supported = data.find("supported");
@@ -2001,61 +2046,61 @@ void loadRuntimeStacks(Inspector &state, const Json &data)
                     success != data.end() && success->is_boolean() && success->get<bool>();
     if (!captured)
     {
-        state.runtimeStacksNotice =
-            !message.empty() ? message : L"The runtime stack capture could not be completed.";
+        pane.notice = !message.empty() ? message : L"The runtime stack capture could not be completed.";
         // Keep a successful capture intact when tooling becomes unavailable or
         // attachment fails. Initial failures show the diagnostic in the page.
-        if (state.runtimeStacksLoaded)
+        if (pane.loaded)
         {
-            state.runtimeStacksNotice += L" The previous capture is still displayed.";
+            pane.notice += L" The previous capture is still displayed.";
             if (data.contains("inspector_error"))
             {
                 // Keep the good capture cached, but do not hide the Inspector
                 // failure or the attempted fallback behind a one-line status.
-                auto combined = state.runtimeStacksNotice + L"\r\n\r\n" + output +
-                                L"\r\n\r\nPrevious successful capture\r\n" + state.runtimeCapture;
-                SetWindowTextW(state.runtimeStacks, editText(combined).c_str());
+                auto combined = pane.notice + L"\r\n\r\n" + output +
+                                L"\r\n\r\nPrevious successful capture\r\n" + pane.capture;
+                SetWindowTextW(pane.window, editText(combined).c_str());
             }
             else
-                SetWindowTextW(state.runtimeStacks, state.runtimeCapture.c_str());
+                SetWindowTextW(pane.window, pane.capture.c_str());
         }
         else
         {
-            std::wstring diagnostic = state.runtimeStacksNotice;
+            std::wstring diagnostic = pane.notice;
             if (!output.empty())
                 diagnostic += L"\r\n\r\n" + output;
-            SetWindowTextW(state.runtimeStacks, editText(diagnostic).c_str());
+            SetWindowTextW(pane.window, editText(diagnostic).c_str());
         }
         return;
     }
     if (output.empty())
     {
-        state.runtimeStacksNotice = L"The diagnostic tool returned no stack output.";
-        if (state.runtimeStacksLoaded)
+        pane.notice = L"The diagnostic tool returned no stack output.";
+        if (pane.loaded)
         {
-            state.runtimeStacksNotice += L" The previous capture is still displayed.";
-            SetWindowTextW(state.runtimeStacks, state.runtimeCapture.c_str());
+            pane.notice += L" The previous capture is still displayed.";
+            SetWindowTextW(pane.window, pane.capture.c_str());
         }
         else
-            SetWindowTextW(state.runtimeStacks, state.runtimeStacksNotice.c_str());
+            SetWindowTextW(pane.window, pane.notice.c_str());
         return;
     }
-    state.runtimeStacksNotice = message.empty() ? L"Runtime stack capture complete." : message;
-    state.runtimeCapture = editText(output);
-    SetWindowTextW(state.runtimeStacks, state.runtimeCapture.c_str());
-    state.runtimeStacksLoaded = true;
+    pane.notice = message.empty() ? L"Runtime stack capture complete." : message;
+    pane.capture = editText(output);
+    SetWindowTextW(pane.window, pane.capture.c_str());
+    pane.loaded = true;
 }
 
 bool chooseNodeBackend(Inspector &state, const Json &data)
 {
-    if (state.nodeChoiceOffered && !data.value("inspector_unavailable", false))
+    auto &pane = state.runtimePanes[runtimeIndex(state.pendingRuntimePage)];
+    if (pane.nodeChoiceOffered && !data.value("inspector_unavailable", false))
     {
         // An explicit backend must not open the same chooser again if its
         // retry fails. Keep diagnostics in the page and preserve any capture.
         loadRuntimeStacks(state, data);
         return false;
     }
-    state.nodeChoiceOffered = true;
+    pane.nodeChoiceOffered = true;
     constexpr int EnableInspector = 1001;
     constexpr int UseLlnode = 1002;
     const TASKDIALOG_BUTTON buttons[] = {{EnableInspector, L"Temporarily Enable Inspector"},
@@ -2092,22 +2137,22 @@ bool chooseNodeBackend(Inspector &state, const Json &data)
         return true;
     if (FAILED(result) || (selected != EnableInspector && selected != UseLlnode))
     {
-        state.runtimeStacksNotice = FAILED(result) ? L"Could not open the capture method chooser."
-                                    : unavailable  ? dependencyMessage
-                                                   : L"Capture canceled.";
-        if (state.runtimeStacksLoaded)
+        pane.notice = FAILED(result) ? L"Could not open the capture method chooser."
+                      : unavailable  ? dependencyMessage
+                                     : L"Capture canceled.";
+        if (pane.loaded)
         {
-            state.runtimeStacksNotice += L" The previous capture is still displayed.";
-            SetWindowTextW(state.runtimeStacks, state.runtimeCapture.c_str());
+            pane.notice += L" The previous capture is still displayed.";
+            SetWindowTextW(pane.window, pane.capture.c_str());
         }
         else
         {
-            std::wstring text = state.runtimeStacksNotice + L"\r\n\r\n" + runtimeStackIntro(state);
-            SetWindowTextW(state.runtimeStacks, text.c_str());
+            std::wstring text = pane.notice + L"\r\n\r\n" + runtimeStackIntro(state.pendingRuntimePage);
+            SetWindowTextW(pane.window, text.c_str());
         }
         return false;
     }
-    Json request = state.runtimeRequest;
+    Json request = pane.request;
     if (selected == EnableInspector)
     {
         if (remember)
@@ -2129,7 +2174,7 @@ bool chooseNodeBackend(Inspector &state, const Json &data)
         request["backend"] = "llnode";
         request.erase("enable_inspector");
     }
-    queueRuntimeCapture(state, std::move(request));
+    queueRuntimeCapture(state, state.pendingRuntimePage, std::move(request));
     return true;
 }
 
@@ -2141,7 +2186,8 @@ void loadReply(Inspector &state, const Reply &reply)
     const bool network = completed == Operation::Connections;
     const bool stacks = completed == Operation::Stacks;
     const bool runtimeStacks = completed == Operation::RuntimeStacks;
-    auto &notice = operationNotice(state, completed);
+    auto &pane = state.runtimePanes[runtimeIndex(state.pendingRuntimePage)];
+    auto &notice = runtimeStacks ? pane.notice : operationNotice(state, completed);
     state.loading = false;
     if (completed == Operation::TargetAction)
     {
@@ -2155,8 +2201,8 @@ void loadReply(Inspector &state, const Reply &reply)
         return;
     }
     auto choice = reply.data.find("choice_required");
-    if (runtimeStacks && state.runtime == "node" && reply.error.empty() && choice != reply.data.end() &&
-        choice->is_boolean() && choice->get<bool>())
+    if (runtimeStacks && state.pendingRuntimePage == RuntimeStacksPage && reply.error.empty() &&
+        choice != reply.data.end() && choice->is_boolean() && choice->get<bool>())
     {
         bool queued = chooseNodeBackend(state, reply.data);
         if (!queued)
@@ -2172,18 +2218,18 @@ void loadReply(Inspector &state, const Reply &reply)
     {
         // A failed refresh leaves the last successful snapshot available for
         // inspection and copying, with a notice scoped to that snapshot.
-        bool hadData = runtimeStacks ? state.runtimeStacksLoaded
+        bool hadData = runtimeStacks ? pane.loaded
                        : stacks      ? state.stacksLoaded
                        : network     ? state.connectionsLoaded
                                      : state.hasData;
         notice = hadData ? L"Refresh failed (displayed data may be stale): " : L"Could not load details: ";
         notice += wide(reply.error);
         if (runtimeStacks && hadData)
-            SetWindowTextW(state.runtimeStacks, state.runtimeCapture.c_str());
+            SetWindowTextW(pane.window, pane.capture.c_str());
         else if (stacks && hadData)
             SetWindowTextW(state.stacks, state.nativeCapture.c_str());
         if (!network && !hadData)
-            SetWindowTextW(runtimeStacks ? state.runtimeStacks
+            SetWindowTextW(runtimeStacks ? pane.window
                            : stacks      ? state.stacks
                                          : state.raw,
                            editText(notice).c_str());
@@ -2250,7 +2296,8 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         int controlId = GetDlgCtrlID(window);
         if (ctrl && wParam == 'A' &&
             (controlId == RawDetails || controlId == StackText || controlId == RuntimeStackText ||
-             controlId == JournalText || controlId == Filter || controlId >= OverviewValueBase))
+             controlId == PythonStackText || controlId == JavaStackText || controlId == JournalText ||
+             controlId == Filter || controlId >= OverviewValueBase))
         {
             SendMessageW(window, EM_SETSEL, 0, -1);
             return 0;
@@ -2341,25 +2388,72 @@ BOOL CALLBACK installShortcuts(HWND child, LPARAM parent)
     return TRUE;
 }
 
-void createRuntimeStackControl(Inspector &state)
+void createRuntimeStackControl(Inspector &state, int page)
 {
-    std::wstring placeholder = runtimeStackIntro(state);
-    state.runtimeStacks = control(state.pageWindow, WC_EDITW, placeholder.c_str(),
-                                  WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | WS_CLIPSIBLINGS | ES_MULTILINE |
-                                      ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
-                                  RuntimeStackText);
-    SendMessageW(state.runtimeStacks, EM_SETLIMITTEXT, 16 * 1024 * 1024, 0);
-    // Initial controls are configured together below. A tab discovered by the
-    // details reply must receive those same behaviors when it is added later.
+    auto &pane = state.runtimePanes[runtimeIndex(page)];
+    const std::wstring placeholder = runtimeStackIntro(page);
+    const int id = page == RuntimeStacksPage  ? RuntimeStackText
+                   : page == PythonStacksPage ? PythonStackText
+                                              : JavaStackText;
+    pane.window = control(state.pageWindow, WC_EDITW, placeholder.c_str(),
+                          WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | WS_CLIPSIBLINGS | ES_MULTILINE |
+                              ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                          id);
+    SendMessageW(pane.window, EM_SETLIMITTEXT, 16 * 1024 * 1024, 0);
+    // Runtime tabs can be added after the window's initial font/theme pass.
     if (state.status)
     {
-        SetWindowSubclass(state.runtimeStacks, shortcutProc, 1, reinterpret_cast<DWORD_PTR>(state.window));
-        WslApplyTheme(state.runtimeStacks);
-        styleControlBorder(state.runtimeStacks);
+        SetWindowSubclass(pane.window, shortcutProc, 1, reinterpret_cast<DWORD_PTR>(state.window));
+        WslApplyTheme(pane.window);
+        styleControlBorder(pane.window);
         SendMessageW(
-            state.runtimeStacks, WM_SETFONT,
+            pane.window, WM_SETFONT,
             reinterpret_cast<WPARAM>(state.rawFont ? state.rawFont : GetStockObject(ANSI_FIXED_FONT)), TRUE);
     }
+}
+
+void syncRuntimePages(Inspector &state)
+{
+    // Rebuild only the tab headers. Existing controls retain their capture and
+    // selection, including a pending capture when the other panes are revealed.
+    for (int i = static_cast<int>(state.pages.size()) - 1; i >= 0; --i)
+        if (isRuntimePage(state.pages[i]))
+        {
+            TabCtrl_DeleteItem(state.tabs, i);
+            state.pages.erase(state.pages.begin() + i);
+        }
+    for (size_t i = 0; i < RuntimePages.size(); ++i)
+    {
+        auto &pane = state.runtimePanes[i];
+        if (!state.scriptStacksForced && state.runtime != RuntimeNames[i])
+        {
+            if (pane.window)
+                DestroyWindow(pane.window);
+            pane = {};
+            continue;
+        }
+        const int index = tabFromPage(state, RawPage);
+        std::wstring title = std::wstring(runtimeLabel(RuntimePages[i])) + L" Stacks";
+        TCITEMW item{};
+        item.mask = TCIF_TEXT;
+        item.pszText = title.data();
+        TabCtrl_InsertItem(state.tabs, index, &item);
+        state.pages.insert(state.pages.begin() + index, RuntimePages[i]);
+        if (!pane.window)
+            createRuntimeStackControl(state, RuntimePages[i]);
+    }
+    if (std::find(state.pages.begin(), state.pages.end(), state.page) == state.pages.end())
+        state.page = 0;
+    TabCtrl_SetCurSel(state.tabs, tabFromPage(state, state.page));
+    showPage(state);
+}
+
+void forceRuntimeTabs(Inspector &state)
+{
+    if (state.isService || state.scriptStacksForced)
+        return;
+    state.scriptStacksForced = true;
+    syncRuntimePages(state);
 }
 
 void syncRuntimeTab(Inspector &state, const Json &data)
@@ -2377,46 +2471,17 @@ void syncRuntimeTab(Inspector &state, const Json &data)
     }
     if (runtime == state.runtime)
         return;
-
-    bool hadRuntime = !state.runtime.empty();
-    int index = hadRuntime ? tabFromPage(state, RuntimeStacksPage) : static_cast<int>(state.pages.size()) - 1;
-    // exec() can change a runtime without changing the PID/start-time identity.
-    // A capture from the previous interpreter is not a valid cache for the new one.
+    // exec() can change a runtime without changing PID/start time. Discard all
+    // old captures, but keep manually revealed tabs for this property window.
     state.runtime = std::move(runtime);
-    state.runtimeStacksLoaded = false;
-    state.runtimeCapture.clear();
-    state.runtimeStacksNotice.clear();
-    if (state.runtimeStacks)
+    for (size_t i = 0; i < state.runtimePanes.size(); ++i)
     {
-        DestroyWindow(state.runtimeStacks);
-        state.runtimeStacks = nullptr;
+        auto &pane = state.runtimePanes[i];
+        if (pane.window)
+            DestroyWindow(pane.window);
+        pane = {};
     }
-    if (state.runtime.empty())
-    {
-        TabCtrl_DeleteItem(state.tabs, index);
-        auto position = std::find(state.pages.begin(), state.pages.end(), RuntimeStacksPage);
-        if (position != state.pages.end())
-            state.pages.erase(position);
-        if (state.page == RuntimeStacksPage)
-            state.page = 0;
-    }
-    else
-    {
-        std::wstring title = std::wstring(runtimeLabel(state)) + L" Stacks";
-        TCITEMW item{};
-        item.mask = TCIF_TEXT;
-        item.pszText = title.data();
-        if (hadRuntime)
-            TabCtrl_SetItem(state.tabs, index, &item);
-        else
-        {
-            state.pages.insert(state.pages.end() - 1, RuntimeStacksPage);
-            TabCtrl_InsertItem(state.tabs, index, &item);
-        }
-        createRuntimeStackControl(state);
-    }
-    TabCtrl_SetCurSel(state.tabs, tabFromPage(state, state.page));
-    showPage(state);
+    syncRuntimePages(state);
 }
 
 std::wstring tooltipText(const Inspector &state, int id)
@@ -2424,7 +2489,7 @@ std::wstring tooltipText(const Inspector &state, int id)
     switch (id)
     {
     case Refresh:
-        if (state.page == RuntimeStacksPage && !state.isService)
+        if (isRuntimePage(state.page) && !state.isService)
             return L"Capture runtime stacks (Ctrl+R)";
         return state.page == StacksPage && !state.isService ? L"Capture native thread stacks (Ctrl+R)"
                                                             : L"Refresh (Ctrl+R)";
@@ -2445,7 +2510,7 @@ std::wstring tooltipText(const Inspector &state, int id)
     case CopyValue:
         return L"Copy the selected environment value (Ctrl+Shift+C)";
     case CaptureStack:
-        if (state.page == RuntimeStacksPage)
+        if (isRuntimePage(state.page))
             return L"Capture runtime stacks. The diagnostic tool may briefly pause the process.";
         return L"Capture thread stacks with GDB. The process pauses while GDB is attached.";
     case ClearFilter:
@@ -2526,7 +2591,9 @@ void createControls(Inspector &state)
         if (detected == "node" || detected == "python" || detected == "java")
         {
             state.runtime = std::move(detected);
-            state.pages.insert(state.pages.end() - 1, RuntimeStacksPage);
+            const auto index =
+                std::find(RuntimeNames.begin(), RuntimeNames.end(), state.runtime) - RuntimeNames.begin();
+            state.pages.insert(state.pages.end() - 1, RuntimePages[index]);
         }
     }
     state.refresh = control(window, WC_BUTTONW, L"&Refresh", BS_PUSHBUTTON | WS_TABSTOP, Refresh);
@@ -2555,7 +2622,8 @@ void createControls(Inspector &state)
             : std::vector<std::wstring>{L"General", L"Threads", L"Modules", L"Memory", L"Environment",
                                         L"Handles", L"Network", L"Stacks",  L"Details"};
     if (!state.runtime.empty())
-        names.insert(names.end() - 1, std::wstring(runtimeLabel(state)) + L" Stacks");
+        names.insert(names.end() - 1,
+                     std::wstring(runtimeLabel(state.pages[state.pages.size() - 2])) + L" Stacks");
     for (int i = 0; i < static_cast<int>(names.size()); ++i)
     {
         TCITEMW item{};
@@ -2590,7 +2658,7 @@ void createControls(Inspector &state)
                                StackText);
         SendMessageW(state.stacks, EM_SETLIMITTEXT, 16 * 1024 * 1024, 0);
         if (!state.runtime.empty())
-            createRuntimeStackControl(state);
+            createRuntimeStackControl(state, state.pages[state.pages.size() - 2]);
         state.tables[0].create(state.pageWindow, Files,
                                {{L"FD", 65, true},
                                 {L"Target", 520},

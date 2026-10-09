@@ -6,7 +6,9 @@
 #include <limits>
 #include <sstream>
 #include <set>
+#include <signal.h>
 #include <stdexcept>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace observer {
@@ -39,6 +41,94 @@ CommandCredentials effective_credentials(int pid) {
         throw std::runtime_error("Cannot read the JVM's effective user and group IDs");
     };
     return {effective("Uid:"), effective("Gid:")};
+}
+
+// Only mapped, executable images count as runtime evidence. A command line or
+// the user's forced tab choice must not cause us to signal an unrelated process.
+std::vector<std::string> mapped_runtime_images(int pid) {
+    const auto maps = read_text(proc_file(pid, "maps"), 8 * 1024 * 1024);
+    std::istringstream lines(maps);
+    std::vector<std::string> images;
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (maps.size() == 8 * 1024 * 1024 && lines.eof()) break;
+        std::istringstream fields(line);
+        std::string range, permissions, offset, device, inode, path;
+        if (!(fields >> range >> permissions >> offset >> device >> inode)) continue;
+        std::getline(fields >> std::ws, path);
+        if (permissions.find('x') == std::string::npos || path.empty() || path[0] != '/') continue;
+        images.push_back(path);
+    }
+    return images;
+}
+
+std::string mapped_jvm(int pid) {
+    for (const auto& path : mapped_runtime_images(pid)) {
+        if (path.substr(path.find_last_of('/') + 1) == "libjvm.so") return path;
+    }
+    return {};
+}
+
+bool node_activation_evidence(int pid) {
+    for (const auto& path : mapped_runtime_images(pid)) {
+        const auto name = path.substr(path.find_last_of('/') + 1);
+        if (name == "libnode.so" || name.compare(0, 11, "libnode.so.") == 0) return true;
+    }
+    // Standalone Node builds contain their runtime in the executable. Ask the
+    // trusted ELF reader for a defined Node entry point, not an arbitrary text
+    // match in the binary or an undefined reference from some other program.
+    if (find_command("readelf").empty()) return false;
+    constexpr size_t SymbolOutputLimit = 8 * 1024 * 1024;
+    const auto result = run_command({"readelf", "--dyn-syms", "--wide", proc_file(pid, "exe")},
+        2000, SymbolOutputLimit);
+    // Large Node symbol tables can outlast the command budget after already
+    // reporting Start. A complete defined-symbol record is sufficient evidence;
+    // do not require readelf to finish printing unrelated symbols. Discard any
+    // partial final line, including the newline run_command adds when capped.
+    auto output = result.output.substr(0, SymbolOutputLimit);
+    const auto last_newline = output.find_last_of('\n');
+    if (last_newline == std::string::npos) return false;
+    output.resize(last_newline + 1);
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        std::string number, value, size, type, binding, visibility, section, name;
+        if (!(fields >> number >> value >> size >> type >> binding >> visibility >> section >> name)) continue;
+        if (type == "FUNC" && section != "UND" && name == "_ZN4node5StartEiPPc") return true;
+    }
+    return false;
+}
+
+bool catches_signal(int pid, int signal_number) {
+    std::istringstream lines(read_text(proc_file(pid, "status"), 64 * 1024));
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (line.compare(0, 7, "SigCgt:") != 0) continue;
+        uint64_t mask = 0;
+        std::istringstream fields(line.substr(7));
+        return (fields >> std::hex >> mask) && (mask & (uint64_t{1} << (signal_number - 1)));
+    }
+    return false;
+}
+
+std::string jcmd_for_jvm(const std::string& library, uint32_t owner) {
+    // Current JDKs use lib/server; older JDKs use jre/lib/<arch>/server.
+    // Restrict the derivation to these layouts instead of searching arbitrary
+    // parent directories and accidentally selecting a different system JDK.
+    const auto lib = library.rfind("/lib/");
+    if (lib == std::string::npos) return {};
+    auto suffix = library.substr(lib + 5);
+    if (suffix != "server/libjvm.so" && suffix != "client/libjvm.so") {
+        const auto arch = suffix.find('/');
+        if (arch == std::string::npos) return {};
+        suffix = suffix.substr(arch + 1);
+        if (suffix != "server/libjvm.so" && suffix != "client/libjvm.so") return {};
+    }
+    auto home = library.substr(0, lib);
+    if (home.size() >= 4 && home.compare(home.size() - 4, 4, "/jre") == 0)
+        home.resize(home.size() - 4);
+    return trusted_command_path(home + "/bin/jcmd", owner);
 }
 
 std::string llnode_plugin() {
@@ -165,7 +255,10 @@ Json script_stacks(const Json& request) {
         throw std::runtime_error("Stack capture for this process is protected");
     require_identity(identity);
     const auto executable = read_link(proc_file(identity.pid, "exe"));
-    const auto runtime = runtime_for_executable(executable);
+    const auto forced_runtime = request.value("force_runtime", "");
+    if (!forced_runtime.empty() && forced_runtime != "node" && forced_runtime != "python" && forced_runtime != "java")
+        throw std::runtime_error("Unknown forced script runtime");
+    const auto runtime = forced_runtime.empty() ? runtime_for_executable(executable) : forced_runtime;
     if (runtime.empty()) return unavailable(runtime, "This executable is not a recognized Node.js, CPython or Java runtime.");
 
     const auto backend = request.value("backend", "auto");
@@ -181,8 +274,19 @@ Json script_stacks(const Json& request) {
             response["inspector_unavailable"] = true;
             return response;
         }
+        struct stat executable_metadata{};
+        if (stat(proc_file(identity.pid, "exe").c_str(), &executable_metadata) != 0)
+            throw std::runtime_error("Cannot verify the process executable before Inspector capture");
+        const bool enable_inspector = backend == "inspector" && request.value("enable_inspector", false);
+        const bool activation_evidence = forced_runtime.empty() ||
+            (enable_inspector && node_activation_evidence(identity.pid));
+        require_identity(identity);
+        if (read_link(proc_file(identity.pid, "exe")) != executable)
+            throw std::runtime_error("The process changed executable before capture; reopen its properties");
         const Json configuration{{"pid", identity.pid}, {"start_ticks", identity.start_ticks},
-            {"enable_inspector", backend == "inspector" && request.value("enable_inspector", false)}};
+            {"enable_inspector", enable_inspector}, {"force_runtime", forced_runtime},
+            {"activation_evidence", activation_evidence},
+            {"executable_device", executable_metadata.st_dev}, {"executable_inode", executable_metadata.st_ino}};
         // Ship the small stdlib client inside the observer, so updating the
         // observer also updates Inspector support. Isolated Python ignores user
         // startup/site packages; only the fixed embedded source is executed.
@@ -245,11 +349,18 @@ Json script_stacks(const Json& request) {
         tool = "py-spy";
         note = "Captured Python thread stacks. Local variable values are not collected.";
     } else {
+        const auto library = forced_runtime.empty() ? std::string{} : mapped_jvm(identity.pid);
+        if (!forced_runtime.empty() && library.empty())
+            return unavailable(runtime, "No loaded JVM (libjvm.so) was found in this process. "
+                "Java stack capture requires a running JVM.");
         credentials = effective_credentials(identity.pid);
         const auto directory = executable.substr(0, executable.find_last_of('/'));
         // Use the target's own JDK, including a securely owned user installation.
         // Arbitrary system jcmd versions are not interchangeable across JDKs.
-        java_tool = trusted_command_path(directory + "/jcmd", credentials->uid);
+        // A renamed/embedded launcher may live beside an unrelated jcmd.
+        // Forced captures select the tool from the mapped JVM's JDK only.
+        java_tool = forced_runtime.empty() ? trusted_command_path(directory + "/jcmd", credentials->uid)
+                                          : jcmd_for_jvm(library, credentials->uid);
         if (java_tool.empty())
             return unavailable(runtime,
                 "Java stacks require jcmd from the target JVM's matching JDK. Install that JDK's "
@@ -267,6 +378,13 @@ Json script_stacks(const Json& request) {
     require_identity(identity);
     if (read_link(proc_file(identity.pid, "exe")) != executable)
         throw std::runtime_error("The process changed executable before stack capture; reopen its properties");
+    // HotSpot attachment can send SIGQUIT to start its attach listener. The
+    // library may already be mapped before JVM signal handlers are installed,
+    // so a forced tab alone must not permit that signal's default termination.
+    if (forced_runtime == "java" && !catches_signal(identity.pid, SIGQUIT))
+        return unavailable(runtime, "The JVM has no SIGQUIT handler for attachment. "
+            "Wait until JVM startup completes and retry; a JVM configured without "
+            "the attach signal handler cannot be captured this way.");
     auto result = run_command(arguments, CaptureTimeoutMs, CaptureOutputLimit, credentials, java_tool);
     require_identity(identity);
     if (read_link(proc_file(identity.pid, "exe")) != executable)

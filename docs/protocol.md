@@ -459,6 +459,19 @@ PyPy, renamed executables, and embedded runtimes do not automatically match.
 Details are refreshed to add, rename, or remove the matching process inspector
 tab after an `exec()` changes the runtime.
 
+The optional `force_runtime` field accepts `node`, `python`, or `java` and
+explicitly selects that backend even when the executable has a different name.
+The Windows client sends it only for stack tabs revealed with **Force-show script
+stacks** in that property window. Identity checks and tool requirements still
+apply. Existing Node Inspector endpoints must pass the normal ownership and PID
+checks. Automatic Inspector activation additionally requires mapped `libnode` or
+a defined Node entry-point symbol from trusted `readelf`, plus a caught SIGUSR1
+handler; otherwise the user can enable Inspector manually or use llnode. Forced
+Java capture requires mapped `libjvm.so`, selects `jcmd` from that library's JDK,
+and verifies a caught SIGQUIT handler immediately before attachment. This avoids
+signalling an unrelated process or a JVM that has not installed its attach signal
+handler. Python capture leaves runtime validation to py-spy.
+
 For Node.js, the optional `backend` field accepts `auto` (default), `inspector`,
 or `llnode`. `enable_inspector:true` is honored only with `backend:"inspector"`;
 it authorizes temporary activation for this capture if Inspector is not already

@@ -12,7 +12,8 @@ enum Command
     CopyCommand = 1,
     OpenLocation,
     FirstSignal = 100,
-    FirstService = 200
+    FirstService = 200,
+    ForceScriptStacks = 300
 };
 
 struct SignalAction
@@ -178,14 +179,14 @@ bool openProcessScheduling(HWND owner, const std::wstring &distro, const Json &p
     return true;
 }
 
-std::optional<Json> targetOptions(HWND owner, HWND anchor, const std::wstring &distro, const Json &process,
-                                  const std::string &service, bool busy)
+TargetOptionsResult targetOptions(HWND owner, HWND anchor, const std::wstring &distro, const Json &process,
+                                  const std::string &service, bool busy, bool scriptStacksForced)
 {
     if (!IsWindow(owner) || !IsWindow(anchor) || GetPropW(owner, MenuProperty))
-        return std::nullopt;
+        return {};
     MenuLifetime lifetime(owner);
     if (!lifetime.valid())
-        return std::nullopt;
+        return {};
 
     // Never retain references into an inspector across a nested message loop.
     const Json target = process;
@@ -200,7 +201,7 @@ std::optional<Json> targetOptions(HWND owner, HWND anchor, const std::wstring &d
 
     HMENU menu = CreatePopupMenu();
     if (!menu)
-        return std::nullopt;
+        return {};
     AppendMenuW(menu, MF_STRING | (availablePath(path) ? 0 : MF_GRAYED), OpenLocation,
                 isService ? L"Show unit file in Explorer" : L"Show executable in Explorer");
     AppendMenuW(menu, MF_STRING | (commandLine.empty() ? MF_GRAYED : 0), CopyCommand, L"Copy command line");
@@ -220,6 +221,9 @@ std::optional<Json> targetOptions(HWND owner, HWND anchor, const std::wstring &d
         for (size_t i = 0; i < std::size(Signals); ++i)
             AppendMenuW(menu, actionFlags, FirstSignal + i, Signals[i].label);
         appendProcessSchedulingMenu(menu, canChange, distribution, target);
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING | (scriptStacksForced ? MF_GRAYED : 0), ForceScriptStacks,
+                    L"Force-show script stacks");
     }
 
     RECT button{};
@@ -230,13 +234,15 @@ std::optional<Json> targetOptions(HWND owner, HWND anchor, const std::wstring &d
                                           button.left, button.bottom, owner, &placement);
     DestroyMenu(menu);
     if (!lifetime.valid())
-        return std::nullopt;
+        return {};
+    if (command == ForceScriptStacks && !isService && !scriptStacksForced)
+        return {std::nullopt, true};
     if (command == OpenLocation && availablePath(path))
         openLinuxPath(owner, distribution, path);
     else if (command == CopyCommand && !commandLine.empty())
         copyText(owner, commandLine);
     else if (canChange && !isService && openProcessScheduling(owner, distribution, target, command))
-        return std::nullopt;
+        return {};
     else if (canChange && isService && command >= FirstService &&
              command < FirstService + std::size(Services))
     {
@@ -246,7 +252,7 @@ std::optional<Json> targetOptions(HWND owner, HWND anchor, const std::wstring &d
         if (MessageBoxW(owner, prompt.c_str(), L"Confirm service action",
                         MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) == IDYES &&
             lifetime.valid())
-            return Json{{"op", "service_action"}, {"name", unit}, {"action", action.verb}};
+            return {Json{{"op", "service_action"}, {"name", unit}, {"action", action.verb}}, false};
     }
     else if (canChange && !isService && command >= FirstSignal && command < FirstSignal + std::size(Signals))
     {
@@ -270,11 +276,12 @@ std::optional<Json> targetOptions(HWND owner, HWND anchor, const std::wstring &d
         if (MessageBoxW(owner, prompt.c_str(), L"Confirm process signal",
                         MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) == IDYES &&
             lifetime.valid())
-            return Json{{"op", "signal"},
-                        {"pid", target["pid"]},
-                        {"start_ticks", target["start_ticks"]},
-                        {"signal", signal}};
+            return {Json{{"op", "signal"},
+                         {"pid", target["pid"]},
+                         {"start_ticks", target["start_ticks"]},
+                         {"signal", signal}},
+                    false};
     }
-    return std::nullopt;
+    return {};
 }
 } // namespace wsl

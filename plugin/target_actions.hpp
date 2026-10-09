@@ -21,6 +21,12 @@ bool openProcessScheduling(HWND owner, const std::wstring &distro, const Json &p
 
 // Local copy/open commands run here. Confirmed changes are returned to the
 // inspector so its normal worker and refresh path remain responsible for them.
-std::optional<Json> targetOptions(HWND owner, HWND anchor, const std::wstring &distro, const Json &process,
-                                  const std::string &service, bool busy);
+struct TargetOptionsResult
+{
+    std::optional<Json> request;
+    bool forceScriptStacks = false;
+};
+
+TargetOptionsResult targetOptions(HWND owner, HWND anchor, const std::wstring &distro, const Json &process,
+                                  const std::string &service, bool busy, bool scriptStacksForced = false);
 } // namespace wsl

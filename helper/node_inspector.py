@@ -86,7 +86,11 @@ class Target:
                 or type(self.start_ticks) is not int or self.start_ticks <= 0):
             raise CaptureError("A valid Node process ID and start time are required")
         self.path = "/proc/%d/" % self.pid
+        self.forced_runtime = request.get("force_runtime") == "node"
+        self.activation_evidence = request.get("activation_evidence") is True
         self.executable_identity = None
+        if "executable_device" in request and "executable_inode" in request:
+            self.executable_identity = (request["executable_device"], request["executable_inode"])
         self.check()
         self.inner_pid = self.pid
         for line in read_file(self.path + "status", 64 * 1024).splitlines():
@@ -105,7 +109,7 @@ class Target:
             executable = os.readlink(self.path + "exe")
             if executable.endswith(" (deleted)"):
                 executable = executable[:-10]
-            if os.path.basename(executable) not in ("node", "nodejs"):
+            if not self.forced_runtime and os.path.basename(executable) not in ("node", "nodejs"):
                 raise CaptureError("The selected executable is no longer Node.js")
             metadata = os.stat(self.path + "exe")
             identity = (metadata.st_dev, metadata.st_ino)
@@ -237,6 +241,24 @@ class Target:
             self.check()
             if self.state in (b"T", b"t"):
                 raise CaptureError("The process is stopped. Resume it before enabling Inspector, or use llnode.")
+            if self.forced_runtime:
+                # Choosing a tab is not proof that the process is Node. SIGUSR1
+                # terminates an ordinary process with no installed handler.
+                # The observer verifies mapped libnode or a defined Node ELF
+                # entry point; check the live handler immediately before use.
+                if not self.activation_evidence:
+                    raise CaptureError("Cannot verify Node.js for automatic Inspector activation. "
+                        "Enable Inspector manually and retry, or use llnode. For renamed standalone "
+                        "Node binaries, installing binutils (apt install binutils) may allow verification.")
+                caught = 0
+                for line in read_file(self.path + "status", 64 * 1024).splitlines():
+                    if line.startswith(b"SigCgt:"):
+                        caught = int(line.split()[1], 16)
+                        break
+                if not caught & (1 << (signal.SIGUSR1 - 1)):
+                    raise CaptureError("This process has no SIGUSR1 handler for Inspector activation. "
+                        "Enable Inspector manually and retry, or use llnode.")
+                self.check()
             signal.pidfd_send_signal(descriptor, signal.SIGUSR1, None, 0)
         finally:
             os.close(descriptor)
