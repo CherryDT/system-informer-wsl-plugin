@@ -8,6 +8,7 @@
 #include <sstream>
 #include <windowsx.h>
 #include <cmath>
+#include <limits>
 
 namespace wsl
 {
@@ -96,6 +97,57 @@ std::wstring bytes(uint64_t value)
     }
     return number(amount, unit ? 2 : 0) + L" " + units[unit];
 }
+std::wstring formatStartTime(uint64_t ticks, const Json &clock)
+{
+    const auto raw = std::to_wstring(ticks) + L" ticks";
+    const auto unavailable = L"Not available (" + raw + L")";
+    try
+    {
+        const double hz = clock.at("clock_ticks").get<double>();
+        const double boot = clock.at("boot_time_unix").get<double>();
+        const double uptime = clock.at("uptime_seconds").get<double>();
+        if (!std::isfinite(hz) || hz <= 0 || !std::isfinite(boot) || boot < 0 || !std::isfinite(uptime) ||
+            uptime < 0)
+            return unavailable;
+
+        const long double sinceBoot = static_cast<long double>(ticks) / hz;
+        // Linux supplies the boot epoch; Windows supplies the user's local
+        // time zone and date/time conventions. Never assume both OSes use UTC.
+        const long double fileTicks = (11644473600.0L + boot + sinceBoot) * 10000000.0L;
+        if (!std::isfinite(fileTicks) || fileTicks < 0 ||
+            fileTicks >= static_cast<long double>(std::numeric_limits<int64_t>::max()))
+            return unavailable;
+        ULARGE_INTEGER timestamp{};
+        timestamp.QuadPart = static_cast<uint64_t>(fileTicks);
+        const FILETIME fileTime{timestamp.LowPart, timestamp.HighPart};
+        SYSTEMTIME utc{}, local{};
+        if (!FileTimeToSystemTime(&fileTime, &utc) || !SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local))
+            return unavailable;
+        wchar_t date[128]{}, time[128]{};
+        if (!GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &local, nullptr, date,
+                             static_cast<int>(std::size(date)), nullptr) ||
+            !GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &local, nullptr, time,
+                             static_cast<int>(std::size(time))))
+            return unavailable;
+        // The elapsed value belongs to the Linux clock sample, rather than the
+        // Windows wall clock (which may differ or change while a reply is queued).
+        const long double elapsed = std::max(0.0L, static_cast<long double>(uptime) - sinceBoot);
+        if (elapsed >= static_cast<long double>(std::numeric_limits<uint64_t>::max()))
+            return unavailable;
+        const auto age = static_cast<uint64_t>(elapsed);
+        wchar_t duration[64]{};
+        swprintf_s(duration, L"%llu:%02llu:%02llu:%02llu", age / 86400, age / 3600 % 24, age / 60 % 60,
+                   age % 60);
+        return std::wstring(date) + L" " + time + L" (" + raw + L" / " + duration + L" ago)";
+    }
+    catch (const std::exception &)
+    {
+        // Older or incomplete replies must still leave the original ticks
+        // visible; guessing a boot time would turn them into a misleading date.
+        return unavailable;
+    }
+}
+
 void errorBox(HWND owner, const std::wstring &message)
 {
     MessageBoxW(owner, message.c_str(), L"WSL Tools", MB_OK | MB_ICONERROR);

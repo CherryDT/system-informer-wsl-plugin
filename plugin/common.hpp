@@ -64,6 +64,7 @@ void errorBox(HWND owner, const std::wstring &text);
 std::wstring text(const Json &value, const char *key, const std::wstring &fallback = L"");
 std::wstring number(double value, int decimals = 2);
 std::wstring bytes(uint64_t value);
+std::wstring formatStartTime(uint64_t ticks, const Json &clock);
 HWND control(HWND parent, const wchar_t *cls, const wchar_t *label, DWORD style, int id);
 void place(HWND child, int x, int y, int width, int height);
 int scale(HWND window, int value);

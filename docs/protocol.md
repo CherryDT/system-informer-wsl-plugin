@@ -141,6 +141,13 @@ policy rather than a wire-protocol request, and never shuts down a distro.
 
 Returns:
 
+- `clock`: `boot_time_unix` (Unix seconds), `clock_ticks` (ticks per second), and
+  `uptime_seconds`, sampled once near the end of the detail request. An empty
+  object means clock information was unavailable. The Windows UI derives absolute
+  start time from `boot_time_unix + start_ticks / clock_ticks` and elapsed time
+  from `uptime_seconds - start_ticks / clock_ticks`, formatting the timestamp in
+  the user's Windows time zone and locale. This is not an extra snapshot query.
+
 - `overview`: current process snapshot fields (including `runtime`), plus `cwd`, `cgroup`,
   `capabilities` (effective, permitted, inheritable, bounding, and ambient masks),
   `seccomp` (`Disabled`, `Strict`, or `Filter`), and `no_new_privs` (`Yes` or `No`).
@@ -244,7 +251,11 @@ Provides thread diagnostics and Linux scheduler controls. For a single thread,
 `properties` returns fields for identity, state, niceness, priority, scheduling
 policy, current CPU and affinity, I/O priority, CPU times, context switches,
 wait channel, current syscall, and kernel stack where readable. `kernel_stack`
-returns the kernel stack/wait diagnostics as text. Scheduling actions are
+returns the kernel stack/wait diagnostics as text. A `properties` response also
+includes the same root `clock` object as `details`; its **Start time** field has
+numeric `start_ticks` metadata alongside fallback `value` text, so the Windows UI
+can apply the same timestamp formatting. Process/thread identity keys are unchanged.
+Scheduling actions are
 `set_nice` (`inputs.nice`, -20 through 19), `set_affinity`
 (`inputs.cpus`, for example `0-3,5`), `set_policy`
 (`inputs.policy`: `other`, `batch`, or `idle`), and `set_io_priority`

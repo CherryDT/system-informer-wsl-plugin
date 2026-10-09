@@ -560,6 +560,30 @@ std::string boot_id() {
     while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) value.pop_back();
     return value;
 }
+Json start_time_clock() {
+    // /proc/<pid>/stat and /proc/<tid>/stat report start time as clock ticks
+    // since boot. Linux's btime plus /proc/uptime lets the UI derive both the
+    // wall-clock start time and the elapsed duration from one late sample.
+    // Stream /proc/stat so this remains bounded even if it gains more rows.
+    std::ifstream stat("/proc/stat");
+    std::string line;
+    uint64_t boot_time = 0;
+    bool have_boot_time = false;
+    while (std::getline(stat, line)) {
+        if (line.rfind("btime ", 0) != 0) continue;
+        std::istringstream value(line.substr(6));
+        std::string trailing;
+        if (!(value >> boot_time) || (value >> trailing)) return Json::object();
+        have_boot_time = true;
+        break;
+    }
+    const long ticks = sysconf(_SC_CLK_TCK);
+    double uptime = 0;
+    std::istringstream uptime_input(read_text("/proc/uptime", 128));
+    if (!have_boot_time || ticks <= 0 || !(uptime_input >> uptime) || uptime < 0)
+        return Json::object();
+    return {{"boot_time_unix", boot_time}, {"clock_ticks", ticks}, {"uptime_seconds", uptime}};
+}
 Json hello() {
     return {{"protocol", 1}, {"boot_id", boot_id()}, {"uid", getuid()},
             {"cpus", sysconf(_SC_NPROCESSORS_ONLN)}, {"clock_ticks", sysconf(_SC_CLK_TCK)},
@@ -818,7 +842,9 @@ Json process_details(const Json& request) {
     const auto no_new_privs = field_text(status, "NoNewPrivs:");
     overview["no_new_privs"] = no_new_privs == "1" ? "Yes" : no_new_privs == "0" ? "No" : no_new_privs;
     require_identity(identity);
+    const auto clock = start_time_clock();
     return {{"overview", overview}, {"threads", threads}, {"environment", environment}, {"summary", summary}, {"files", files}, {"modules", modules}, {"memory", memory},
+            {"clock", clock},
             {"files_accessible", files_accessible}, {"modules_accessible", !maps.empty()},
             {"memory_accessible", !maps.empty()}, {"modules_unverified", modules_unverified},
             {"module_classification_note", module_classification_note},

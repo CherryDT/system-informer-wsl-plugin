@@ -41,6 +41,9 @@ ProcessStat process_stat(int pid);
 ProcessIdentity request_identity(const Json& request);
 void require_identity(const ProcessIdentity& identity);
 std::string boot_id();
+// Clock values used to turn /proc start ticks into an absolute start time.
+// Read on demand by detail requests, never as part of process snapshots.
+Json start_time_clock();
 Json hello();
 Json snapshot(const Json& request);
 Json process_details(const Json& request);

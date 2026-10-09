@@ -113,7 +113,7 @@ struct Inspector
     int overviewScroll = 0;
     bool overviewLayoutActive = false;
     std::vector<OverviewField> overviewFields;
-    Json overviewData;
+    Json overviewData, clock;
     HWND refresh = nullptr, copySave = nullptr;
     HWND filterLabel = nullptr, filter = nullptr, clearFilter = nullptr;
     HWND pageOptions = nullptr, targetOptions = nullptr, closeButton = nullptr;
@@ -417,6 +417,8 @@ std::wstring overviewValue(const Inspector &state, const OverviewField &field)
             return L"Systemd default";
         return L"Not available";
     }
+    if (!state.isService && key == "start_ticks")
+        return formatStartTime(state.overviewData.at("start_ticks").get<uint64_t>(), state.clock);
     if (!state.isService && key == "service_unit")
     {
         const auto scope = cell(state.overviewData, "service_scope");
@@ -451,6 +453,7 @@ std::wstring overviewValue(const Inspector &state, const OverviewField &field)
 
 void updateOverview(Inspector &state, const Json &data)
 {
+    state.clock = data.value("clock", Json::object());
     auto overview = data.find("overview");
     if (overview != data.end() && overview->is_object())
         state.overviewData.update(*overview);
@@ -502,7 +505,7 @@ void createOverviewFields(Inspector &state)
                                 {"virtual_bytes", L"Virtual memory"},
                                 {"read_bytes", L"Storage reads"},
                                 {"write_bytes", L"Storage writes"},
-                                {"start_ticks", L"Start time (ticks)"},
+                                {"start_ticks", L"Start time"},
                                 {"cgroup", L"Control groups", true},
                                 {"seccomp", L"Seccomp"},
                                 {"no_new_privs", L"No new privileges"},
@@ -1824,11 +1827,18 @@ void loadProcessDetails(Inspector &state, const Json &data)
                     row.key += ":" + std::to_string(nameOccurrences[row.key]++);
                     break;
                 case 3:
-                    row.cells = {
-                        cell(value, "tid"),          cell(value, "name"),       cell(value, "state"),
-                        cell(value, "wchan"),        cell(value, "nice"),       cell(value, "priority"),
-                        cell(value, "policy"),       cell(value, "processor"),  cell(value, "user_ticks"),
-                        cell(value, "kernel_ticks"), cell(value, "start_ticks")};
+                    row.cells = {cell(value, "tid"),
+                                 cell(value, "name"),
+                                 cell(value, "state"),
+                                 cell(value, "wchan"),
+                                 cell(value, "nice"),
+                                 cell(value, "priority"),
+                                 cell(value, "policy"),
+                                 cell(value, "processor"),
+                                 cell(value, "user_ticks"),
+                                 cell(value, "kernel_ticks"),
+                                 formatStartTime(value.value("start_ticks", uint64_t{0}), state.clock)};
+                    row.numeric[10] = value.value("start_ticks", 0.0);
                     row.key = rowKey(value, "tid") + ":" + rowKey(value, "start_ticks");
                     break;
                 case MemoryTable: {
@@ -2621,7 +2631,7 @@ void createControls(Inspector &state)
                                 {L"Last CPU", 80, true, false},
                                 {L"User time (ticks)", 120, true, false},
                                 {L"Kernel time (ticks)", 120, true, false},
-                                {L"Start time (ticks)", 120, true, false}});
+                                {L"Start time", 360, true, false}});
         state.tables[ConnectionsTable].create(state.pageWindow, Connections,
                                               {{L"Protocol", 85},
                                                {L"Local address", 195},

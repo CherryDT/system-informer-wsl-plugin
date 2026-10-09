@@ -633,8 +633,13 @@ void loadReply(ToolWindow &state, const Reply &reply)
         auto fields = reply.data.find("fields");
         if (fields != reply.data.end() && fields->is_array())
             for (const auto &field : *fields)
-                rows.push_back(
-                    {{text(field, "name"), text(field, "value")}, field, std::to_string(rows.size())});
+            {
+                const auto value = field.contains("start_ticks")
+                                       ? formatStartTime(field.at("start_ticks").get<uint64_t>(),
+                                                         reply.data.value("clock", Json::object()))
+                                       : text(field, "value");
+                rows.push_back({{text(field, "name"), value}, field, std::to_string(rows.size())});
+            }
         if (state.properties.window)
             state.properties.replace(std::move(rows));
         state.output = text(reply.data, "text");

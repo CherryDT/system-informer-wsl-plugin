@@ -284,7 +284,8 @@ static Json thread_tool_one(const Json& request, bool diagnostics, bool& mutatio
     auto field = [&](const char* name, const std::string& value) { result["fields"].push_back({{"name", name}, {"value", value}}); };
     field("Thread ID", std::to_string(tid));
     field("Name", snapshot.at("name").get<std::string>());
-    field("Start time (ticks)", std::to_string(start));
+    result["fields"].push_back({{"name", "Start time"}, {"value", std::to_string(start) + " ticks"},
+        {"start_ticks", start}});
     field("State", snapshot.at("state").get<std::string>());
     field("Nice", std::to_string(snapshot.at("nice").get<int>()));
     field("Priority", std::to_string(snapshot.at("priority").get<int>()));
@@ -517,7 +518,11 @@ Json thread_tool(const Json& request) {
     if (request.value("action", "") == "settings") return affinity_settings(request);
     if (request.value("all_threads", false)) return process_thread_tool(request);
     bool changed = false;
-    try { return thread_tool_one(request, true, changed); }
+    try {
+        auto result = thread_tool_one(request, true, changed);
+        if (request.value("action", "") == "properties") result["clock"] = start_time_clock();
+        return result;
+    }
     catch (const std::exception& e) {
         if (!changed) throw;
         // A successful syscall followed by a disappearing target is not a
