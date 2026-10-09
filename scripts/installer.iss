@@ -46,6 +46,11 @@ Type: files; Name: "{app}\installation.ini"
 var
   TargetPage: TInputDirWizardPage;
   CompanionBox: TNewCheckBox;
+  PluginPage: TInputOptionWizardPage;
+  PluginDetails, PluginPathLabel: TNewStaticText;
+  PluginPathEdit: TNewEdit;
+  PluginSettingsPath: String;
+  PluginSettingsSupported, PluginSettingsNeeded, PluginSettingsInspected: Boolean;
   ExistingTarget, TargetDirectory: String;
   InstallFailed: Boolean;
 
@@ -113,7 +118,26 @@ begin
   Notice.WordWrap := True;
   Notice.Caption := 'Includes stopped distributions, which will temporarily be started. ' +
     'Runs as Linux root.' + #13#10#13#10 + DistributionSummary + #13#10#13#10 +
-    'Your System Informer and plugin settings will be preserved.';
+    'Your other System Informer settings will be preserved.';
+  PluginPage := CreateInputOptionPage(TargetPage.ID, 'System Informer plugin loading',
+    'Allow System Informer to load WSL Tools.',
+    'Required for WSL Tools. This enables plugin loading and allows third-party plugin DLLs.',
+    False, False);
+  PluginPage.Add('Enable third-party plugins in System Informer');
+  PluginDetails := TNewStaticText.Create(PluginPage);
+  PluginDetails.Parent := PluginPage.Surface;
+  PluginDetails.SetBounds(0, ScaleY(75), PluginPage.SurfaceWidth, ScaleY(85));
+  PluginDetails.AutoSize := False;
+  PluginDetails.WordWrap := True;
+  PluginDetails.ShowAccelChar := False;
+  PluginPathLabel := TNewStaticText.Create(PluginPage);
+  PluginPathLabel.Parent := PluginPage.Surface;
+  PluginPathLabel.SetBounds(0, ScaleY(165), PluginPage.SurfaceWidth, ScaleY(18));
+  PluginPathLabel.Caption := 'Settings file:';
+  PluginPathEdit := TNewEdit.Create(PluginPage);
+  PluginPathEdit.Parent := PluginPage.Surface;
+  PluginPathEdit.SetBounds(0, ScaleY(185), PluginPage.SurfaceWidth, ScaleY(23));
+  PluginPathEdit.ReadOnly := True;
 end;
 
 function ValidateTarget: String;
@@ -128,6 +152,49 @@ begin
       'Uninstall it before selecting a different System Informer installation.';
 end;
 
+procedure InspectPluginSettings;
+var Report, Params, Diagnostic: String; ExitCode: Integer;
+begin
+  ExtractTemporaryFile('setup-settings.ps1');
+  Report := ExpandConstant('{tmp}\plugin-settings.ini');
+  DeleteFile(Report);
+  Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+    NativeQuote(ExpandConstant('{tmp}\setup-settings.ps1')) +
+    ' -Mode Inspect -SystemInformerDirectory ' + NativeQuote(TargetDirectory) +
+    ' -ResultFile ' + NativeQuote(Report);
+  PluginSettingsSupported := False;
+  PluginSettingsNeeded := False;
+  Diagnostic := 'Could not inspect System Informer settings. You can enable third-party plugins manually after installation.';
+  if Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Params, '',
+    SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
+    if (ExitCode = 0) and FileExists(Report) then begin
+      PluginSettingsSupported := GetIniString('Plugins', 'Supported', '0', Report) = '1';
+      PluginSettingsNeeded := GetIniString('Plugins', 'NeedsChange', '0', Report) = '1';
+    end;
+    Diagnostic := GetIniString('Plugins', 'Message', Diagnostic, Report);
+  end;
+  if PluginSettingsSupported and PluginSettingsNeeded then
+    Diagnostic := 'Your other settings and disabled-plugin choices will be preserved.';
+  PluginSettingsPath := GetIniString('Plugins', 'Path', '', Report);
+  PluginPage.CheckListBox.Enabled := PluginSettingsSupported;
+  { Interactive installs opt in by default. Silent installs must explicitly
+    request a settings change because there is no checkbox to review. }
+  PluginPage.Values[0] := PluginSettingsSupported and PluginSettingsNeeded and
+    (ExpandConstant('{param:ENABLETHIRDPARTYPLUGINS|}') <> '0') and
+    (not WizardSilent or (ExpandConstant('{param:ENABLETHIRDPARTYPLUGINS|}') = '1'));
+  PluginDetails.Caption := Diagnostic;
+  PluginPathEdit.Text := PluginSettingsPath;
+  PluginPathEdit.Visible := PluginSettingsPath <> '';
+  PluginPathLabel.Visible := PluginPathEdit.Visible;
+  PluginSettingsInspected := True;
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := (PageID = PluginPage.ID) and PluginSettingsInspected and
+    PluginSettingsSupported and not PluginSettingsNeeded;
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 var Problem: String;
 begin
@@ -135,7 +202,8 @@ begin
   if CurPageID = TargetPage.ID then begin
     Problem := ValidateTarget;
     Result := Problem = '';
-    if not Result then SuppressibleMsgBox(Problem, mbError, MB_OK, IDOK);
+    if not Result then SuppressibleMsgBox(Problem, mbError, MB_OK, IDOK)
+    else InspectPluginSettings;
   end;
 end;
 
@@ -143,6 +211,7 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   { Also validate when silent installation skips the directory page. }
   Result := ValidateTarget;
+  if (Result = '') and not PluginSettingsInspected then InspectPluginSettings;
 end;
 
 procedure RegisterPreviousData(PreviousDataKey: Integer);
@@ -156,6 +225,8 @@ begin
   Result := 'System Informer folder:' + NewLine + Space + TargetDirectory + NewLine + NewLine;
   if CompanionBox.Checked then Result := Result + 'Install companion in all WSL2 distributions.'
   else Result := Result + 'Install the Windows plugin only.';
+  if PluginPage.Values[0] then
+    Result := Result + NewLine + NewLine + 'Enable third-party plugins in System Informer.';
 end;
 
 procedure ReportWorkerFailure(Action: String);
@@ -170,9 +241,11 @@ begin
   if CurStep = ssPostInstall then begin
     { Inno has committed its repair payload and uninstall record. External
       updates cannot be rolled back, so retain both if any phase fails. }
-    InstallFailed := not RunSetupWorker('Install', 'Windows', TargetDirectory);
+    InstallFailed := not RunSetupWorker('Install', 'Windows', TargetDirectory, '');
+    if not InstallFailed and PluginPage.Values[0] then
+      InstallFailed := not RunSetupWorker('Install', 'PluginSettings', TargetDirectory, PluginSettingsPath);
     if not InstallFailed and CompanionBox.Checked then
-      InstallFailed := not RunSetupWorker('Install', 'Companions', TargetDirectory);
+      InstallFailed := not RunSetupWorker('Install', 'Companions', TargetDirectory, '');
     if InstallFailed then ReportWorkerFailure('Installation');
   end;
 end;
@@ -251,11 +324,11 @@ begin
     Companions := ConfirmCompanionRemoval;
     { Abort before Inno removes its own files/registration on failure. This
       allows a failed or cancelled companion removal to be retried. }
-    if not RunSetupWorker('Uninstall', 'Windows', TargetDirectory) then begin
+    if not RunSetupWorker('Uninstall', 'Windows', TargetDirectory, '') then begin
       ReportWorkerFailure('Uninstall');
       Abort;
     end;
-    if Companions and not RunSetupWorker('Uninstall', 'Companions', TargetDirectory) then begin
+    if Companions and not RunSetupWorker('Uninstall', 'Companions', TargetDirectory, '') then begin
       ReportWorkerFailure('Companion removal');
       Abort;
     end;

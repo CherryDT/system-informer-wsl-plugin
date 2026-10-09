@@ -112,7 +112,7 @@ begin
   end;
 end;
 
-function RunSetupWorker(Mode, Phase, Target: String): Boolean;
+function RunSetupWorker(Mode, Phase, Target, SettingsPath: String): Boolean;
 var Info: TWorkerExecuteInfo; Params: String; I: Integer; Silent: Boolean;
 begin
   Result := False;
@@ -147,6 +147,7 @@ begin
       ' -DistributionDirectory ' + NativeQuote(ExpandConstant('{app}')) +
       ' -ProgressFile ' + NativeQuote(WorkProgressFile) +
       ' -CancelFile ' + NativeQuote(WorkCancelFile);
+    if SettingsPath <> '' then Params := Params + ' -SettingsFile ' + NativeQuote(SettingsPath);
     Info.cbSize := SizeOf(Info);
     Info.fMask := $00000040 or $00000100; { NOCLOSEPROCESS | NOASYNC }
     Info.Wnd := WorkForm.Handle;

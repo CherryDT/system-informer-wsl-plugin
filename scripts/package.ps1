@@ -25,7 +25,7 @@ try {
     foreach ($File in @('WslTools.dll', 'WslTools.pdb', 'wsl-observer')) { Copy-PackageFile "$Dist/$File" $File }
     foreach ($File in @('README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) { Copy-PackageFile "$Root/$File" $File }
     foreach ($File in @('install.ps1', 'uninstall.ps1', 'setup-common.ps1',
-                        'setup-files.ps1', 'setup-worker.ps1')) {
+                        'setup-files.ps1', 'setup-worker.ps1', 'setup-settings.ps1')) {
         Copy-PackageFile "$Root/scripts/$File" $File
     }
     Copy-PackageFile "$Root/docs/images/wsl-tools.png" 'docs/images/wsl-tools.png'

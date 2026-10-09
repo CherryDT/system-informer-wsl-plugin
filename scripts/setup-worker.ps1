@@ -3,9 +3,10 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [ValidateSet('Install', 'Uninstall')] [string] $Mode,
-    [Parameter(Mandatory)] [ValidateSet('Windows', 'Companions')] [string] $Phase,
+    [Parameter(Mandatory)] [ValidateSet('Windows', 'Companions', 'PluginSettings')] [string] $Phase,
     [string] $SystemInformerDirectory,
     [string] $DistributionDirectory,
+    [string] $SettingsFile,
     [Parameter(Mandatory)] [string] $ProgressFile,
     [Parameter(Mandatory)] [string] $CancelFile
 )
@@ -31,6 +32,20 @@ try {
     if ($Phase -eq 'Windows') {
         Invoke-WindowsFileAction $Mode $SystemInformerDirectory $DistributionDirectory $ProgressFile
         # A copy already in progress finishes before cancellation takes effect.
+        Test-SetupCancelled $CancelFile
+    } elseif ($Phase -eq 'PluginSettings') {
+        if ($Mode -ne 'Install') { throw 'Plugin settings can only be enabled during installation.' }
+        Test-SetupCancelled $CancelFile
+        $Report = $ProgressFile + '.ini'
+        & (Join-Path $PSScriptRoot 'setup-settings.ps1') -Mode Enable `
+            -SystemInformerDirectory $SystemInformerDirectory -ExpectedSettingsPath $SettingsFile -ResultFile $Report
+        $ResultCode = $LASTEXITCODE
+        $Message = (Get-Content -LiteralPath $Report | Where-Object { $_.StartsWith('Message=') } |
+            Select-Object -First 1)
+        if ($Message) { $Message = $Message.Substring(8) }
+        else { $Message = 'Could not enable third-party plugins. Check the System Informer settings file.' }
+        if ($ResultCode -ne 0) { throw $Message }
+        Write-SetupProgress $Message $ProgressFile
         Test-SetupCancelled $CancelFile
     } else {
         $Distros = @(Get-Wsl2Distributions)
@@ -58,7 +73,7 @@ try {
             throw "$Failures WSL distribution(s) failed. See the results above, then retry if needed."
         }
     }
-    Write-SetupProgress 'Done. System Informer and plugin settings were preserved.' $ProgressFile
+    Write-SetupProgress 'Done. Unrelated settings were preserved.' $ProgressFile
     exit 0
 } catch {
     $Diagnostic = $_.Exception.Message
