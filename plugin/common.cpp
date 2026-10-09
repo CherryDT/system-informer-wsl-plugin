@@ -192,6 +192,17 @@ LRESULT CALLBACK tableLayoutProc(HWND window, UINT message, WPARAM wparam, LPARA
                                  DWORD_PTR context)
 {
     auto table = reinterpret_cast<Table *>(context);
+    if (message == WM_CONTEXTMENU)
+    {
+        const HWND source = reinterpret_cast<HWND>(wparam);
+        wchar_t className[32]{};
+        if (GetParent(source) == window && GetClassNameW(source, className, std::size(className)) &&
+            lstrcmpW(className, WC_HEADERW) == 0)
+            // TreeNewHeaderRightClick already handled this gesture. A modal
+            // column chooser can outlive that callback; the header's later
+            // WM_CONTEXTMENU must not become a second menu for a grid row.
+            return 0;
+    }
     if (message == SaveTableLayout)
     {
         table->saveLayout();

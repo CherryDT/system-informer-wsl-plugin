@@ -2210,15 +2210,6 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
                               DWORD_PTR reference)
 {
     HWND inspector = reinterpret_cast<HWND>(reference);
-    if (message == WM_CONTEXTMENU)
-    {
-        int id = GetDlgCtrlID(window);
-        if ((id >= Files && id <= Connections) || id == Memory)
-        {
-            SendMessageW(inspector, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(window), lParam);
-            return 0;
-        }
-    }
     if (message == WM_KEYDOWN)
     {
         int id = 0;
