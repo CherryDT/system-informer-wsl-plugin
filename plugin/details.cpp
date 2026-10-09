@@ -2252,6 +2252,8 @@ void loadReply(Inspector &state, const Reply &reply)
             content = cell(reply.data, "journal");
             SetWindowTextW(state.journal, content.empty() ? L"No journal entries were returned."
                                                           : editText(content).c_str());
+            // journalctl returns entries oldest first; open at the newest ones.
+            SendMessageW(state.journal, WM_VSCROLL, SB_BOTTOM, 0);
             state.hasData = true;
         }
         else
