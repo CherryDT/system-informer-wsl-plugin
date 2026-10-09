@@ -4,7 +4,7 @@ A native System Informer plugin for inspecting and controlling WSL 2 from a dedi
 
 > [!WARNING]
 > ⚠️ **Using this build with System Informer’s driver module (KPH) requires relaxing its image-load protection.**
-> Third-party plugin loading must be enabled, and using this build with System Informer’s driver module (KPH) requires `KsiDisableImageLoadProtection=1`. The driver module trusts specific signing authorities or its own detached signatures. When using it, not even regular code signing would be enough, so at the moment this plugin can only function with this option enabled!
+> Third-party plugin loading must be enabled, and using this build with System Informer’s driver module (KPH) requires `KsiDisableImageLoadProtection=1`. System Informer's driver module (KPH) does not trust this plugin yet. It uses its own whitelist and not even regular code signing would be enough, so at the moment this plugin can only function with this option enabled!
 >
 > **Tradeoff: untrusted DLLs can load into System Informer, and its kernel-driver access is reduced. Some Windows inspection and control features become unavailable.** The installer explains these choices. WSL Tools itself does not require the driver; a separate `-nokph` instance can keep the main instance’s protection intact. See [restoring image-load protection](#restoring-image-load-protection).
 
@@ -49,7 +49,7 @@ For a manual ZIP installation, or if you declined the setup options, enable plug
 2. In **Options → Advanced**, set **KsiDisableImageLoadProtection** to **0**, or select the uninstaller’s corresponding reset checkbox. To restore built-in-only plugin discovery too, set **EnableDefaultSafePlugins** to **1** (the other uninstall reset). Unselected preferences are preserved.
 3. Reload KPH so it reads the restored configuration. One supported route is to temporarily enable **KsiUnloadOnExit** in the last System Informer instance you will close, exit all other instances, then use **File → Exit** in that final instance. After a successful driver unload, start System Informer again. You can return `KsiUnloadOnExit` to its previous value afterward.
 
-Closing a window into the tray does not unload the driver. If unloading fails, a Windows restart is needed. With a custom persistent KPH service, also check its `HKLM\SYSTEM\CurrentControlSet\Services\<service name>\Parameters\Flags`: the `DisableImageLoadProtection` bit (bit 0) must be cleared while preserving all other bits. A stale service flag can survive a reboot; a successful native driver unload/recreation removes that stale configuration. The installer resets the host preference only and does not edit driver-service flags automatically.
+Closing a window into the tray does not unload the driver. If unloading fails, a Windows restart is needed. Custom persistent KPH services may retain their own driver parameters across restarts; use a successful native driver unload/recreation to clear stale configuration. The installer changes the host preference only and does not alter driver-service parameters automatically.
 
 Open **WSL** and choose a running distribution. If that distro does not have the observer installed, the plugin shows an installation notice in place of the normal view. Choose **Install and retry** to install it as root, verify it, and reconnect.
 
@@ -60,7 +60,7 @@ wsl.exe --distribution Ubuntu --user root --exec rm -- /usr/local/lib/system-inf
 wsl.exe --distribution Ubuntu --user root --exec rmdir -- /usr/local/lib/system-informer-wsl
 ```
 
-The second command succeeds only if the directory is empty. System Informer settings are preserved, and neither the installer nor plugin replaces the original System Informer executable.
+The second command succeeds only if the directory is empty. Companion removal preserves System Informer settings, and neither the installer nor plugin replaces the original System Informer executable.
 
 ### Compatibility
 
@@ -80,7 +80,7 @@ WSL monitoring follows System Informer's global **View → Refresh automatically
 
 **Enable background capture** is on by default. Turn it off to stop all WSL requests and close the observer whenever the WSL tab is inactive, System Informer is minimized or hidden, or another distro is selected. This also pauses requests from inspectors and Find handles for an inactive distro; opening an inspector does not keep its observer running. Returning to that distro in the WSL tab reconnects and refreshes immediately, which can take a second. Graphs leave a gap for the uncaptured time instead of joining the old and new samples. No distro is stopped or shut down.
 
-**Processes:** By default, process CPU follows the Windows convention: **100% = all WSL vCPUs**. In System Informer **Options → WSL**, switch to Linux's convention if preferred: **100% = one fully occupied vCPU**. The registry setting is `CpuPercentOfTotal` (`REG_DWORD`): `1` is the default total-WSL-capacity scale and `0` selects the one-vCPU scale. The summary and CPU graph always divide the selected distro's collected process total by the guest CPU count, regardless of the process-column setting. Memory available/total is VM-wide because WSL distributions share a kernel; RSS is per process and includes shared pages. Read/write rates are Linux storage accounting, not network or every buffered read/write operation.
+**Processes:** By default, process CPU follows the Windows convention: **100% = all WSL vCPUs**. In System Informer **Options → WSL**, switch to Linux's convention if preferred: **100% = one fully occupied vCPU**. The `CpuPercentOfTotal` preference is: `1` is the default total-WSL-capacity scale and `0` selects the one-vCPU scale. The summary and CPU graph always divide the selected distro's collected process total by the guest CPU count, regardless of the process-column setting. Memory available/total is VM-wide because WSL distributions share a kernel; RSS is per process and includes shared pages. Read/write rates are Linux storage accounting, not network or every buffered read/write operation.
 
 The optional **CPU (average)** column averages the most recent valid process CPU samples, using System Informer's **Sample count** history length. It is not a lifetime average. It follows the same CPU scale, decimal precision and tiny-value display rules as CPU, and sorts by the unrounded average. History is collected even when the column is hidden, using existing snapshots with no additional WSL queries. Paused capture periods and the first baseline reading after resuming are excluded; retained samples survive a pause. Exited processes, reused PIDs, distro changes and WSL restarts start fresh histories.
 
@@ -102,7 +102,7 @@ CPU and VM-memory graphs stay visible and update across Processes, Services and 
 
 **Network:** enter a port such as `3000`, or combine terms such as `node 3000`. The ToolStatus search box follows its native matching options. The fallback search ANDs space-separated terms across the collected row values, including data in hidden columns; it does not fetch missing metadata just for a search. **Listening / bound ports only** includes TCP listeners and unconnected UDP endpoints. Unix sockets are included. Double-click an owned socket to switch to Processes and select its owner; press Enter again to inspect it. PID 0 means no owner was visible; it is not a Windows PID. **View → Network → Hide waiting connections** hides ownerless entries and TCP `CLOSE_WAIT` in both main and process-detail network tables. The **Remote hostname** column follows the host's resolve-addresses setting and is resolved only while that column is visible in the main Network view. Hiding it stops lookups even if it remains the sort column. Lookups use the distro's name service, are cached, and leave the numeric endpoint usable when a name is unavailable.
 
-**Services:** inspect a service for structured properties, full diagnostics, its unit file, and a separate **Journal** tab showing the last 100 journal entries. **Show inactive services** is off by default and remembers its value; failed units remain visible. Running services with a PID use the enabled **Service processes** color. The PID column shows the current main process when known; **Go to process** in the context menu selects that process in Processes. Enter and double-click still open the service inspector. Actions have explicit confirmations and run against the system manager as root, not a user's `systemctl --user` manager. Enabling a service and starting it are separate operations.
+**Services:** inspect a service for structured properties, full diagnostics, its unit file, and a separate **Journal** tab showing the last 100 journal entries and scrolling to the newest entries after loading or refreshing. **Show inactive services** is off by default and remembers its value; failed units remain visible. Running services with a PID use the enabled **Service processes** color. The PID column shows the current main process when known; **Go to process** in the context menu selects that process in Processes. Enter and double-click still open the service inspector. Actions have explicit confirmations and run against the system manager as root, not a user's `systemctl --user` manager. Enabling a service and starting it are separate operations.
 
 Bare template units such as `getty@.service` show their unit definition and startup state, with journal entries from matching instances. A template has no runtime PID or expanded instance properties; choose a named instance such as `getty@tty1.service` for those details and for start/stop/restart/reload or enable/disable-at-boot actions.
 
@@ -180,31 +180,33 @@ The first snapshot establishes a baseline without new-row highlights. Search/fil
 | Scheduling editor | Escape | Cancel/close |
 | Inspector/settings/resource viewer | Escape | Close window |
 
-## Explorer path overrides
+## Settings and Explorer path overrides
 
-Use the WSL view's **Settings** button to open **System Informer Options → WSL** for CPU display mode, the Node Inspector preference, and a distro path prefix. You can also configure a registry string value under:
+WSL Tools uses System Informer’s normal plugin settings API. Its preferences are saved in the active System Informer settings file: normally `%APPDATA%\SystemInformer\settings.json`, a portable settings file beside the executable, or the file selected with `-settings`. Separate settings profiles keep independent WSL Tools preferences.
 
-```text
-HKEY_CURRENT_USER\Software\David Trapp\System Informer WSL Plugin\PathOverrides
-```
+Use **Options → WSL** (or the WSL view’s **Settings** button) for CPU display mode, Node Inspector behavior, background capture, interop filters, and per-distro Explorer prefixes. Column choices, sorting, inspector options, and saved scheduling rules are saved with that same profile. Fonts, highlighting colors, and refresh behavior use the corresponding host settings.
 
-The value name is the exact distribution name; its `REG_SZ` value is the Windows prefix for `/`.
+The plugin registers three namespaced string settings, also visible in **Options → Advanced**:
 
-For example, to map an Ubuntu distro's Linux paths to drive `R:`:
+| Setting | Contents |
+| --- | --- |
+| `DavidTrapp.WslTools.Preferences` | JSON object containing the preferences below, `Table.*` layout values, and `Inspector.*` options. |
+| `DavidTrapp.WslTools.PathOverrides` | JSON object mapping exact distro names to Windows prefixes for `/`. |
+| `DavidTrapp.WslTools.SavedProcessScheduling` | Versioned JSON containing saved per-executable scheduling rules; empty means no rules. |
 
-```powershell
-$key = 'HKCU:\Software\David Trapp\System Informer WSL Plugin\PathOverrides'
-New-Item -Path $key -Force | Out-Null
-New-ItemProperty -Path $key -Name Ubuntu -PropertyType String -Value 'R:\' -Force
+For example, select **Ubuntu** in **Options → WSL** and enter `R:\` as its Explorer prefix. The `PathOverrides` setting then contains:
+
+```json
+{"Ubuntu":"R:\\"}
 ```
 
 Thus `/usr/bin/bash` opens as `R:\usr\bin\bash` instead of `\\wsl.localhost\Ubuntu\usr\bin\bash`. Replace `R:\` with a drive prefix available on your system. Without an override the plugin uses `\\wsl.localhost\<distro>\`. Overrides affect Explorer navigation only; all inspection and actions still happen inside the correct distro. Deleted files, sockets, pipes and Linux-only paths that Windows cannot represent are not opened as ordinary files.
 
 Standard WSL Windows-drive mounts are recognized before the distro prefix: `/mnt/c` opens as `C:\`, and `/mnt/c/Users` as `C:\Users`, regardless of the prefix configured for other Linux paths. The mount must be exactly `/mnt/<letter>` or followed by `/`; a path like `/mnt/cfoo` does not match and uses the normal per-distro prefix.
 
-Column visibility, widths, display order and the sort column/direction are saved independently for each table under `Table.*` values in the plugin registry key. Widths are stored in DPI-independent units.
+Column visibility, widths, display order, and sort column/direction are stored independently for each table under `Table.*` properties in `DavidTrapp.WslTools.Preferences`. Widths use DPI-independent units. Inspector filters and local highlighting switches use `Inspector.*` properties in that same object.
 
-The refresh interval and automatic-update choice come from System Informer's main View settings. Other preferences use the following `REG_DWORD` values in the plugin registry key; explicit saved values override these defaults.
+The refresh interval and automatic-update choice come from System Informer’s main View settings. Other preferences use these integer values in `DavidTrapp.WslTools.Preferences`; saved values override the defaults:
 
 | Setting | Default | Effect |
 | --- | --- | --- |
@@ -217,7 +219,7 @@ The refresh interval and automatic-update choice come from System Informer's mai
 | `ShowInactiveServices` | `0` | Show units whose systemd state is `inactive`; failed units remain visible. |
 | `ShowProcessTree` | `0` | Remember the process-tree checkbox. |
 
-Saved executable scheduling rules are kept separately in `SavedProcessScheduling` (`REG_SZ` JSON). Use **Save for this executable** and **Remove saved settings** to manage them.
+Saved executable scheduling rules are kept in `DavidTrapp.WslTools.SavedProcessScheduling`. Use **Save for this executable** and **Remove saved settings** to manage them.
 
 ## Build
 
@@ -236,7 +238,7 @@ From Windows PowerShell, using the Windows-visible checkout path:
 .\scripts\package.ps1
 ```
 
-The first Windows build downloads the pinned upstream SDK source and checks its archive SHA-256. It derives public headers and the import library without building System Informer. Later builds can use `-SkipSdk`. Every Windows build still cleans native objects: this prevents stale header layouts across the WSL/Windows staging boundary. Matching PDB symbols are retained for crash diagnosis. Windows compilation is staged under `%LOCALAPPDATA%\WslTools\build`; `-BuildRoot` can select another staging directory.
+The first Windows build downloads the pinned upstream SDK source and checks its archive SHA-256. It derives public headers and the import library without building System Informer. Later builds can use `-SkipSdk`. Every Windows build still cleans native objects: this prevents stale header layouts across the WSL/Windows staging boundary. Matching PDB symbols are retained for crash diagnosis. The DLL is compiled and linked with Control Flow Guard support for hardened System Informer launches. Windows compilation is staged under `%LOCALAPPDATA%\WslTools\build`; `-BuildRoot` can select another staging directory.
 
 Packaging requires **Inno Setup 6**: `package.ps1` finds `ISCC.exe` on `PATH` or in the standard Program Files installation folders. Use `-InnoCompiler 'C:\path\to\ISCC.exe'` to select it explicitly. The default produces both `WslTools-0.1.0-windows-x64.zip` and `WslTools-0.1.0-setup-x64.exe`; a missing compiler fails with installation guidance. Use `package.ps1 -SkipInstaller` to deliberately build only the ZIP. `scripts/build-installer.ps1 -PackageDirectory <prepared-payload> -OutputDirectory <output-folder>` can compile an installer from an already prepared package directory on local NTFS. Packaging and installer compilation stage under `%LOCALAPPDATA%\WslTools` before copying their final files to `dist/`, including when the checkout is on SSHFS.
 

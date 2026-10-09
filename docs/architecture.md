@@ -19,14 +19,14 @@
 - `resource_tooltips.cpp`: process, service and network tooltips from cached row data.
 - `common.cpp`: the shared TreeNew-backed Table model, semantic row colors, exports, clipboard and UI helpers.
 - `graphs.cpp`: CPU and VM-memory sample history, drawing, moving time grid, and hover details.
-- `settings.cpp`: registry configuration, validated path translation, settings window.
+- `settings.cpp`: host-backed plugin preferences, validated path translation, settings window.
 - `options.rc`: the native WSL page hosted inside System Informer Options.
 - `controller.cpp`: serialized work queue, connection reuse and cancellation.
 - `transport.cpp`: WSL discovery, process creation, binary deployment and bounded protocol I/O.
 
 The UI never performs a WSL request synchronously. A worker owns all connections and executes requests in order. Replies are posted through mailboxes. A mailbox mutex makes window teardown and posting mutually exclusive; destruction detaches then drains pending replies. Main-view reply tags include an epoch so responses to an old distro selection cannot overwrite the current view. Shutdown cancels the active connection before joining the worker.
 
-The shared `Table` owns lightweight rows and supplies text/colors/fonts/tooltips to the host TreeNew control on demand. Its C adapter owns native node storage; C++ retains filtering, exact numeric sorting, lifecycle highlights and persisted column identities. Native fixed columns, headers and PhScrollNew scrollbars replace the previous ListView painting and scroll corrections. Selection is restored by resource identity rather than row index after refresh/sort. Process identity is the distro/connection context plus Linux PID and start ticks; a change of VM boot ID resets CPU sampling state.
+The shared `Table` owns lightweight rows and supplies text/colors/fonts/tooltips to the host TreeNew control on demand. Its C adapter owns native node storage; C++ retains filtering, exact numeric sorting, lifecycle highlights and persisted column identities. Native fixed columns, headers and PhScrollNew scrollbars provide the same scrolling and interaction behavior as the host grids. Selection is restored by resource identity rather than row index after refresh/sort. Process identity is the distro/connection context plus Linux PID and start ticks; a change of VM boot ID resets CPU sampling state.
 
 Automatic refresh and its interval come from System Informer's main View settings; the WSL view does not maintain a separate pause or interval. F5/View→Refresh requests a fresh discovery and snapshot even when automatic updates are off. Hiding the WSL tab keeps lightweight capture running by default; with background capture disabled, it cancels work and disconnects its collector. The view's Settings button opens System Informer Options at the WSL category.
 
@@ -42,9 +42,11 @@ Process and service inspectors share bottom Options, Refresh, Copy/Save and Clos
 
 Saved scheduling rules match the distribution and full executable path. Existing snapshots supply identities and thread counts; executable paths are additionally requested while rules need them. The controller queues at most one saved action per snapshot, with checks against stale rules and process identities. A new identity, executable, boot, thread count or rule revision permits another attempt; persistent failures do not cause a retry on every tick. Capture policy also applies to these jobs. Process-wide settings operate on the current thread set and report partial results; the numeric-TID Linux APIs cannot make the update atomic against thread exit/reuse.
 
+Plugin preferences are registered during DLL attachment through `PhAddSettings` using lifetime-stable names/defaults. `DavidTrapp.WslTools.Preferences` and `DavidTrapp.WslTools.PathOverrides` are JSON objects stored as host strings; `DavidTrapp.WslTools.SavedProcessScheduling` retains the versioned rules document. The host saves them in its active profile. A C bridge owns referenced host strings, while C++ caches compare current host values before reuse. A mutex serializes read/modify/write operations, and host setting changes invalidate scheduling work. Unknown JSON properties are retained; malformed data is never silently overwritten. The command-line path-prefix option uses the same profile setting and preserves unrelated preferences.
+
 ## Transport and deployment
 
-The main view lists running WSL 2 distributions. WSL 2 is identified from the `Flags` VM-mode bit (`0x8`) in each `HKCU\...\Lxss` registration; the registry `Version` value is a schema version, not the WSL generation. The WSL Options page and setup inventory use the same flag to list all registered WSL 2 distributions, including stopped ones, without starting them just to show the list.
+The main view lists running WSL 2 distributions. WSL 2 is identified from the `Flags` VM-mode bit (`0x8`) in each distribution registration; the `Version` value is a schema version, not the WSL generation. The WSL Options page and setup inventory use the same flag to list all registered WSL 2 distributions, including stopped ones, without starting them just to show the list.
 
 For monitoring, the plugin uses `wsl.exe --distribution <name> --user root --exec ...`, not a login shell. Selecting a running distro checks for `/usr/local/lib/system-informer-wsl/wsl-observer`. If it is missing, the view presents an install notice and an explicit Install and retry action. On every connection, the plugin compares SHA-256 hashes and replaces a stale observer with the bundled version. The bootstrap uses `/bin/sh` and basic utilities; it does not invoke a distro package manager or require a Windows drive mount.
 
