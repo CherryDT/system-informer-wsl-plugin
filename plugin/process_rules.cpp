@@ -8,8 +8,7 @@ namespace wsl
 {
 namespace
 {
-constexpr wchar_t ValueName[] = L"SavedProcessScheduling";
-constexpr DWORD MaximumBytes = 1024 * 1024;
+constexpr size_t MaximumBytes = WSL_SETTING_MAXIMUM_BYTES;
 constexpr size_t MaximumRules = 128;
 // Normally only live matching processes occupy this map. The ceiling also
 // bounds retention if every subsequent snapshot is truncated.
@@ -37,6 +36,7 @@ struct Distro
 };
 std::mutex mutex;
 bool loaded = false;
+std::wstring loadedValue;
 Rules rules;
 uint64_t revision = 1;
 uint64_t nextToken = 1;
@@ -97,28 +97,23 @@ Json schedulerInputs(const std::string &action, const Json &inputs)
 
 void load()
 {
-    if (loaded)
-        return;
-    loaded = true;
+    bool readSucceeded = false;
     try
     {
-        DWORD bytes = 0;
-        auto status =
-            RegGetValueW(HKEY_CURRENT_USER, RegistryKey, ValueName, RRF_RT_REG_SZ, nullptr, nullptr, &bytes);
-        if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND)
+        const auto buffer = readStringSetting(WslSavedProcessSchedulingSetting);
+        readSucceeded = true;
+        if (loaded && buffer == loadedValue)
             return;
-        if (status != ERROR_SUCCESS)
-            throw std::runtime_error("Unable to read saved process scheduling.");
-        if (bytes < sizeof(wchar_t) || bytes > MaximumBytes || bytes % sizeof(wchar_t))
-            throw std::runtime_error("Saved process scheduling has an invalid size.");
-        std::wstring buffer(bytes / sizeof(wchar_t), L'\0');
-        status = RegGetValueW(HKEY_CURRENT_USER, RegistryKey, ValueName, RRF_RT_REG_SZ, nullptr,
-                              buffer.data(), &bytes);
-        if (status != ERROR_SUCCESS)
-            throw std::runtime_error("Unable to read saved process scheduling.");
-        buffer.resize(bytes / sizeof(wchar_t));
-        while (!buffer.empty() && buffer.back() == L'\0')
-            buffer.pop_back();
+        loadedValue = buffer;
+        loaded = true;
+        rules.clear();
+        loadError.clear();
+        // A host Reset or Advanced edit invalidates queued work as well as the
+        // parsed rules. Empty is the registered default, meaning no saved rules.
+        ++revision;
+        distros.clear();
+        if (buffer.empty())
+            return;
         const auto document = Json::parse(utf8(buffer));
         if (!document.is_object() || document.value("version", 0) != 1 || !document.contains("rules") ||
             !document.at("rules").is_array() || document.at("rules").size() > MaximumRules)
@@ -142,9 +137,18 @@ void load()
     }
     catch (const std::exception &)
     {
+        // An unreadable host value must not leave the previous source cached:
+        // restoring that same source later still needs to reload its rules.
+        if (!readSucceeded)
+            loaded = false;
+        if (!rules.empty())
+        {
+            ++revision;
+            distros.clear();
+        }
         rules.clear();
-        loadError =
-            L"Saved process scheduling could not be loaded. Check the SavedProcessScheduling registry value.";
+        loadError = L"Saved process scheduling could not be loaded. Check "
+                    L"DavidTrapp.WslTools.SavedProcessScheduling in System Informer's Advanced settings.";
     }
 }
 
@@ -161,17 +165,9 @@ void persist(Rules replacement)
     const auto value = wide(Json{{"version", 1}, {"rules", entries}}.dump());
     if ((value.size() + 1) * sizeof(wchar_t) > MaximumBytes)
         throw std::runtime_error("Saved process scheduling exceeds the 1 MiB limit.");
-    HKEY key = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, RegistryKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key,
-                        nullptr) != ERROR_SUCCESS)
-        throw std::runtime_error("Unable to open the settings registry key.");
-    const auto status =
-        RegSetValueExW(key, ValueName, 0, REG_SZ, reinterpret_cast<const BYTE *>(value.c_str()),
-                       static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
-    RegCloseKey(key);
-    if (status != ERROR_SUCCESS)
-        throw std::runtime_error("Unable to save process scheduling.");
-    // An unsuccessful registry write must never enable a rule just in memory.
+    writeStringSetting(WslSavedProcessSchedulingSetting, value);
+    loadedValue = value;
+    // Only enable the replacement after the host accepted its serialized value.
     rules = std::move(replacement);
     ++revision;
     distros.clear();
@@ -342,6 +338,7 @@ std::optional<Json> nextSavedScheduling(const std::wstring &distro, const Json &
 bool savedSchedulingCurrent(const std::wstring &distro, const Json &request)
 {
     std::lock_guard<std::mutex> lock(mutex);
+    load();
     try
     {
         if (!request.value("_saved_scheduling", false) ||
@@ -447,4 +444,16 @@ std::wstring savedSchedulingError(const std::wstring &distro)
     const auto found = distros.find(distro);
     return found == distros.end() ? L"" : found->second.error;
 }
+// Called before the host refreshes views after settings changes. load() compares
+// host text, so an unrelated option does not reset successful scheduling attempts.
+void refreshSavedScheduling()
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    load();
+}
 } // namespace wsl
+
+extern "C" void WslSavedSchedulingSettingsChanged(void)
+{
+    wsl::refreshSavedScheduling();
+}

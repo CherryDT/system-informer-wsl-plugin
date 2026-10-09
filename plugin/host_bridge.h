@@ -13,6 +13,27 @@ extern "C"
     DWORD WslHostRefreshInterval(void);
     BOOL WslHostRefreshAutomatically(void);
     DWORD WslHostIntegerSetting(PCWSTR name);
+    typedef enum WSL_STRING_SETTING
+    {
+        WslPreferencesSetting,
+        WslPathOverridesSetting,
+        WslSavedProcessSchedulingSetting,
+        WslStringSettingCount
+    } WSL_STRING_SETTING;
+    /* Includes the terminating WCHAR, matching the saved scheduling limit. */
+#define WSL_SETTING_MAXIMUM_BYTES (1024 * 1024)
+    typedef struct WSL_HOST_STRING
+    {
+        PCWSTR Buffer;
+        SIZE_T Length; /* WCHARs, excluding the terminator. */
+        void *Reference;
+    } WSL_HOST_STRING;
+    /* Each successful get owns a host reference until the matching release.
+     * The returned buffer is immutable and remains valid for that lifetime. */
+    BOOL WslHostGetStringSetting(WSL_STRING_SETTING setting, WSL_HOST_STRING *value);
+    void WslHostReleaseStringSetting(WSL_HOST_STRING *value);
+    BOOL WslHostSetStringSetting(WSL_STRING_SETTING setting, PCWSTR value, SIZE_T length);
+    void WslSavedSchedulingSettingsChanged(void);
     void WslOpenHostOptions(HWND owner);
     void WslHostViewSettingsChanged(void);
     void WslPositionDialog(HWND window, HWND owner);

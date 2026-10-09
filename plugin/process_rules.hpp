@@ -16,7 +16,7 @@ void removeSavedScheduling(const std::wstring &distro, const std::string &exe,
 
 // Called by the controller, using its existing raw process snapshot. The
 // returned request is already reserved and must eventually be finished, even
-// when submission is cancelled or fails. No registry reads occur per sample.
+// when submission is cancelled or fails. Host text is parsed only when changed.
 std::optional<Json> nextSavedScheduling(const std::wstring &distro, const Json &snapshot);
 // Check immediately before sending a queued request: the user may have changed
 // or removed its rule while earlier controller jobs were still running.

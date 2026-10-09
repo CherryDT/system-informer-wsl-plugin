@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory)] [string] $SystemInformerDirectory,
     [Parameter(Mandatory)] [string] $ResultFile,
     [string] $ExpectedSettingsPath,
-    [ValidateSet('PluginLoading', 'ImageLoadProtection')] [string] $Operation = 'PluginLoading',
+    [ValidateSet('PluginLoading', 'ImageLoadProtection', 'PathOverrides')] [string] $Operation = 'PluginLoading',
+    [string] $PathOverridesJson = '{}',
     [switch] $Reset,
     # Private continuation: never rediscover an alternate administrator's profile.
     [switch] $Elevated
@@ -17,7 +18,13 @@ $script:KphEnabled = $true
 
 # System Informer treats these integer settings as booleans (any nonzero
 # value is true). Resetting plugin policy must not change EnablePlugins.
-if ($Operation -eq 'ImageLoadProtection') {
+if ($Operation -eq 'PathOverrides') {
+    $Targets = @()
+    $StringTarget = 'DavidTrapp.WslTools.PathOverrides'
+    $ActionDescription = 'Merge the requested Explorer path prefixes into this System Informer profile.'
+    $CompletedDescription = 'Explorer path prefixes updated.'
+    $UnchangedDescription = 'Explorer path prefixes are already configured.'
+} elseif ($Operation -eq 'ImageLoadProtection') {
     $Wanted = if ($Reset) { 0 } else { 1 }
     $Targets = @([pscustomobject]@{ Name = 'KsiDisableImageLoadProtection'; Default = 0; Wanted = $Wanted })
     $ActionDescription = if ($Reset) { 'Restore image-load protection by setting KsiDisableImageLoadProtection to 0.' }
@@ -113,6 +120,51 @@ function Get-SettingInteger($Value, [bool] $IsString) {
     return [uint32]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Read-PathOverrides([string] $Text) {
+    Add-Type -AssemblyName System.Web.Extensions
+    $Json = New-Object Web.Script.Serialization.JavaScriptSerializer
+    $Json.MaxJsonLength = [int]::MaxValue
+    $Map = $Json.DeserializeObject($Text)
+    if ($Map -isnot [Collections.Generic.Dictionary[string,object]]) { throw 'Path overrides must be a JSON object.' }
+    foreach ($Distro in $Map.Keys) {
+        $Prefix = $Map[$Distro]
+        if (-not $Distro -or $Prefix -isnot [string]) { throw 'Path overrides require nonempty distribution names and string values.' }
+        if (-not $Prefix) { continue }
+        # Match the plugin's Explorer-prefix validation, including UNC shares.
+        $Unc = $Prefix.StartsWith('\\')
+        if ($Unc) { $Tail = $Prefix.Substring(2) }
+        elseif ($Prefix -cmatch '^[a-zA-Z]:\\') { $Tail = $Prefix.Substring(3) }
+        else { throw "Invalid path prefix for $Distro. Use an absolute drive path or a UNC path containing a server and share." }
+        if ($Tail -eq '\') { throw "Invalid empty path component in the prefix for $Distro." }
+        if ($Tail.EndsWith('\')) { $Tail = $Tail.Substring(0, $Tail.Length - 1) }
+        $Components = @(if ($Tail) { $Tail.Split([char]'\') })
+        if ($Unc -and $Components.Count -lt 2) { throw "The UNC prefix for $Distro requires a server and share." }
+        foreach ($Component in $Components) {
+            if (-not $Component -or $Component -in @('.', '..') -or $Component -match '[. ]$|[/":*?<>|\x00-\x1f]') {
+                throw "Invalid path component in the prefix for $Distro."
+            }
+        }
+    }
+    return ,$Map
+}
+
+function Merge-PathOverrides([string] $Current) {
+    $Map = Read-PathOverrides $Current
+    $Changed = $false
+    foreach ($Distro in $script:RequestedOverrides.Keys) {
+        $Prefix = $script:RequestedOverrides[$Distro]
+        if (-not $Prefix) {
+            if ($Map.Remove($Distro)) { $Changed = $true }
+        } elseif (-not $Map.ContainsKey($Distro) -or $Map[$Distro] -cne $Prefix) {
+            $Map[$Distro] = $Prefix
+            $Changed = $true
+        }
+    }
+    $Json = New-Object Web.Script.Serialization.JavaScriptSerializer
+    $Json.MaxJsonLength = [int]::MaxValue
+    return [pscustomobject]@{ NeedsChange = $Changed; Value = $Json.Serialize($Map) }
+}
+
 function Edit-Json([string] $Text) {
     Add-Type -AssemblyName System.Web.Extensions
     $Json = New-Object Web.Script.Serialization.JavaScriptSerializer
@@ -179,6 +231,22 @@ function Edit-Json([string] $Text) {
             }
         }
     }
+    if ($Operation -eq 'PathOverrides') {
+        $Entry = @($Pairs | Where-Object { $_.Name -ceq $StringTarget })
+        $Current = '{}'
+        if ($Entry.Count) {
+            $Token = $Entry[0].Token
+            if (-not $Token.Value.StartsWith('"')) { throw 'The path-overrides setting must be a string.' }
+            $Current = [string]$Json.DeserializeObject($Token.Value)
+        } elseif ($Names.Contains($StringTarget)) { throw "Unexpected capitalization of setting: $StringTarget" }
+        $Merged = Merge-PathOverrides $Current
+        $NeedsChange = $Merged.NeedsChange
+        if ($NeedsChange) {
+            $Value = $Json.Serialize($Merged.Value)
+            if ($Entry.Count) { $Edits.Add([pscustomobject]@{ Index = $Token.Index; Length = $Token.Length; Value = $Value }) }
+            else { $Missing.Add('"' + $StringTarget + '": ' + $Value) }
+        }
+    }
     if ($Missing.Count) {
         $Insert = if ($Pairs.Count) { ', ' } else { '' }
         $Edits.Add([pscustomobject]@{ Index = $Position; Length = 0; Value = $Insert + ($Missing -join ', ') })
@@ -238,6 +306,24 @@ function Edit-Xml([string] $Text) {
                 [void] $Document.DocumentElement.AppendChild($Node)
             }
             $Node.set_InnerText([string]$Wanted)
+        }
+    }
+    if ($Operation -eq 'PathOverrides') {
+        $Current = '{}'
+        if ($Entries.ContainsKey($StringTarget)) {
+            $Node = $Entries[$StringTarget]
+            if ($Node.GetAttribute('name') -cne $StringTarget) { throw "Unexpected capitalization of setting: $StringTarget" }
+            $Current = $Node.get_InnerText()
+        }
+        $Merged = Merge-PathOverrides $Current
+        $NeedsChange = $Merged.NeedsChange
+        if ($NeedsChange) {
+            if (-not $Entries.ContainsKey($StringTarget)) {
+                $Node = $Document.CreateElement('setting')
+                $Node.SetAttribute('name', $StringTarget)
+                [void] $Document.DocumentElement.AppendChild($Node)
+            }
+            $Node.set_InnerText($Merged.Value)
         }
     }
     return [pscustomobject]@{ NeedsChange = $NeedsChange; Text = $Document.OuterXml }
@@ -346,6 +432,10 @@ function Quote-Argument([string] $Value) {
 }
 
 try {
+    if ($Operation -eq 'PathOverrides') {
+        if ($Reset) { throw 'PathOverrides does not support Reset; use an empty prefix to remove an override.' }
+        $script:RequestedOverrides = Read-PathOverrides $PathOverridesJson
+    }
     $SystemInformerDirectory = [IO.Path]::GetFullPath($SystemInformerDirectory)
     $ResultFile = [IO.Path]::GetFullPath($ResultFile)
     if (-not [IO.File]::Exists((Join-Path $SystemInformerDirectory 'SystemInformer.exe'))) { throw 'The selected folder does not contain SystemInformer.exe.' }
@@ -382,6 +472,7 @@ try {
             '-Mode', 'Enable', '-Operation', $Operation, '-SystemInformerDirectory', $SystemInformerDirectory,
             '-ResultFile', $ResultFile, '-ExpectedSettingsPath', $Store.Path, '-Elevated')
         if ($Reset) { $Arguments += '-Reset' }
+        if ($Operation -eq 'PathOverrides') { $Arguments += @('-PathOverridesJson', $PathOverridesJson) }
         $Start = New-Object Diagnostics.ProcessStartInfo
         $Start.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $Start.Arguments = ($Arguments | ForEach-Object { Quote-Argument $_ }) -join ' '

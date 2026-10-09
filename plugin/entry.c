@@ -29,6 +29,49 @@ static PTOOLSTATUS_INTERFACE ToolStatus;
 static PH_CALLBACK_REGISTRATION SearchChangedRegistration;
 static BOOLEAN SearchCallbackRegistered;
 static PH_STRINGREF SearchBanner = PH_STRINGREF_INIT(L"Search WSL");
+/* PhAddSettings retains references to the names/defaults. Keep both the
+ * descriptors and their literal strings alive for the plugin lifetime. */
+static PH_SETTING_CREATE PluginSettings[WslStringSettingCount] = {
+    {StringSettingType, L"DavidTrapp.WslTools.Preferences", L"{}"},
+    {StringSettingType, L"DavidTrapp.WslTools.PathOverrides", L"{}"},
+    {StringSettingType, L"DavidTrapp.WslTools.SavedProcessScheduling", L""}};
+
+BOOL WslHostGetStringSetting(WSL_STRING_SETTING setting, WSL_HOST_STRING *value)
+{
+    PPH_STRING string;
+    memset(value, 0, sizeof(*value));
+    if ((unsigned int)setting >= WslStringSettingCount)
+        return FALSE;
+    string = PhGetStringSetting(PluginSettings[setting].Name);
+    if (string->Length > WSL_SETTING_MAXIMUM_BYTES - sizeof(WCHAR) || string->Length % sizeof(WCHAR))
+    {
+        PhDereferenceObject(string);
+        return FALSE;
+    }
+    value->Buffer = string->Buffer;
+    value->Length = string->Length / sizeof(WCHAR);
+    value->Reference = string;
+    return TRUE;
+}
+
+void WslHostReleaseStringSetting(WSL_HOST_STRING *value)
+{
+    if (value->Reference)
+        PhDereferenceObject(value->Reference);
+    memset(value, 0, sizeof(*value));
+}
+
+BOOL WslHostSetStringSetting(WSL_STRING_SETTING setting, PCWSTR value, SIZE_T length)
+{
+    PH_STRINGREF string;
+    if ((unsigned int)setting >= WslStringSettingCount ||
+        length > WSL_SETTING_MAXIMUM_BYTES / sizeof(WCHAR) - 1)
+        return FALSE;
+    string.Buffer = (PWSTR)value;
+    string.Length = length * sizeof(WCHAR);
+    PhSetStringSetting2(PluginSettings[setting].Name, &string);
+    return TRUE;
+}
 
 void WslOpenHostOptions(HWND owner)
 {
@@ -84,6 +127,7 @@ static VOID NTAPI HostSettingsUpdated(PVOID parameter, PVOID context)
 {
     UNREFERENCED_PARAMETER(parameter);
     UNREFERENCED_PARAMETER(context);
+    WslSavedSchedulingSettingsChanged();
     WslHostViewSettingsChanged();
     if (ViewWindow)
         RedrawWindow(ViewWindow, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
@@ -374,6 +418,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     plugin = PhRegisterPlugin(L"DavidTrapp.WslTools", instance, &information);
     if (!plugin)
         return FALSE;
+    /* Register during DLL loading, before the host converts ignored settings. */
+    PhAddSettings(PluginSettings, RTL_NUMBER_OF(PluginSettings));
     information->DisplayName = L"WSL Tools";
     information->Author = L"David Trapp / Trapp Innovations";
     information->Description = L"Processes, connections, open files, modules and systemd services for WSL 2.";

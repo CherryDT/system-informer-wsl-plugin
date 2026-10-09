@@ -4,11 +4,97 @@
 #include "transport.hpp"
 #include <algorithm>
 #include <stdexcept>
+#include <limits>
+#include <string_view>
 
 namespace wsl
 {
 namespace
 {
+// Serialize plugin read/modify/write operations, including callers on worker
+// threads. Compare the live host string before using cached JSON so Advanced
+// settings edits and Reset never get overwritten by an old cached document.
+std::mutex settingsMutex;
+
+class HostString
+{
+  public:
+    explicit HostString(WSL_STRING_SETTING setting)
+    {
+        if (!WslHostGetStringSetting(setting, &value))
+            throw std::runtime_error("The WSL setting exceeds the 1 MiB limit.");
+    }
+    ~HostString()
+    {
+        WslHostReleaseStringSetting(&value);
+    }
+    HostString(const HostString &) = delete;
+    HostString &operator=(const HostString &) = delete;
+    std::wstring_view text() const
+    {
+        return {value.Buffer, value.Length};
+    }
+
+  private:
+    WSL_HOST_STRING value{};
+};
+
+struct ObjectSetting
+{
+    std::wstring source;
+    Json document;
+    bool loaded = false;
+    bool valid = false;
+};
+ObjectSetting preferences;
+ObjectSetting pathOverrides;
+
+ObjectSetting &objectSetting(WSL_STRING_SETTING setting)
+{
+    auto &cache = setting == WslPreferencesSetting ? preferences : pathOverrides;
+    HostString current(setting);
+    if (!cache.loaded || current.text() != std::wstring_view(cache.source))
+    {
+        cache.source = current.text();
+        cache.loaded = true;
+        cache.valid = false;
+        cache.document = nullptr;
+        try
+        {
+            cache.document = Json::parse(utf8(cache.source));
+            cache.valid = cache.document.is_object();
+        }
+        catch (const std::exception &)
+        {
+            // Reads may use their fallback, but mutations must preserve bad
+            // input until the user corrects it in the host's Advanced settings.
+        }
+    }
+    return cache;
+}
+
+void requireObject(const ObjectSetting &cache, const char *name)
+{
+    if (!cache.valid)
+        throw std::runtime_error(std::string("Cannot save WSL ") + name +
+                                 ": the stored setting is not a valid JSON object. "
+                                 "Correct it in System Informer's Advanced settings first.");
+}
+
+void setString(WSL_STRING_SETTING setting, const std::wstring &value)
+{
+    if (!WslHostSetStringSetting(setting, value.data(), value.size()))
+        throw std::runtime_error("The WSL setting exceeds the 1 MiB limit.");
+}
+
+void storeObject(WSL_STRING_SETTING setting, ObjectSetting &cache, Json replacement)
+{
+    auto value = wide(replacement.dump());
+    setString(setting, value);
+    cache.source = std::move(value);
+    cache.document = std::move(replacement);
+}
+
 bool validPrefix(const std::wstring &value)
 {
     if (value.empty())
@@ -49,56 +135,71 @@ bool validPrefix(const std::wstring &value)
 } // namespace
 DWORD readSetting(const wchar_t *name, DWORD fallback)
 {
-    DWORD value = fallback, size = sizeof(value);
-    RegGetValueW(HKEY_CURRENT_USER, RegistryKey, name, RRF_RT_REG_DWORD, nullptr, &value, &size);
-    return value;
+    std::lock_guard<std::mutex> lock(settingsMutex);
+    try
+    {
+        const auto &cache = objectSetting(WslPreferencesSetting);
+        if (!cache.valid)
+            return fallback;
+        const auto found = cache.document.find(utf8(name));
+        if (found == cache.document.end() || !found->is_number_integer() ||
+            (!found->is_number_unsigned() && found->get<int64_t>() < 0))
+            return fallback;
+        const auto value = found->get<uint64_t>();
+        return value <= std::numeric_limits<DWORD>::max() ? static_cast<DWORD>(value) : fallback;
+    }
+    catch (const std::exception &)
+    {
+        return fallback;
+    }
 }
 void writeSetting(const wchar_t *name, DWORD value)
 {
-    HKEY key;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, RegistryKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key,
-                        nullptr) != ERROR_SUCCESS)
-        throw std::runtime_error("Unable to open the settings registry key.");
-    LSTATUS result =
-        RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE *>(&value), sizeof(value));
-    RegCloseKey(key);
-    if (result != ERROR_SUCCESS)
-        throw std::runtime_error("Unable to save the WSL setting.");
+    std::lock_guard<std::mutex> lock(settingsMutex);
+    auto &cache = objectSetting(WslPreferencesSetting);
+    requireObject(cache, "preferences");
+    auto replacement = cache.document;
+    replacement[utf8(name)] = value;
+    storeObject(WslPreferencesSetting, cache, std::move(replacement));
+}
+std::wstring readStringSetting(WSL_STRING_SETTING setting)
+{
+    std::lock_guard<std::mutex> lock(settingsMutex);
+    return std::wstring(HostString(setting).text());
+}
+void writeStringSetting(WSL_STRING_SETTING setting, const std::wstring &value)
+{
+    std::lock_guard<std::mutex> lock(settingsMutex);
+    setString(setting, value);
 }
 std::wstring distroPrefix(const std::wstring &distro)
 {
-    auto key = std::wstring(RegistryKey) + L"\\PathOverrides";
-    DWORD size = 0;
-    if (RegGetValueW(HKEY_CURRENT_USER, key.c_str(), distro.c_str(), RRF_RT_REG_SZ, nullptr, nullptr,
-                     &size) != ERROR_SUCCESS)
+    std::lock_guard<std::mutex> lock(settingsMutex);
+    const auto &cache = objectSetting(WslPathOverridesSetting);
+    requireObject(cache, "path overrides");
+    const auto found = cache.document.find(utf8(distro));
+    if (found == cache.document.end())
         return L"";
-    std::wstring value(size / sizeof(wchar_t), L'\0');
-    if (RegGetValueW(HKEY_CURRENT_USER, key.c_str(), distro.c_str(), RRF_RT_REG_SZ, nullptr, value.data(),
-                     &size) != ERROR_SUCCESS)
-        return L"";
-    while (!value.empty() && value.back() == L'\0')
-        value.pop_back();
+    if (!found->is_string())
+        throw std::runtime_error("The path override is not text. Correct it in WSL Tools settings.");
+    auto value = wide(found->get<std::string>());
+    if (!validPrefix(value))
+        throw std::runtime_error("The path override is invalid. Correct it in WSL Tools settings.");
     return value;
 }
 void setDistroPrefix(const std::wstring &distro, const std::wstring &prefix)
 {
     if (!validPrefix(prefix))
         throw std::runtime_error("Use an absolute drive path or a UNC path containing a server and share.");
-    HKEY key;
-    auto path = std::wstring(RegistryKey) + L"\\PathOverrides";
-    LSTATUS result = RegCreateKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr,
-                                     &key, nullptr);
-    if (result != ERROR_SUCCESS)
-        throw std::runtime_error("Unable to open the path override registry key.");
+    std::lock_guard<std::mutex> lock(settingsMutex);
+    auto &cache = objectSetting(WslPathOverridesSetting);
+    requireObject(cache, "path overrides");
+    auto replacement = cache.document;
     if (prefix.empty())
-        result = RegDeleteValueW(key, distro.c_str());
+        replacement.erase(utf8(distro));
     else
-        result =
-            RegSetValueExW(key, distro.c_str(), 0, REG_SZ, reinterpret_cast<const BYTE *>(prefix.c_str()),
-                           static_cast<DWORD>((prefix.size() + 1) * sizeof(wchar_t)));
-    RegCloseKey(key);
-    if (result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND)
-        throw std::runtime_error("Unable to save the path override.");
+        replacement[utf8(distro)] = utf8(prefix);
+    storeObject(WslPathOverridesSetting, cache, std::move(replacement));
 }
 std::wstring windowsPath(const std::wstring &distro, const std::wstring &linuxPath)
 {
@@ -128,8 +229,7 @@ std::wstring windowsPath(const std::wstring &distro, const std::wstring &linuxPa
     {
         prefix = distroPrefix(distro);
         if (!validPrefix(prefix))
-            throw std::runtime_error(
-                "The registry path override is invalid. Correct it in WSL Tools settings.");
+            throw std::runtime_error("The path override is invalid. Correct it in WSL Tools settings.");
         if (prefix.empty())
             prefix = L"\\\\wsl.localhost\\" + distro + L"\\";
         if (prefix.back() != L'\\')
@@ -184,7 +284,16 @@ void loadPrefix(HWND window, OptionsState &state)
 {
     state.loading = true;
     const bool available = state.selected >= 0 && static_cast<size_t>(state.selected) < state.distros.size();
-    auto prefix = available ? distroPrefix(state.distros[state.selected]) : std::wstring{};
+    std::wstring prefix;
+    try
+    {
+        if (available)
+            prefix = distroPrefix(state.distros[state.selected]);
+    }
+    catch (const std::exception &error)
+    {
+        optionsStatus(window, wide(error.what()));
+    }
     SetDlgItemTextW(window, IDC_WSL_PREFIX, prefix.c_str());
     EnableWindow(GetDlgItem(window, IDC_WSL_PREFIX), available);
     EnableWindow(GetDlgItem(window, IDC_WSL_APPLY_PREFIX), FALSE);
