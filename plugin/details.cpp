@@ -2068,7 +2068,13 @@ bool chooseNodeBackend(Inspector &state, const Json &data)
     const bool unavailable = data.value("inspector_unavailable", false);
     config.pszMainInstruction =
         unavailable ? L"Inspector requires Python 3" : L"Node Inspector is not enabled for this process";
-    config.pszContent = unavailable ? L"Install Python 3 in this distribution, or use llnode." : nullptr;
+    // The observer supplies the dependency and installation instructions.
+    // Keep this copy alive through the modal dialog and retain it on Cancel.
+    std::wstring dependencyMessage = unavailable ? cell(data, "message") : L"";
+    if (unavailable && dependencyMessage.empty())
+        dependencyMessage = L"Install Python 3 in this distribution. On Ubuntu/Debian, run "
+                            L"apt install python3. No extra Python packages are required.";
+    config.pszContent = unavailable ? dependencyMessage.c_str() : nullptr;
     config.pszVerificationText = unavailable ? nullptr : L"Don't show again";
     config.cButtons = unavailable ? 1 : static_cast<UINT>(std::size(buttons));
     config.pButtons = unavailable ? buttons + 1 : buttons;
@@ -2085,8 +2091,9 @@ bool chooseNodeBackend(Inspector &state, const Json &data)
         return true;
     if (FAILED(result) || (selected != EnableInspector && selected != UseLlnode))
     {
-        state.runtimeStacksNotice =
-            FAILED(result) ? L"Could not open the capture method chooser." : L"Capture canceled.";
+        state.runtimeStacksNotice = FAILED(result) ? L"Could not open the capture method chooser."
+                                    : unavailable  ? dependencyMessage
+                                                   : L"Capture canceled.";
         if (state.runtimeStacksLoaded)
         {
             state.runtimeStacksNotice += L" The previous capture is still displayed.";
