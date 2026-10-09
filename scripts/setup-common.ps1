@@ -39,15 +39,33 @@ function Get-Wsl2Distributions {
 }
 
 function Write-SetupProgress([string] $Text, $ProgressQueue) {
-    if ($null -ne $ProgressQueue) { $ProgressQueue.Enqueue($Text) }
+    if ($ProgressQueue -is [string]) {
+        # Inno Setup reads the worker log as UTF-16, including its BOM.
+        # The wizard may briefly hold the file while refreshing its memo.
+        for ($Attempt = 0; ; ++$Attempt) {
+            try {
+                [IO.File]::AppendAllText($ProgressQueue, $Text + [Environment]::NewLine, [Text.Encoding]::Unicode)
+                break
+            } catch [IO.IOException] {
+                if ($Attempt -ge 4) { throw }
+                Start-Sleep -Milliseconds 20
+            }
+        }
+    }
+    elseif ($null -ne $ProgressQueue) { $ProgressQueue.Enqueue($Text) }
     else { Write-Host $Text }
 }
 
 function Test-SetupCancelled($Cancellation) {
-    if ($null -ne $Cancellation -and $Cancellation.IsSet) { throw 'Cancelled. Completed changes have been kept.' }
+    $Cancelled = if ($Cancellation -is [string]) { [IO.File]::Exists($Cancellation) }
+                 else { $null -ne $Cancellation -and $Cancellation.IsSet }
+    if ($Cancelled) { throw 'Cancelled. Completed changes have been kept.' }
 }
 
 function ConvertTo-NativeArgument([string] $Value) {
+    # Like the plugin transport, leave simple arguments unquoted: WSL parses
+    # switches from the raw command line and treats quoted switches as commands.
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
     # Windows PowerShell 5.1 lacks ProcessStartInfo.ArgumentList. Apply the
     # CommandLineToArgvW quoting rules, including backslashes before quotes.
     return '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
@@ -131,8 +149,61 @@ namespace WslSetup {
     }
 }
 
+function Invoke-WslManagement([string[]] $Arguments, $Cancellation) {
+    $Start = New-Object Diagnostics.ProcessStartInfo
+    $Start.FileName = Join-Path $env:SystemRoot 'System32\wsl.exe'
+    $Start.Arguments = ($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
+    $Start.UseShellExecute = $false
+    $Start.CreateNoWindow = $true
+    $Start.RedirectStandardOutput = $true
+    $Start.RedirectStandardError = $true
+    # Pin WSL's redirected management output to its default UTF-16 format,
+    # even when the caller opts into UTF-8 for their own terminals.
+    $Start.EnvironmentVariables.Remove('WSL_UTF8')
+    $Start.StandardOutputEncoding = [Text.Encoding]::Unicode
+    $Start.StandardErrorEncoding = [Text.Encoding]::Unicode
+    $Process = New-Object Diagnostics.Process
+    $Process.StartInfo = $Start
+    $Started = $false
+    try {
+        Test-SetupCancelled $Cancellation
+        [void] $Process.Start()
+        $Started = $true
+        $Output = $Process.StandardOutput.ReadToEndAsync()
+        $Errors = $Process.StandardError.ReadToEndAsync()
+        $Watch = [Diagnostics.Stopwatch]::StartNew()
+        # Include redirected-stream completion in the timeout as well.
+        while (-not ($Process.HasExited -and $Output.IsCompleted -and $Errors.IsCompleted)) {
+            Test-SetupCancelled $Cancellation
+            if ($Watch.Elapsed.TotalSeconds -gt 15) { throw 'WSL management command did not respond within 15 seconds.' }
+            Start-Sleep -Milliseconds 50
+        }
+        $Text = $Output.GetAwaiter().GetResult()
+        $Diagnostic = $Errors.GetAwaiter().GetResult().Trim()
+        if ($Process.ExitCode -ne 0) {
+            if (-not $Diagnostic) { $Diagnostic = $Text.Trim() }
+            throw "WSL management command exited with code $($Process.ExitCode): $Diagnostic"
+        }
+        return $Text
+    } finally {
+        try {
+            if ($Started -and -not $Process.HasExited) {
+                $Process.Kill()
+                [void] $Process.WaitForExit(1000)
+            }
+        } finally { $Process.Dispose() }
+    }
+}
+
 function Invoke-WslComponent([string] $Mode, [string] $Distro, [string] $Observer, $Cancellation) {
     Test-SetupCancelled $Cancellation
+    try {
+        $RunningText = Invoke-WslManagement @('--list', '--running', '--quiet') $Cancellation
+        $RunningDistros = @($RunningText -split '\r?\n' | ForEach-Object { $_.Trim().Trim([char]0xFEFF) } | Where-Object { $_ })
+        $RestoreStopped = $RunningDistros -notcontains $Distro
+    } catch {
+        throw "Could not determine whether $Distro is running; its companion was not changed. $($_.Exception.Message)"
+    }
     $Script = @'
 set -eu
 umask 077
@@ -206,7 +277,10 @@ trap - EXIT HUP INT TERM
     $Process = New-Object Diagnostics.Process
     $Process.StartInfo = $Start
     $Started = $false
+    $OperationError = $null
+    $CleanupErrors = New-Object 'Collections.Generic.List[string]'
     try {
+        Test-SetupCancelled $Cancellation
         [void] $Process.Start()
         $Started = $true
         $Output = $Process.StandardOutput.ReadToEndAsync()
@@ -231,15 +305,37 @@ trap - EXIT HUP INT TERM
             throw "WSL exited with code $($Process.ExitCode): $Diagnostic"
         }
         if ($Copy) { $Copy.GetAwaiter().GetResult() }
+    } catch {
+        $OperationError = $_.Exception.Message
     } finally {
-        if ($Started -and -not $Process.HasExited) {
-            # Closing stdin lets the bootstrap detect a short upload and run
-            # its cleanup trap. Never terminate the distro or its WSL VM.
-            try { $Process.StandardInput.Close() } catch {}
-            if (-not $Process.WaitForExit(1000)) { $Process.Kill(); [void] $Process.WaitForExit(1000) }
+        try {
+            if ($Started -and -not $Process.HasExited) {
+                # Let an incomplete upload run its cleanup trap before ending
+                # this launcher. A distro that was already running stays up.
+                try { $Process.StandardInput.Close() } catch {}
+                if (-not $Process.WaitForExit(1000)) { $Process.Kill(); [void] $Process.WaitForExit(1000) }
+            }
+        } catch {
+            $CleanupErrors.Add("Could not close the WSL command: $($_.Exception.Message)")
+        } finally {
+            try {
+                if ($InputFile) { $InputFile.Dispose() }
+                $Process.Dispose()
+            } finally {
+                if ($Started -and $RestoreStopped) {
+                    try {
+                        # Ignore cancellation during restoration: this distro was
+                        # started only temporarily for the companion operation.
+                        [void] (Invoke-WslManagement @('--terminate', $Distro) $null)
+                    } catch {
+                        $CleanupErrors.Add("Could not restore $Distro to its stopped state: $($_.Exception.Message)")
+                    }
+                }
+            }
         }
-        if ($InputFile) { $InputFile.Dispose() }
-        $Process.Dispose()
+    }
+    if ($OperationError -or $CleanupErrors.Count) {
+        throw ((@($OperationError) + @($CleanupErrors) | Where-Object { $_ }) -join [Environment]::NewLine)
     }
 }
 
@@ -258,15 +354,15 @@ function Invoke-Setup([string] $Mode, [string] $Directory, [string] $Distributio
         if (-not $Distros.Count) { Write-SetupProgress 'No WSL 2 distributions are registered for this Windows user.' $ProgressQueue }
         foreach ($Distro in $Distros) {
             Test-SetupCancelled $Cancellation
-            Write-SetupProgress "$Distro`: $($Mode.ToLowerInvariant()) Linux companion (starts the distro if stopped)..." $ProgressQueue
+            Write-SetupProgress "$Distro`: $($Mode.ToLowerInvariant()) Linux companion (temporarily starts the distro if stopped)..." $ProgressQueue
             try {
                 $Observer = if ($Mode -eq 'Install') { Join-Path $DistributionDirectory 'wsl-observer' } else { '' }
                 Invoke-WslComponent $Mode $Distro $Observer $Cancellation
                 Write-SetupProgress "$Distro`: completed." $ProgressQueue
             } catch {
+                Write-SetupProgress "$Distro`: $($_.Exception.Message)" $ProgressQueue
                 Test-SetupCancelled $Cancellation
                 ++$Failures
-                Write-SetupProgress "$Distro`: $($_.Exception.Message)" $ProgressQueue
             }
         }
     }

@@ -1,4 +1,4 @@
-# Command-line alternative to uninstall.cmd. All user settings are retained.
+# ZIP/source command-line removal. For an EXE installation, use Windows Installed apps.
 [CmdletBinding()]
 param(
     [string] $SystemInformerDirectory,

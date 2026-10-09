@@ -1,4 +1,4 @@
-# Command-line alternative to setup.cmd. No settings are changed by default.
+# ZIP/source command-line installation. Companions are opt-in; settings are preserved by default.
 [CmdletBinding()]
 param(
     [string] $SystemInformerDirectory,
