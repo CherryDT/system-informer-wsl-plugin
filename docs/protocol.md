@@ -450,10 +450,13 @@ tab after an `exec()` changes the runtime.
 
 For Node.js, the optional `backend` field accepts `auto` (default), `inspector`,
 or `llnode`. `enable_inspector:true` is honored only with `backend:"inspector"`;
-it records the user's explicit choice to activate an Inspector that is not
-already listening. With `auto`, a listener owned by the selected process is
-preferred. The helper verifies the socket inode belongs to that process and
-checks the Inspector endpoint's reported PID before capture. It captures the
+it authorizes temporary activation for this capture if Inspector is not already
+listening. The Windows client sets it from the default/saved
+`UseNodeInspectorWithoutAsking` preference or an explicit choice in the activation
+dialog. With `auto`, the helper uses an existing listener and requests a choice
+when activation is needed; it does not implicitly enable Inspector. The helper
+verifies the socket inode belongs to that process and checks the Inspector
+endpoint's reported PID before capture. It captures the
 main JavaScript thread and up to 32 reported worker contexts, with up to 256
 JavaScript frames per context. Contexts are sampled sequentially, not as one
 simultaneous snapshot. Each context gets up to one second to reach a JavaScript
@@ -472,7 +475,8 @@ preference. If Python 3 is missing, the helper also returns
 offers **Use llnode** or **Cancel**, without the Inspector activation choice or
 remember-preference checkbox. This llnode-only choice remains available even if
 `UseNodeInspectorWithoutAsking` is set, because Inspector activation cannot run
-without the embedded Python client.
+without the embedded Python client. The dialog displays the helper’s installation
+instructions and retains them in the stack page after Cancel.
 An explicit `backend:"llnode"` request skips Inspector discovery and capture.
 Enabling Inspector uses SIGUSR1 through a pidfd after
 rechecking the selected Node executable and process identity. Before doing so,
@@ -531,8 +535,8 @@ the root-owned, non-group/world-writable plugin at `/usr/local/lib/llnode/llnode
 `/usr/lib/lldb/plugins/llnode.so`, `/usr/local/lib/node_modules/llnode/llnode.so`,
 or `/usr/lib/node_modules/llnode/llnode.so`. Never run npm as root. See the
 [llnode installation instructions](https://github.com/nodejs/llnode#install-instructions).
-LLDB 18 with llnode 4 does not reliably decode JavaScript names for Node.js 22;
-fallback output may contain partial V8 data or native addresses.
+Compatibility depends on the LLDB and Node/V8 versions; llnode may not work with
+every Node version. Fallback output can contain partial V8 data or native addresses.
 
 Python executables `python`, `python2`, `python3`, and versioned/debug/free-threaded
 CPython names select Python. The helper uses a trusted, root-owned `py-spy` in
@@ -548,9 +552,9 @@ matching JDK is needed if a custom JRE does not include `jcmd`. See Oracle's
 
 The stack pages are passive; their capture buttons and Ctrl+R start collection
 without a separate confirmation dialog. Node's method-choice dialog appears only
-when automatic Inspector use is disabled and there is no verified listener.
-Automatic Inspector use is enabled by default unless a saved preference overrides
-it. The page text
+when automatic Inspector use is disabled and there is no verified listener, or
+when Python 3 is unavailable and only llnode can be offered. Automatic Inspector
+use is enabled by default unless a saved preference overrides it. The page text
 explains the button, possible pause, and tool requirements. Java capture can
 pause threads at a JVM safepoint. Native GDB, py-spy, and llnode can briefly
 pause the target. Tools and runtime versions must be installed and compatible;
@@ -572,7 +576,7 @@ partial text.
 {"id":4,"op":"script_stacks","pid":123,"start_ticks":4567}
 {"id":4,"ok":true,"data":{"runtime":"node","tool":"Node Inspector","supported":true,"success":false,"choice_required":true,"message":"No Inspector listener owned by this Node process was found. Choose whether to enable Inspector for this capture or use llnode instead.","text":""}}
 {"id":5,"op":"script_stacks","pid":123,"start_ticks":4567}
-{"id":5,"ok":true,"data":{"runtime":"node","supported":false,"success":false,"choice_required":true,"inspector_unavailable":true,"message":"Node Inspector capture requires Python 3 in this distribution.","text":""}}
+{"id":5,"ok":true,"data":{"runtime":"node","supported":false,"success":false,"choice_required":true,"inspector_unavailable":true,"message":"Node Inspector capture requires Python 3 in this distribution. On Ubuntu/Debian install it with apt install python3. No extra Python packages are required.","text":""}}
 {"id":6,"op":"script_stacks","pid":123,"start_ticks":4567,"backend":"inspector","enable_inspector":true}
 {"id":6,"ok":true,"data":{"runtime":"node","tool":"Node Inspector","supported":true,"success":true,"choice_required":false,"message":"Captured the main JavaScript thread through Node Inspector. The Inspector listener enabled for this capture was closed.","text":"Node Inspector: main JavaScript thread\n\n#0 main at app.js:10:1"}}
 ```
@@ -651,12 +655,16 @@ boot activation and does not imply an immediate start/stop.
 Bare templates reject all of these actions, including enable/disable. Choose a
 named instance to change its runtime state or startup behavior.
 
-System tools run from trusted `/usr/bin` or `/bin` paths with explicit argv and
-a minimal environment. Caller PATH, bus-address, loader, and pager overrides are
-not inherited. They use no shell, no interactive password prompt,
-no pager, and C locale. Output is limited to 2 MiB per command. Read-only commands
-have a 5-second deadline each; service actions have a 10-second deadline. A
-service detail query makes four sequential commands and can therefore take up to
+The shared command runner searches trusted `/usr/local/bin`, `/usr/bin` and
+`/bin` locations, resolves symlinks and validates ownership and write permissions.
+The Java backend instead supplies a validated `jcmd` path from the target JVM’s
+matching JDK and runs it as that target’s effective user and group. Commands use
+explicit argv and a minimal environment; caller PATH, bus-address, loader and
+pager overrides are not inherited. They use no shell, no interactive password
+prompt, no pager, and C locale. The default output limit is 2 MiB per command;
+callers can specify the smaller limits described above. Read-only systemd
+commands have a 5-second deadline each; service actions have a 10-second deadline.
+A service detail query makes four sequential commands and can therefore take up to
 20 seconds. On timeout the helper kills the command process group and reaps the child. A
 child stuck in an uninterruptible kernel wait is reaped on a later command, so it
 cannot indefinitely block the transport. A service
