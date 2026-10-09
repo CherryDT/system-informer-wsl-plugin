@@ -129,14 +129,18 @@ begin
     WorkForm.OnCloseQuery := @WorkerCloseQuery;
     WorkMemo := TNewMemo.Create(WorkForm);
     WorkMemo.Parent := WorkForm;
-    WorkMemo.SetBounds(ScaleX(12), ScaleY(12), ScaleX(536), ScaleY(260));
+    WorkMemo.SetBounds(ScaleX(12), ScaleY(12),
+      WorkForm.ClientWidth - ScaleX(24), WorkForm.ClientHeight - ScaleY(60));
+    WorkMemo.Anchors := [akLeft, akTop, akRight, akBottom];
     WorkMemo.ReadOnly := True;
     WorkMemo.ScrollBars := ssVertical;
     WorkMemo.WordWrap := True;
     WorkMemo.Text := 'Preparing ' + Lowercase(Phase) + '...';
     WorkCancel := TNewButton.Create(WorkForm);
     WorkCancel.Parent := WorkForm;
-    WorkCancel.SetBounds(ScaleX(458), ScaleY(282), ScaleX(90), ScaleY(26));
+    WorkCancel.SetBounds(WorkForm.ClientWidth - ScaleX(102),
+      WorkForm.ClientHeight - ScaleY(38), ScaleX(90), ScaleY(26));
+    WorkCancel.Anchors := [akRight, akBottom];
     WorkCancel.Caption := 'Cancel';
     WorkCancel.Cancel := True;
     WorkCancel.OnClick := @CancelWorker;
