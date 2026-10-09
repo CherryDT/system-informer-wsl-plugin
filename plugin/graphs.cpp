@@ -73,7 +73,7 @@ void hover(HWND window, GraphWindow &state)
 {
     RECT rect{};
     GetClientRect(window, &rect);
-    const auto &samples = state.view->graphSamples;
+    const auto &samples = state.view->capture->graphSamples;
     int index = -1;
     if (state.mouseX >= 0 && rect.right > 2 && !samples.empty())
     {
@@ -177,9 +177,9 @@ LRESULT CALLBACK graphProc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
         // Grid columns are tied to sample sequence, so they travel left with
         // their samples instead of staying fixed against the scrolling graph.
         const auto &v = *state->view;
-        const auto &samples = v.graphSamples;
+        const auto &samples = v.capture->graphSamples;
         for (int slot = 0; slot < HistoryCapacity; ++slot)
-            if ((v.graphSequence + slot) % 10 == 0)
+            if ((v.capture->graphSequence + slot) % 10 == 0)
             {
                 int x = 1 + slot * (r.right - 2) / (HistoryCapacity - 1);
                 MoveToEx(dc, x, 1, nullptr);

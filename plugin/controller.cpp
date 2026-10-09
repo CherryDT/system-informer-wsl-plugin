@@ -34,12 +34,16 @@ std::atomic<bool> cancellationRequested{true};
 // the worker finishes a request or removes a disconnected client from its map.
 std::shared_ptr<Client> activeClient;
 std::wstring activeDistro;
+bool activeAutomatic = false;
+std::atomic<bool> automaticCapture{true};
 bool backgroundCapture = true, captureVisible = false;
 std::wstring captureDistro;
 std::atomic<bool> discoveryPaused{false};
 
-bool captureAllowed(const std::wstring &distro, const std::string &operation)
+bool captureAllowed(const std::wstring &distro, const std::string &operation, bool automatic = false)
 {
+    if (automatic && !automaticCapture.load())
+        return false;
     return backgroundCapture || (captureVisible && (operation == "discover" || distro == captureDistro));
 }
 constexpr auto CapturePaused =
@@ -95,6 +99,7 @@ void run()
             continue;
         }
         const bool savedRule = job.request.value("_saved_scheduling", false);
+        const bool automatic = savedRule || job.request.value("_automatic_capture", false);
         if (!job.mailbox || !job.mailbox->window.load())
         {
             if (savedRule)
@@ -113,14 +118,16 @@ void run()
         {
             {
                 std::lock_guard<std::mutex> lock(queueMutex);
-                if (!captureAllowed(job.distro, operation))
+                if (!captureAllowed(job.distro, operation, automatic))
                     throw std::runtime_error(CapturePaused);
             }
             if (operation == "discover")
             {
                 reply->data = Json::array();
-                for (const auto &distro :
-                     runningDistros([] { return cancellationRequested.load() || discoveryPaused.load(); }))
+                for (const auto &distro : runningDistros([automatic] {
+                         return cancellationRequested.load() || discoveryPaused.load() ||
+                                (automatic && !automaticCapture.load());
+                     }))
                     reply->data.push_back(utf8(distro.name));
             }
             else
@@ -136,12 +143,13 @@ void run()
                     std::lock_guard<std::mutex> lock(queueMutex);
                     if (stopping)
                         break;
-                    if (!captureAllowed(job.distro, operation))
+                    if (!captureAllowed(job.distro, operation, automatic))
                     {
                         clients.erase(job.distro);
                         throw std::runtime_error(CapturePaused);
                     }
                     activeDistro = job.distro;
+                    activeAutomatic = automatic;
                     activeClient = client;
                 }
                 const auto timeout = operation == "service_details" || operation == "service_action" ||
@@ -168,6 +176,7 @@ void run()
             std::lock_guard<std::mutex> lock(queueMutex);
             activeClient.reset();
             activeDistro.clear();
+            activeAutomatic = false;
             if (stopping)
                 break;
         }
@@ -176,7 +185,7 @@ void run()
             bool allowed;
             {
                 std::lock_guard<std::mutex> lock(queueMutex);
-                allowed = captureAllowed(job.distro, operation);
+                allowed = captureAllowed(job.distro, operation, automatic);
             }
             if (!allowed)
                 cancelSavedScheduling(job.distro, job.request);
@@ -189,12 +198,13 @@ void run()
             }
             continue;
         }
-        if (operation == "snapshot" && reply->error.empty())
+        if (operation == "snapshot" && reply->error.empty() && automaticCapture.load())
         {
             if (auto request = nextSavedScheduling(job.distro, reply->data))
             {
                 std::lock_guard<std::mutex> lock(queueMutex);
-                if (!stopping && captureAllowed(job.distro, "thread") && jobs.size() < MaximumQueuedRequests)
+                if (!stopping && captureAllowed(job.distro, "thread", true) &&
+                    jobs.size() < MaximumQueuedRequests)
                     jobs.push_back({job.distro, std::move(*request), job.mailbox, 0});
                 else
                     cancelSavedScheduling(job.distro, *request);
@@ -238,7 +248,9 @@ void submit(const std::wstring &distro, Json request, std::shared_ptr<Mailbox> m
         std::lock_guard<std::mutex> lock(queueMutex);
         if (stopping)
             rejection = "WSL Tools is shutting down.";
-        else if (!captureAllowed(distro, request.value("op", "")))
+        else if (!captureAllowed(distro, request.value("op", ""),
+                                 request.value("_automatic_capture", false) ||
+                                     request.value("_saved_scheduling", false)))
             rejection = CapturePaused;
         else if (jobs.size() >= MaximumQueuedRequests)
             rejection = "Too many WSL requests are waiting. Wait for the current operation, then try again.";
@@ -256,26 +268,30 @@ void submit(const std::wstring &distro, Json request, std::shared_ptr<Mailbox> m
     ready.notify_one();
 }
 
-void setCapturePolicy(bool background, bool visible, const std::wstring &distro)
+void setCapturePolicy(bool background, bool visible, const std::wstring &distro, bool automatic)
 {
     std::deque<Job> cancelled;
     {
         std::lock_guard<std::mutex> lock(queueMutex);
-        if (backgroundCapture == background && captureVisible == visible && captureDistro == distro)
+        if (backgroundCapture == background && captureVisible == visible && captureDistro == distro &&
+            automaticCapture.load() == automatic)
             return;
         const bool previouslyBackground = backgroundCapture;
+        const bool previouslyAutomatic = automaticCapture.exchange(automatic);
         backgroundCapture = background;
         captureVisible = visible;
         captureDistro = distro;
         discoveryPaused = !background && !visible;
-        if (stopping || (background && previouslyBackground))
+        if (stopping || (background && previouslyBackground && automatic == previouslyAutomatic))
             return;
         for (auto it = jobs.begin(); it != jobs.end();)
         {
             const auto op = it->request.value("op", "");
             if (op == "capture_policy")
                 it = jobs.erase(it);
-            else if (op != "disconnect" && !captureAllowed(it->distro, op))
+            else if (op != "disconnect" && !captureAllowed(it->distro, op,
+                                                           it->request.value("_automatic_capture", false) ||
+                                                               it->request.value("_saved_scheduling", false)))
             {
                 cancelled.push_back(std::move(*it));
                 it = jobs.erase(it);
@@ -283,7 +299,7 @@ void setCapturePolicy(bool background, bool visible, const std::wstring &distro)
             else
                 ++it;
         }
-        if (activeClient && !captureAllowed(activeDistro, "snapshot"))
+        if (activeClient && !captureAllowed(activeDistro, "snapshot", activeAutomatic))
             activeClient->close();
         // The worker owns idle clients. Give its cleanup priority over new work.
         jobs.push_front({{}, {{"op", "capture_policy"}}, nullptr, 0});
@@ -305,29 +321,40 @@ void setCapturePolicy(bool background, bool visible, const std::wstring &distro)
 
 void disconnect(const std::wstring &distro)
 {
+    std::deque<Job> cancelled;
     {
         std::lock_guard<std::mutex> lock(queueMutex);
         if (stopping)
             return;
-        // Preserve previously requested actions, but discard old polling work.
-        // Coalesce control markers too: repeated reconnect clicks cannot create
-        // an unbounded queue. Control markers have priority over the request cap
-        // so a busy queue can always release a connection.
-        jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
-                                  [&](const Job &job) {
-                                      const auto operation = job.request.value("op", "");
-                                      if (job.distro == distro &&
-                                          job.request.value("_saved_scheduling", false))
-                                      {
-                                          cancelSavedScheduling(distro, job.request);
-                                          return true;
-                                      }
-                                      return job.distro == distro &&
-                                             (operation == "snapshot" || operation == "connections" ||
-                                              operation == "services" || operation == "disconnect");
-                                  }),
-                   jobs.end());
+        // Preserve explicit actions, but retire old polls and coalesce control
+        // markers. Every cancelled poll still needs a reply so its view can
+        // release its pending-request state.
+        for (auto it = jobs.begin(); it != jobs.end();)
+        {
+            const auto operation = it->request.value("op", "");
+            if (it->distro == distro &&
+                (it->request.value("_saved_scheduling", false) || operation == "snapshot" ||
+                 operation == "connections" || operation == "services" || operation == "disconnect"))
+            {
+                cancelled.push_back(std::move(*it));
+                it = jobs.erase(it);
+            }
+            else
+                ++it;
+        }
         jobs.push_back({distro, {{"op", "disconnect"}}, nullptr, 0});
+    }
+    for (const auto &job : cancelled)
+    {
+        if (job.request.value("_saved_scheduling", false))
+            cancelSavedScheduling(distro, job.request);
+        else if (job.mailbox)
+        {
+            auto reply = std::make_unique<Reply>();
+            reply->tag = job.tag;
+            reply->error = "Capture was interrupted by a refresh or capture-policy change.";
+            deliver(job.mailbox, std::move(reply));
+        }
     }
     ready.notify_one();
 }

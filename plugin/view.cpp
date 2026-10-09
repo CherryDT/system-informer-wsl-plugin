@@ -1,4 +1,5 @@
 #include "controller.hpp"
+#include "capture.hpp"
 #include "settings.hpp"
 #include "host_bridge.h"
 #include "graphs.hpp"
@@ -8,6 +9,7 @@
 #include "resource_dialog.hpp"
 #include "process_rules.hpp"
 #include <algorithm>
+#include <atomic>
 #include <set>
 #include <utility>
 #include <windowsx.h>
@@ -38,69 +40,10 @@ bool contentVisible(const View &v)
     HWND host = GetAncestor(v.window, GA_ROOT);
     return v.active && IsWindowVisible(v.window) && IsWindowVisible(host) && !IsIconic(host);
 }
-// This runs on the UI thread and never waits for WSL. The controller wakes or
-// cancels its worker independently, including requests from open inspectors.
+Json snapshotRequest(const View &v);
 void updateCaptureState(View &v)
 {
-    const bool visible = contentVisible(v);
-    const bool background = readSetting(L"EnableBackgroundCapture", 1) != 0;
-    setCapturePolicy(background, visible, v.selectedDistro);
-    const bool suspended = !background && !visible;
-    const auto now = GetTickCount64();
-    if (suspended != v.captureSuspended)
-    {
-        v.captureSuspended = suspended;
-        ++v.epoch;
-        v.pending = false;
-        v.refreshAfterPending = false;
-        v.previous.clear();
-        v.previousTime = 0;
-        if (suspended)
-        {
-            v.lastGraphTick = now;
-            // One empty slot separates adjacent traces even for a brief hide.
-            GraphSample missing;
-            missing.missing = true;
-            GetSystemTimeAsFileTime(&missing.timestamp);
-            v.graphSamples.push_back(missing);
-            ++v.graphSequence;
-            if (v.graphSamples.size() > 120)
-                v.graphSamples.pop_front();
-            status(v, L"Background capture is disabled. Capture resumes when this WSL tab is visible.");
-        }
-        else
-        {
-            v.failed = v.componentMissing;
-            v.forceRefresh = true;
-            v.refreshServiceMetadata = true;
-        }
-    }
-    if (suspended && v.lastGraphTick)
-    {
-        const auto interval = std::max(1ul, WslHostRefreshInterval());
-        const auto count = (now - v.lastGraphTick) / interval;
-        if (count)
-        {
-            FILETIME stamp{};
-            GetSystemTimeAsFileTime(&stamp);
-            ULARGE_INTEGER time{};
-            time.LowPart = stamp.dwLowDateTime;
-            time.HighPart = stamp.dwHighDateTime;
-            for (uint64_t i = std::min<uint64_t>(count, 120); i > 0; --i)
-            {
-                GraphSample missing;
-                missing.missing = true;
-                ULARGE_INTEGER slot = time;
-                slot.QuadPart -= (i - 1) * interval * 10000ull;
-                missing.timestamp = {slot.LowPart, slot.HighPart};
-                v.graphSamples.push_back(missing);
-                if (v.graphSamples.size() > 120)
-                    v.graphSamples.pop_front();
-            }
-            v.graphSequence += count;
-            v.lastGraphTick += count * interval;
-        }
-    }
+    setCaptureView(v.window, v.selectedDistro, contentVisible(v), snapshotRequest(v));
 }
 Json mergeIdentitySnapshot(const Json &previous, const Json &incoming, const char *arrayName)
 {
@@ -183,8 +126,8 @@ Json snapshotRequest(const View &v)
     }
     for (const auto &field : fields)
         request["fields"].push_back(field);
-    if (v.defaultUid)
-        request["default_uid"] = *v.defaultUid;
+    if (v.capture->defaultUid)
+        request["default_uid"] = *v.capture->defaultUid;
     return request;
 }
 } // namespace
@@ -207,26 +150,13 @@ bool queueVisibleServices(View &v)
 void refresh(View &v)
 {
     updateCaptureState(v);
-    if (v.captureSuspended)
-        return;
-    if ((v.paused && !v.forceRefresh) || v.pending || v.failed)
-        return;
-    if (v.selectedDistro.empty())
-    {
-        if (v.active)
-            queue(v, {{"op", "discover"}}, DiscoverTag);
-        return;
-    }
-    // Background monitoring keeps graph samples and object identities current;
-    // expensive process metadata is requested only for visible columns/colors.
-    v.forceRefresh = false;
-    v.collectConnections = v.page == 1 || v.sockets.is_object();
-    v.collectServices = contentVisible(v) && v.page == 2;
-    queue(v, snapshotRequest(v), SnapshotTag);
+    if (!v.selectedDistro.empty())
+        refreshCapture(v.selectedDistro);
 }
 namespace
 {
 View *mainView = nullptr;
+std::atomic<HWND> mainViewWindow{};
 const wchar_t *viewClass = L"WslTools.View";
 
 void layout(View &v)
@@ -264,7 +194,7 @@ void layout(View &v)
     const int footerY = height - s(2) - footerHeight;
     place(v.status, s(2), footerY, width - s(4), footerHeight);
 
-    const bool content = !v.componentMissing;
+    const bool content = !v.capture->componentMissing;
     for (HWND child : {v.graph, v.memoryGraph, v.tabs, v.exportButton, v.findHandles})
         ShowWindow(child, content ? SW_SHOW : SW_HIDE);
     ShowWindow(v.processes.window, content && v.page == 0 ? SW_SHOW : SW_HIDE);
@@ -302,6 +232,149 @@ void layout(View &v)
     for (auto table : {&v.processes, &v.connections, &v.services})
         place(table->window, 0, tableTop, width, std::max(0, footerY - s(2) - tableTop));
 }
+void updateStatus(View &v)
+{
+    if (v.selectedDistro.empty())
+    {
+        status(v, L"No running WSL2 distributions. Start a distro, then use View > Refresh (F5).");
+        return;
+    }
+    if (v.capture->componentMissing)
+    {
+        status(v, L"Component not installed in " + v.selectedDistro + L".");
+        return;
+    }
+    if (v.capture->failed)
+    {
+        status(v, L"Disconnected: " + v.capture->error + L" · Use View > Refresh (F5) to reconnect.");
+        return;
+    }
+    if (!WslHostRefreshAutomatically())
+    {
+        status(v, L"Automatic refresh is off. Use View > Refresh (F5) to update.");
+        return;
+    }
+    if (v.capture->suspended)
+    {
+        status(v, L"Background capture is disabled. Capture resumes when this WSL tab is visible.");
+        return;
+    }
+    if (!v.capture->snapshot.is_object())
+    {
+        status(v, L"Connecting to the selected distribution…");
+        return;
+    }
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    wchar_t stamp[32];
+    swprintf_s(stamp, L"%02u:%02u:%02u", time.wHour, time.wMinute, time.wSecond);
+    std::wstring value = v.page == 0 && !v.capture->statistics.empty()
+                             ? v.capture->statistics
+                             : std::to_wstring(v.table().rows.size()) + L" visible rows";
+    value += L" · " + std::wstring(stamp);
+    if (v.page == 1 && v.sockets.is_object() && v.sockets.value("inaccessible_processes", 0) > 0)
+        value += L" · some socket owners were inaccessible";
+    if ((v.page == 0 && v.capture->snapshot.value("processes_truncated", false)) ||
+        (v.page == 1 && v.sockets.is_object() && v.sockets.value("connections_truncated", false)))
+        value += L" · collection limit reached (partial results)";
+    const auto schedulingError = savedSchedulingError(v.selectedDistro);
+    if (!schedulingError.empty())
+        value += L" · " + schedulingError;
+    status(v, value);
+}
+void refreshUiData(View &v)
+{
+    if (v.selectedDistro.empty() || v.capture->failed || (v.capture->suspended && !contentVisible(v)))
+        return;
+    if (v.pending)
+    {
+        v.refreshAfterPending = true;
+        return;
+    }
+    v.refreshAfterPending = false;
+    v.collectConnections = v.page == 1 || v.sockets.is_object();
+    v.collectServices = contentVisible(v) && v.page == 2;
+    if (v.collectConnections)
+        queue(v,
+              {{"op", "connections"},
+               {"identities_only", !contentVisible(v) || v.page != 1},
+               {"resolve_names", contentVisible(v) && v.page == 1 &&
+                                     WslHostIntegerSetting(L"EnableNetworkResolve") &&
+                                     v.connections.isColumnVisible(9)}},
+              ConnectionsTag);
+    else if (v.collectServices)
+        queueVisibleServices(v);
+}
+void captureChanged(View &v)
+{
+    const auto names = captureDistros();
+    if (names != v.distroNames)
+    {
+        v.distroNames = names;
+        SendMessageW(v.distro, CB_RESETCONTENT, 0, 0);
+        int selected = -1;
+        for (size_t i = 0; i < names.size(); ++i)
+        {
+            SendMessageW(v.distro, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(names[i].c_str()));
+            if (names[i] == v.selectedDistro)
+                selected = static_cast<int>(i);
+        }
+        if (selected < 0 && !names.empty())
+            selected = 0;
+        SendMessageW(v.distro, CB_SETCURSEL, selected, 0);
+        const auto chosen = selected >= 0 ? names[selected] : std::wstring{};
+        if (chosen != v.selectedDistro)
+        {
+            clearDistro(v);
+            v.selectedDistro = chosen;
+            if (!chosen.empty())
+                v.capture = captureModel(chosen);
+            updateCaptureState(v);
+        }
+    }
+    if (v.renderedRevision == v.capture->revision)
+        return;
+    const bool first = v.renderedRevision == UINT64_MAX;
+    v.renderedRevision = v.capture->revision;
+    const bool newSnapshot = v.capture->snapshot.is_object() && v.capture->previousTime > 0 &&
+                             v.renderedSnapshotTime != v.capture->previousTime;
+    const bool renderSnapshot = v.capture->snapshot.is_object() && (first || newSnapshot);
+    v.renderedSnapshotTime = v.capture->previousTime;
+    if (!v.renderedSnapshotTime)
+    {
+        v.refreshAfterPending = false;
+        v.collectServices = false;
+    }
+    layout(v);
+    PostMessageW(v.graph, GraphSampleChanged, 0, 0);
+    PostMessageW(v.memoryGraph, GraphSampleChanged, 0, 0);
+    if (renderSnapshot)
+    {
+        render(v, SnapshotTag);
+        if (contentVisible(v) && v.page == 0 && !v.capture->newProcess.empty() &&
+            WslHostIntegerSetting(L"ScrollToNewProcesses"))
+        {
+            const auto &rows = v.processes.rows;
+            const auto added = std::find_if(rows.begin(), rows.end(), [&](const Row &row) {
+                return row.key == v.capture->newProcess && !row.removed;
+            });
+            if (added != rows.end())
+                v.processes.ensureVisible(static_cast<int>(added - rows.begin()));
+        }
+        if (v.page == 0 && !v.pendingSelection.empty())
+        {
+            v.processes.selectKey(v.pendingSelection);
+            const int index = v.processes.selectedIndex();
+            if (index >= 0)
+                v.processes.ensureVisible(index);
+            v.pendingSelection.clear();
+        }
+        if (newSnapshot)
+            refreshUiData(v);
+    }
+    if (!v.pending)
+        updateStatus(v);
+}
 void switchPage(View &v)
 {
     const int tab = TabCtrl_GetCurSel(v.tabs);
@@ -320,22 +393,14 @@ void switchPage(View &v)
                                                         : L"Filter service, state or description…"));
     layout(v);
     render(v);
-    v.forceRefresh = true;
     v.refreshAfterPending = v.pending;
     refresh(v);
 }
 void manualRefresh(View &v)
 {
-    updateCaptureState(v);
-    if (v.captureSuspended || v.pending)
-        return;
-    if (v.failed)
-        disconnect(v.selectedDistro);
-    v.failed = false;
-    v.forceRefresh = true;
     v.refreshServiceMetadata = true;
-    queue(v, {{"op", "discover"}}, DiscoverTag);
-    status(v, L"Discovering running WSL2 distributions…");
+    updateCaptureState(v);
+    refreshCaptures(true);
 }
 LRESULT CALLBACK childKeys(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR, DWORD_PTR data)
 {
@@ -399,13 +464,13 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         v->mailbox->window = window;
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(v));
         mainView = v;
+        mainViewWindow = window;
     }
     if (!v)
         return DefWindowProcW(window, message, wparam, lparam);
     switch (message)
     {
     case WM_CREATE: {
-        v->paused = !WslHostRefreshAutomatically();
         v->distro =
             control(window, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, DistroCombo);
         v->settings = control(window, L"BUTTON", L"Settings...", WS_TABSTOP, SettingsButton);
@@ -514,10 +579,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                     L"It runs only while connected; future component updates are applied automatically.",
                     SS_LEFT, 0);
         v->installButton = control(window, L"BUTTON", L"Install and retry", WS_TABSTOP, InstallButton);
-        v->status = control(window, L"STATIC",
-                            L"Monitoring starts when this tab is selected. Stopped distros are not "
-                            L"started intentionally.",
-                            SS_LEFT, 0);
+        v->status = control(window, L"STATIC", L"Loading capture history…", SS_LEFT, 0);
         for (HWND child : {v->distro, v->settings, v->tabs, v->search, v->listeners, v->tree,
                            v->processes.window, v->connections.window, v->services.window, v->exportButton,
                            v->installButton, v->findHandles, v->inactiveServices})
@@ -540,8 +602,8 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         switchPage(*v);
         layout(*v);
         SetTimer(window, 1, 500, nullptr);
-        startController();
         updateCaptureState(*v);
+        captureChanged(*v);
         return 0;
     }
     case WM_GETFONT:
@@ -564,7 +626,6 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         layout(*v);
         return 0;
     case ResourceActionCompleted:
-        v->forceRefresh = true;
         v->refreshAfterPending = v->pending;
         refresh(*v);
         return 0;
@@ -577,20 +638,12 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             if (foreground)
             {
                 v->refreshServiceMetadata = true;
-                v->forceRefresh = true;
                 v->refreshAfterPending = v->pending;
                 refresh(*v);
             }
         }
         if (v->cpuPercentOfTotal != (readSetting(L"CpuPercentOfTotal", 1) != 0))
             render(*v);
-        auto now = GetTickCount64();
-        auto interval = std::max(1ul, WslHostRefreshInterval());
-        if (now - v->lastRefresh >= interval)
-        {
-            v->lastRefresh = now;
-            refresh(*v);
-        }
         return 0;
     }
     case WM_COMMAND: {
@@ -602,9 +655,8 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             {
                 clearDistro(*v);
                 v->selectedDistro = chosen;
-                v->defaultUid = distroDefaultUid(chosen);
-                v->forceRefresh = true;
-                layout(*v);
+                v->capture = captureModel(chosen);
+                captureChanged(*v);
                 refresh(*v);
             }
             return 0;
@@ -617,10 +669,8 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         switch (id)
         {
         case InstallButton:
-            if (v->componentMissing && !v->pending)
+            if (v->capture->componentMissing && !v->pending)
             {
-                v->forceRefresh = true;
-                v->failed = false;
                 queue(*v, {{"op", "install_component"}}, InstallTag);
                 EnableWindow(v->installButton, FALSE);
                 status(*v, L"Installing the WSL component as root…");
@@ -667,7 +717,6 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         }
         return 0;
     case ColumnsChangedMessage:
-        v->forceRefresh = true;
         v->refreshAfterPending = v->pending;
         refresh(*v);
         return 0;
@@ -718,6 +767,12 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         menu(*v, p);
         return 0;
     }
+    case WSL_VIEW_SETTINGS_CHANGED:
+        WslHostViewSettingsChanged();
+        return 0;
+    case CaptureChangedMessage:
+        captureChanged(*v);
+        return 0;
     case ReplyMessage: {
         std::unique_ptr<Reply> reply(reinterpret_cast<Reply *>(lparam));
         updateCaptureState(*v);
@@ -729,8 +784,6 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         {
             if (reply->componentMissing || tag == InstallTag)
             {
-                v->componentMissing = true;
-                v->failed = true;
                 layout(*v);
                 if (tag == InstallTag)
                     errorBox(window, L"Could not install the WSL component.\r\n\r\n" + wide(reply->error));
@@ -748,7 +801,6 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                 refresh(*v);
                 return 0;
             }
-            v->failed = true;
             status(*v,
                    L"Disconnected: " + wide(reply->error) + L"  ·  Use View > Refresh (F5) to reconnect.");
             return 0;
@@ -792,93 +844,11 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             }
             if (tag == InstallTag)
             {
-                v->componentMissing = false;
-                v->failed = false;
                 status(*v, L"Component installed. Loading processes…");
-                switchPage(*v);
+                refreshCapture(v->selectedDistro, true);
                 return 0;
             }
-            if (tag == DiscoverTag)
-            {
-                auto old = v->selectedDistro;
-                SendMessageW(v->distro, CB_RESETCONTENT, 0, 0);
-                int chosen = -1, index = 0;
-                for (auto &name : reply->data)
-                {
-                    auto value = wide(name.get<std::string>());
-                    SendMessageW(v->distro, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value.c_str()));
-                    if (value == old)
-                        chosen = index;
-                    ++index;
-                }
-                if (!index)
-                {
-                    clearDistro(*v);
-                    v->selectedDistro.clear();
-                    layout(*v);
-                    v->failed = true;
-                    status(*v,
-                           L"No running WSL2 distributions. Start a distro, then use View > Refresh (F5).");
-
-                    updateButtons(*v);
-                    return 0;
-                }
-                if (chosen < 0)
-                    chosen = 0;
-                SendMessageW(v->distro, CB_SETCURSEL, chosen, 0);
-                auto distro = windowText(v->distro);
-                if (distro != old)
-                {
-                    clearDistro(*v);
-                    v->selectedDistro = distro;
-                    v->defaultUid = distroDefaultUid(distro);
-                }
-                refresh(*v);
-            }
-            else if (tag == SnapshotTag)
-            {
-                if (v->componentMissing)
-                {
-                    v->componentMissing = false;
-                    layout(*v);
-                }
-                updateSnapshot(*v, reply->data);
-                render(*v, SnapshotTag);
-                if (contentVisible(*v) && v->page == 0 && !v->newProcess.empty() &&
-                    WslHostIntegerSetting(L"ScrollToNewProcesses"))
-                {
-                    const auto &rows = v->processes.rows;
-                    auto added = std::find_if(rows.begin(), rows.end(), [&](const Row &row) {
-                        return row.key == v->newProcess && !row.removed;
-                    });
-                    if (added != rows.end())
-                        v->processes.ensureVisible(static_cast<int>(added - rows.begin()));
-                }
-                if (v->page == 0 && !v->pendingSelection.empty())
-                {
-                    v->processes.selectKey(v->pendingSelection);
-                    int index = v->processes.selectedIndex();
-                    if (index >= 0)
-                        v->processes.ensureVisible(index);
-                    else
-                        status(*v, L"The socket owner has exited. Refresh the connections view.");
-                    v->pendingSelection.clear();
-                }
-                if (v->collectConnections)
-                {
-                    queue(*v,
-                          {{"op", "connections"},
-                           {"identities_only", !contentVisible(*v) || v->page != 1},
-                           {"resolve_names", contentVisible(*v) && v->page == 1 &&
-                                                 WslHostIntegerSetting(L"EnableNetworkResolve") &&
-                                                 v->connections.isColumnVisible(9)}},
-                          ConnectionsTag);
-                    return 0;
-                }
-                if (v->collectServices && queueVisibleServices(*v))
-                    return 0;
-            }
-            else if (tag == ConnectionsTag)
+            if (tag == ConnectionsTag)
             {
                 v->sockets = mergeIdentitySnapshot(v->sockets, reply->data, "connections");
                 render(*v, ConnectionsTag);
@@ -898,43 +868,17 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             else if (tag == ActionTag)
             {
                 status(*v, L"Action completed. Refreshing…");
-                v->forceRefresh = true;
                 refresh(*v);
                 return 0;
             }
 
             if (!v->pending && v->refreshAfterPending)
-            {
-                v->refreshAfterPending = false;
-                v->forceRefresh = true;
-                refresh(*v);
-            }
+                refreshUiData(*v);
             if (!v->pending)
-            {
-                SYSTEMTIME time{};
-                GetLocalTime(&time);
-                wchar_t stamp[32];
-                swprintf_s(stamp, L"%02u:%02u:%02u", time.wHour, time.wMinute, time.wSecond);
-                std::wstring statusText;
-                if (v->page == 0 && !v->statistics.empty())
-                    statusText += v->statistics;
-                else
-                    statusText += std::to_wstring(v->table().rows.size()) + L" visible rows";
-                statusText += L" · " + std::wstring(stamp);
-                if (v->page == 1 && v->sockets.value("inaccessible_processes", 0) > 0)
-                    statusText += L" · some socket owners were inaccessible";
-                if ((v->page == 0 && v->snapshot.value("processes_truncated", false)) ||
-                    (v->page == 1 && v->sockets.value("connections_truncated", false)))
-                    statusText += L" · collection limit reached (partial results)";
-                const auto schedulingError = savedSchedulingError(v->selectedDistro);
-                if (!schedulingError.empty())
-                    statusText += L" · " + schedulingError;
-                status(*v, statusText);
-            }
+                updateStatus(*v);
         }
         catch (const std::exception &e)
         {
-            v->failed = true;
             status(*v, L"Invalid observer response: " + wide(e.what()));
         }
         return 0;
@@ -943,12 +887,15 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         DestroyWindow(v->tooltips);
         KillTimer(window, 1);
         v->mailbox->detach();
-        disconnect(v->selectedDistro);
+        detachCaptureView(window);
         drainReplies(window);
         return 0;
     case WM_NCDESTROY:
         if (mainView == v)
+        {
+            mainViewWindow = nullptr;
             mainView = nullptr;
+        }
         delete v;
         SetWindowLongPtrW(window, GWLP_USERDATA, 0);
         break;
@@ -996,21 +943,14 @@ extern "C" void WslSetActive(BOOL active)
     updateCaptureState(v);
     if (v.active)
     {
-        v.failed = false;
-        v.paused = !WslHostRefreshAutomatically();
-        v.forceRefresh = true;
         v.refreshServiceMetadata = true;
-        v.refreshAfterPending = v.pending;
         render(v);
-        if (v.paused && !v.forceRefresh)
-            status(v, L"Automatic refresh is off. Use View > Refresh (F5) to update.");
         refresh(v);
     }
-    // With background capture enabled, inactive pages retain graph history
-    // and process identities. Otherwise updateCaptureState releases the helper.
 }
 extern "C" void WslShutdown(void)
 {
+    wsl::stopCapture();
     wsl::stopController();
 }
 
@@ -1019,7 +959,7 @@ extern "C" void WslFocusContent(BOOL select)
     using namespace wsl::ui;
     if (!mainView)
         return;
-    if (mainView->componentMissing)
+    if (mainView->capture->componentMissing)
     {
         SetFocus(mainView->installButton);
         return;
@@ -1038,48 +978,46 @@ extern "C" void WslSearchChanged(void)
     render(*mainView);
 }
 
-extern "C" void WslHostRefreshChanged(BOOL automatic)
+extern "C" void WslHostRefreshChanged(BOOL)
 {
     using namespace wsl;
     using namespace wsl::ui;
-    if (!mainView)
-        return;
-    auto &v = *mainView;
-    v.paused = !automatic;
-    if (v.paused)
+    captureSettingsChanged();
+    if (mainView)
     {
-        disconnect(v.selectedDistro);
-        ++v.epoch;
-        v.pending = false;
-        v.forceRefresh = false;
-        status(v, L"Automatic refresh is off. Use View > Refresh (F5) to update.");
-    }
-    else
-    {
-        v.previousTime = 0;
-        v.lastRefresh = 0;
-        refresh(v);
+        updateCaptureState(*mainView);
+        updateStatus(*mainView);
     }
 }
 extern "C" void WslHostRefresh(void)
 {
+    using namespace wsl;
     using namespace wsl::ui;
     if (mainView && mainView->active)
         manualRefresh(*mainView);
+    else
+        refreshCaptures(true);
 }
 
 // View-menu settings do not emit the host Options callback. The bridge calls
 // this after the host has applied a command, including while updates are paused.
 extern "C" void WslHostViewSettingsChanged(void)
 {
+    using namespace wsl;
     using namespace wsl::ui;
+    captureSettingsChanged();
+    const HWND window = mainViewWindow.load();
+    if (!window)
+        return;
+    if (GetWindowThreadProcessId(window, nullptr) != GetCurrentThreadId())
+    {
+        PostMessageW(window, WSL_VIEW_SETTINGS_CHANGED, 0, 0);
+        return;
+    }
     if (!mainView)
         return;
     render(*mainView);
+    updateCaptureState(*mainView);
     if (contentVisible(*mainView))
-    {
-        mainView->forceRefresh = true;
-        mainView->refreshAfterPending = mainView->pending;
         refresh(*mainView);
-    }
 }

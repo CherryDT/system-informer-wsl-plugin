@@ -10,6 +10,6 @@ constexpr uintptr_t ActionTag = 5;
 constexpr uintptr_t InstallTag = 6;
 void startController();
 void stopController();
-void setCapturePolicy(bool background, bool visible, const std::wstring &distro);
+void setCapturePolicy(bool background, bool visible, const std::wstring &distro, bool automatic = true);
 void disconnect(const std::wstring &distro);
 } // namespace wsl

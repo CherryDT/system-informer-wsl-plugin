@@ -10,6 +10,7 @@
 extern HWND WslCreateView(HWND parent, HINSTANCE instance);
 extern void WslSetActive(BOOL active);
 extern void WslShutdown(void);
+extern void WslStartCapture(HINSTANCE module, HWND host);
 extern void WslFocusContent(BOOL select);
 extern void WslSearchChanged(void);
 extern void WslHostRefreshChanged(BOOL automatic);
@@ -159,7 +160,7 @@ static LRESULT CALLBACK HostWindowSubclass(HWND window, UINT message, WPARAM wpa
     UNREFERENCED_PARAMETER(context);
     /* ID_VIEW_REFRESH from the host's public command resources. */
     const UINT refreshCommand = 10098;
-    if (message == WM_COMMAND && LOWORD(wparam) == refreshCommand && ViewWindow)
+    if (message == WM_COMMAND && LOWORD(wparam) == refreshCommand)
         WslHostRefresh();
     if (message == WM_NCDESTROY)
     {
@@ -364,6 +365,7 @@ static VOID NTAPI MainWindowShowing(PVOID parameter, PVOID context)
     HostWindow = SystemInformer_GetWindowHandle();
     if (HostWindow)
         SetWindowSubclass(HostWindow, HostWindowSubclass, (UINT_PTR)HostWindowSubclass, 0);
+    WslStartCapture(PluginModule, HostWindow);
     ToolStatus = PhGetPluginInterfaceZ(TOOLSTATUS_INTERFACE_NAME, TOOLSTATUS_INTERFACE_VERSION);
     if (ToolStatus && (!ToolStatus->GetSearchMatchHandle || !ToolStatus->WordMatch ||
                        !ToolStatus->RegisterTabInfo || !ToolStatus->SearchChangedEvent))

@@ -65,7 +65,7 @@ void action(View &v, int id)
     {
         if (v.page != 2 || row.data.contains("pid"))
             goToProcess(v, row.data);
-        else if (!v.pending && v.active && !v.failed)
+        else if (!v.pending && v.active && !v.capture->failed)
         {
             // A hidden PID column avoids polling MainPID; fetch it on demand
             // when the user explicitly asks to navigate to the service process.
@@ -94,7 +94,7 @@ void action(View &v, int id)
         errorBox(v.window, L"A request is still running. Wait for it to finish, then try the action again.");
         return;
     }
-    if (!v.active || v.failed)
+    if (!v.active || v.capture->failed)
     {
         errorBox(v.window, L"Refresh before changing a process or service.");
         return;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.hpp"
+#include "capture_model.hpp"
 #include <algorithm>
 #include <deque>
 #include <map>
@@ -51,44 +52,6 @@ enum Id
     GoToProcess,
     InterruptSignal
 };
-struct ProcessSample
-{
-    uint64_t ticks = 0, read = 0, written = 0;
-    bool hasIo = false;
-};
-// Raw per-vCPU percentages, independent of the current display scale. Keeping
-// the sum makes each update constant-time once the history window is full.
-struct CpuHistory
-{
-    std::deque<double> samples;
-    double sum = 0;
-
-    void append(double usage, size_t capacity)
-    {
-        samples.push_back(usage);
-        sum += usage;
-        while (samples.size() > capacity)
-        {
-            sum -= samples.front();
-            samples.pop_front();
-        }
-    }
-    double average() const
-    {
-        return samples.empty() ? 0 : std::max(0.0, sum / samples.size());
-    }
-};
-struct GraphSample
-{
-    FILETIME timestamp{};
-    bool missing = false;
-    double cpu = 0, topCpu = 0, interval = 0;
-    unsigned cpus = 1;
-    uint64_t memoryTotal = 0, memoryAvailable = 0, largestRss = 0;
-    size_t processCount = 0;
-    int topPid = 0, largestRssPid = 0;
-    std::wstring topName, largestRssName;
-};
 struct View
 {
     HWND window{}, distro{}, settings{}, search{}, tabs{}, listeners{}, tree{}, exportButton{}, status{},
@@ -96,35 +59,24 @@ struct View
         inactiveServices{};
     Table processes, connections, services;
     std::shared_ptr<Mailbox> mailbox = std::make_shared<Mailbox>();
-    Json snapshot, sockets, units;
-    // Only the current process identities are retained between samples.
-    std::map<std::string, ProcessSample> previous;
-    std::map<std::string, double> cpu, readRate, writeRate;
-    // Separate from the interval baseline so a capture pause does not add zeros
-    // or discard valid history. Keys include the process start time.
-    std::map<std::string, CpuHistory> cpuHistory;
-    std::deque<GraphSample> graphSamples;
-    uint64_t graphSequence = 0;
-    uint64_t previousTime = 0;
-    std::string bootId;
+    std::shared_ptr<CaptureModel> capture = std::make_shared<CaptureModel>();
+    Json sockets, units;
     std::wstring selectedDistro;
-    std::optional<uint32_t> defaultUid;
-    std::wstring statistics;
+    std::vector<std::wstring> distroNames;
+    uint64_t renderedRevision = UINT64_MAX;
+    uint64_t renderedSnapshotTime = 0;
     std::string pendingSelection;
-    std::string newProcess;
     std::string pendingExecutable;
     std::string pendingService;
     // Replies from earlier distro selections or disconnected sessions are ignored.
     unsigned epoch = 1;
     int page = 0;
-    bool active = false, paused = false, pending = false, failed = false;
-    bool forceRefresh = false, refreshAfterPending = false;
-    bool foreground = false, captureSuspended = false;
-    ULONGLONG lastGraphTick = 0;
+    bool active = false, pending = false;
+    bool refreshAfterPending = false;
+    bool foreground = false;
     bool collectConnections = false, collectServices = false;
     bool refreshServiceMetadata = true;
-    ULONGLONG lastRefresh = 0;
-    bool componentMissing = false, cpuPercentOfTotal = true;
+    bool cpuPercentOfTotal = true;
     Table &table()
     {
         return page == 0 ? processes : page == 1 ? connections : services;
@@ -196,7 +148,6 @@ void selectPage(View &view, int page);
 void clearDistro(View &view);
 void updateButtons(View &view);
 void render(View &view, uintptr_t changed = 0);
-void updateSnapshot(View &view, const Json &data);
 std::string connectionKey(const Json &connection);
 
 // Commands shared by toolbar buttons, keyboard shortcuts and context menus.
