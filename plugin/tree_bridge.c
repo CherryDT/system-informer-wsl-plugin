@@ -212,6 +212,9 @@ void WslTreeColumns(WSL_TREE *tree, const WSL_TREE_COLUMN *columns, size_t count
             }
     }
     tree->settingColumns = FALSE;
+    // TreeNew column changes update the headers/layout without invalidating
+    // populated rows. Repaint every cell after visibility or order changes.
+    InvalidateRect(tree->window, NULL, FALSE);
 }
 int WslTreeColumnWidth(WSL_TREE *tree, int id)
 {
