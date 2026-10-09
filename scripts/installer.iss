@@ -257,8 +257,9 @@ begin
   else ProtectionAlready.Caption := 'Not required (KPH disabled)';
   ProtectionDetails.Visible := ProtectionSettingsNeeded;
   if ProtectionSettingsSupported then
-    ProtectionDetails.Caption := 'When using System Informer''s driver module (KPH), not even regular ' +
-      'code signing would be enough, so at the moment this plugin can only function with this option enabled!'
+    ProtectionDetails.Caption := 'System Informer''s driver module (KPH) does not trust this plugin yet. ' +
+      'It uses its own whitelist and not even regular code signing would be enough, so at the moment ' +
+      'this plugin can only function with this option enabled!'
   else ProtectionDetails.Caption := Diagnostic;
   ProtectionWarning.Visible := ProtectionSettingsNeeded;
   PluginPathEdit.Text := PluginSettingsPath;
