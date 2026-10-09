@@ -147,7 +147,7 @@ Json snapshotRequest(const View &v)
     auto enabled = [](PCWSTR name) { return WslHostIntegerSetting(name) != 0; };
     const bool tooltips = enabled(L"EnableTooltipSupport");
     const bool interopFilter =
-        readSetting(L"HideWindowsToWslInterop", 0) || readSetting(L"HideWslToWindowsInterop", 0);
+        readSetting(L"HideWindowsToWslInterop", 1) || readSetting(L"HideWslToWindowsInterop", 1);
     if (needs({ProcessUser}) || tooltips)
         fields.insert("user");
     // Search is intentionally restricted to the data actually collected. The
@@ -198,7 +198,8 @@ bool queueVisibleServices(View &v)
     queue(v,
           {{"op", "services"},
            {"refresh_metadata", metadata},
-           {"include_pids", v.services.isColumnVisible(6) || v.services.sortColumn == 6}},
+           {"include_pids", v.services.isColumnVisible(6) || v.services.sortColumn == 6 ||
+                                WslHostIntegerSetting(L"UseColorServiceProcesses") != 0}},
           ServicesTag);
     return true;
 }
@@ -244,7 +245,7 @@ void layout(View &v)
         ReleaseDC(check, dc);
         return textSize.cx + GetSystemMetricsForDpi(SM_CXMENUCHECK, GetDpiForWindow(check)) + s(6);
     };
-    const int optionWidth = checkWidth(v.page == 1 ? v.listeners : v.tree);
+    const int optionWidth = checkWidth(v.page == 0 ? v.tree : v.page == 1 ? v.listeners : v.inactiveServices);
     const int combo = std::max(s(110), std::min(s(300), width - s(350) - optionWidth - gap));
     place(v.distro, 0, 0, combo, s(300));
     // A dropdown's requested height includes its popup. Measure the collapsed
@@ -257,6 +258,8 @@ void layout(View &v)
     place(v.findHandles, combo + s(202) + 3 * gap, 0, s(118), line);
     place(v.tree, width - checkWidth(v.tree), 0, checkWidth(v.tree), line);
     place(v.listeners, width - checkWidth(v.listeners), 0, checkWidth(v.listeners), line);
+    place(v.inactiveServices, width - checkWidth(v.inactiveServices), 0, checkWidth(v.inactiveServices),
+          line);
     const int footerHeight = s(18);
     const int footerY = height - s(2) - footerHeight;
     place(v.status, s(2), footerY, width - s(4), footerHeight);
@@ -269,6 +272,7 @@ void layout(View &v)
     ShowWindow(v.services.window, content && v.page == 2 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.tree, content && v.page == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.listeners, content && v.page == 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(v.inactiveServices, content && v.page == 2 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.installNotice, content ? SW_HIDE : SW_SHOW);
     ShowWindow(v.installButton, content ? SW_HIDE : SW_SHOW);
     EnableWindow(v.installButton, !v.pending);
@@ -309,6 +313,7 @@ void switchPage(View &v)
     ShowWindow(v.services.window, v.page == 2 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.listeners, v.page == 1 ? SW_SHOW : SW_HIDE);
     ShowWindow(v.tree, v.page == 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(v.inactiveServices, v.page == 2 ? SW_SHOW : SW_HIDE);
     SendMessageW(v.search, EM_SETCUEBANNER, TRUE,
                  reinterpret_cast<LPARAM>(v.page == 0   ? L"Filter name, PID, user or command…"
                                           : v.page == 1 ? L"Find port, address, PID or process…"
@@ -418,6 +423,12 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         v->listeners = control(window, L"BUTTON", L"Listening / bound ports only",
                                BS_AUTOCHECKBOX | WS_TABSTOP, ListenerCheck);
         v->tree = control(window, L"BUTTON", L"Show process tree", BS_AUTOCHECKBOX | WS_TABSTOP, TreeCheck);
+        SendMessageW(v->tree, BM_SETCHECK, readSetting(L"ShowProcessTree", 0) ? BST_CHECKED : BST_UNCHECKED,
+                     0);
+        v->inactiveServices = control(window, L"BUTTON", L"Show inactive services",
+                                      BS_AUTOCHECKBOX | WS_TABSTOP, InactiveServicesCheck);
+        SendMessageW(v->inactiveServices, BM_SETCHECK,
+                     readSetting(L"ShowInactiveServices", 0) ? BST_CHECKED : BST_UNCHECKED, 0);
 
         v->processes.kind = Table::Kind::Processes;
         v->connections.kind = Table::Kind::Network;
@@ -507,9 +518,9 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                             L"Monitoring starts when this tab is selected. Stopped distros are not "
                             L"started intentionally.",
                             SS_LEFT, 0);
-        for (HWND child :
-             {v->distro, v->settings, v->tabs, v->search, v->listeners, v->tree, v->processes.window,
-              v->connections.window, v->services.window, v->exportButton, v->installButton, v->findHandles})
+        for (HWND child : {v->distro, v->settings, v->tabs, v->search, v->listeners, v->tree,
+                           v->processes.window, v->connections.window, v->services.window, v->exportButton,
+                           v->installButton, v->findHandles, v->inactiveServices})
             SetWindowSubclass(child, childKeys, 1, reinterpret_cast<DWORD_PTR>(v));
         v->tooltips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
                                       WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -622,8 +633,14 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             showSettings(window, v->selectedDistro);
             break;
         case TreeCheck:
+            writeSetting(L"ShowProcessTree", SendMessageW(v->tree, BM_GETCHECK, 0, 0) == BST_CHECKED);
             render(*v);
             v->processes.centerSelection();
+            break;
+        case InactiveServicesCheck:
+            writeSetting(L"ShowInactiveServices",
+                         SendMessageW(v->inactiveServices, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            render(*v, ServicesTag);
             break;
         case ListenerCheck:
             render(*v);
@@ -645,6 +662,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         if (reinterpret_cast<HWND>(lparam) == v->processes.window)
         {
             SendMessageW(v->tree, BM_SETCHECK, BST_UNCHECKED, 0);
+            writeSetting(L"ShowProcessTree", 0);
             render(*v);
         }
         return 0;
@@ -663,7 +681,10 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         if (hdr->hwndFrom == v->processes.window && hdr->code == TableSortChanged)
         {
             if (!WslHostIntegerSetting(L"SortChildProcesses"))
+            {
                 SendMessageW(v->tree, BM_SETCHECK, BST_UNCHECKED, 0);
+                writeSetting(L"ShowProcessTree", 0);
+            }
             render(*v, SnapshotTag);
             return 0;
         }

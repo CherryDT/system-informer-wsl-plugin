@@ -934,6 +934,8 @@ void Table::rowColors(int index, COLORREF &background, COLORREF &foreground) con
         const bool stopped = active == "inactive" || active == "failed";
         const auto unitState = item.value("enabled", std::string{});
         apply(stopped && (unitState == "disabled" || unitState.find("masked") == 0), L"ColorServiceDisabled");
+        apply(active == "active" && item.value("sub", "") == "running" && item.value("pid", 0) > 0,
+              L"ColorServiceProcesses");
         if (!semantic && stopped && WslHostIntegerSetting(L"UseColorServiceStop"))
             foreground = WslHostIntegerSetting(L"ColorServiceStop");
     }
@@ -989,8 +991,7 @@ HFONT Table::rowFont(int index) const
     if (index < 0 || static_cast<size_t>(index) >= rows.size())
         return normal;
     const auto &data = rows[index].data;
-    const bool bold = (kind == Kind::Modules && data.value("main_module", false)) ||
-                      (kind == Kind::Services && data.value("active", std::string{}) == "active");
+    const bool bold = kind == Kind::Modules && data.value("main_module", false);
     if (!bold)
         return normal;
     if (boldSourceFont != normal)

@@ -185,7 +185,7 @@ void contextMenu(SearchWindow &state, LPARAM position)
     const Row *row = state.table.selectedActionable();
     const auto path = row ? text(row->data, "path") : L"";
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING | (row ? 0 : MF_GRAYED), OpenProcess, L"Properties");
+    AppendMenuW(menu, MF_STRING | (row ? 0 : MF_GRAYED), OpenProcess, L"Process properties");
     SetMenuDefaultItem(menu, OpenProcess, FALSE);
     AppendMenuW(menu,
                 MF_STRING |

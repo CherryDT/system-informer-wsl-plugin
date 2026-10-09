@@ -1088,7 +1088,7 @@ void captureRuntimeStacks(Inspector &state)
     }
     // The runtime hint only controls presentation. The helper revalidates the
     // executable and process identity before choosing a diagnostic tool.
-    bool useInspector = state.runtime == "node" && readSetting(L"UseNodeInspectorWithoutAsking", 0) != 0;
+    bool useInspector = state.runtime == "node" && readSetting(L"UseNodeInspectorWithoutAsking", 1) != 0;
     if (useInspector)
     {
         request["backend"] = "inspector";

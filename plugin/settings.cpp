@@ -258,15 +258,15 @@ INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         SendDlgItemMessageW(window, IDC_WSL_CPU_MODE, CB_SETCURSEL,
                             readSetting(L"CpuPercentOfTotal", 1) ? 1 : 0, 0);
         CheckDlgButton(window, IDC_WSL_NODE_INSPECTOR,
-                       readSetting(L"UseNodeInspectorWithoutAsking", 0) ? BST_CHECKED : BST_UNCHECKED);
+                       readSetting(L"UseNodeInspectorWithoutAsking", 1) ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(window, IDC_WSL_DETECT_32BIT,
                        readSetting(L"Detect32BitProcesses", 0) ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(window, IDC_WSL_BACKGROUND_CAPTURE,
                        readSetting(L"EnableBackgroundCapture", 1) ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(window, IDC_WSL_HIDE_WINDOWS_TO_WSL,
-                       readSetting(L"HideWindowsToWslInterop", 0) ? BST_CHECKED : BST_UNCHECKED);
+                       readSetting(L"HideWindowsToWslInterop", 1) ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(window, IDC_WSL_HIDE_WSL_TO_WINDOWS,
-                       readSetting(L"HideWslToWindowsInterop", 0) ? BST_CHECKED : BST_UNCHECKED);
+                       readSetting(L"HideWslToWindowsInterop", 1) ? BST_CHECKED : BST_UNCHECKED);
         SendDlgItemMessageW(window, IDC_WSL_PREFIX, EM_SETLIMITTEXT, 32760, 0);
         try
         {

@@ -114,8 +114,8 @@ void render(View &v, uintptr_t changed)
         const double cpuThreshold = std::pow(10.0, -precision);
         const bool ownOnly = WslHostIntegerSetting(L"HideOtherUserProcesses") != 0;
         const bool hideSystem = WslHostIntegerSetting(L"HideMicrosoftProcesses") != 0;
-        const bool hideWindowsToWsl = readSetting(L"HideWindowsToWslInterop", 0) != 0;
-        const bool hideWslToWindows = readSetting(L"HideWslToWindowsInterop", 0) != 0;
+        const bool hideWindowsToWsl = readSetting(L"HideWindowsToWslInterop", 1) != 0;
+        const bool hideWslToWindows = readSetting(L"HideWslToWindowsInterop", 1) != 0;
         v.processes.setAncestryOrder(tree, tree && (WslHostIntegerSetting(L"SortChildProcesses") ||
                                                     WslHostIntegerSetting(L"SortRootProcesses")));
         auto cpuText = [&](double value) -> std::wstring {
@@ -312,8 +312,13 @@ void render(View &v, uintptr_t changed)
                     s.value("name", "")};
             rows.push_back(std::move(row));
         }
+        const bool showInactive = SendMessageW(v.inactiveServices, BM_GETCHECK, 0, 0) == BST_CHECKED;
         v.services.replace(
-            std::move(rows), [query](const Row &row) { return matches(row, query); },
+            std::move(rows),
+            [query, showInactive](const Row &row) {
+                // Failed units remain visible: failure is distinct from an inactive unit.
+                return (showInactive || row.data.value("active", "") != "inactive") && matches(row, query);
+            },
             v.units.value("available", true) && !v.units.value("services_truncated", false));
     }
     updateButtons(v);

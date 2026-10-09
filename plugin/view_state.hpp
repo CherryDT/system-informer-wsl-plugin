@@ -29,6 +29,7 @@ enum Id
     ExportButton,
     InstallButton,
     FindHandlesButton,
+    InactiveServicesCheck,
     Inspect = 200,
     CopyRow,
     CopyCommand,
@@ -91,7 +92,8 @@ struct GraphSample
 struct View
 {
     HWND window{}, distro{}, settings{}, search{}, tabs{}, listeners{}, tree{}, exportButton{}, status{},
-        graph{}, memoryGraph{}, installNotice{}, installButton{}, tooltips{}, findHandles{};
+        graph{}, memoryGraph{}, installNotice{}, installButton{}, tooltips{}, findHandles{},
+        inactiveServices{};
     Table processes, connections, services;
     std::shared_ptr<Mailbox> mailbox = std::make_shared<Mailbox>();
     Json snapshot, sockets, units;
