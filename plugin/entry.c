@@ -375,7 +375,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     if (!plugin)
         return FALSE;
     information->DisplayName = L"WSL Tools";
-    information->Author = L"David Trapp";
+    information->Author = L"David Trapp / Trapp Innovations";
     information->Description = L"Processes, connections, open files, modules and systemd services for WSL 2.";
     information->HasOptions = TRUE;
 

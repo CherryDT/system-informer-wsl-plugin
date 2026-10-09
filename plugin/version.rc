@@ -11,11 +11,11 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName", "David Trapp\0"
+            VALUE "CompanyName", "David Trapp / Trapp Innovations\0"
             VALUE "FileDescription", "WSL Tools for System Informer\0"
             VALUE "FileVersion", "0.1.0\0"
             VALUE "InternalName", "WslTools\0"
-            VALUE "LegalCopyright", "Copyright (c) 2026 David Trapp. MIT License.\0"
+            VALUE "LegalCopyright", "Copyright (c) 2026 David Trapp / Trapp Innovations. MIT License.\0"
             VALUE "OriginalFilename", "WslTools.dll\0"
             VALUE "ProductName", "WSL Tools\0"
             VALUE "ProductVersion", "0.1.0\0"

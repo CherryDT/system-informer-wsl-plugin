@@ -1,6 +1,6 @@
 # WSL Tools for System Informer
 
-A native System Informer plugin for inspecting and controlling WSL 2 from a dedicated **WSL** tab. Written in C++ with a small C SDK bridge and a self-contained Linux observer. MIT licensed to David Trapp.
+A native System Informer plugin for inspecting and controlling WSL 2 from a dedicated **WSL** tab. Written in C++ with a small C SDK bridge and a self-contained Linux observer. MIT licensed to David Trapp / Trapp Innovations.
 
 ## What it does
 
@@ -200,4 +200,4 @@ See [architecture](docs/architecture.md) and the [wire protocol](docs/protocol.m
 
 ## Licensing
 
-Original project code: [MIT, David Trapp](LICENSE). The vendored JSON library is nlohmann/json 3.11.3 under its [MIT license](vendor/json.LICENSE.MIT). System Informer's SDK is fetched separately and retains its upstream license. See [third-party notices](THIRD_PARTY_NOTICES.md).
+Original project code: [MIT, David Trapp / Trapp Innovations](LICENSE). The vendored JSON library is nlohmann/json 3.11.3 under its [MIT license](vendor/json.LICENSE.MIT). System Informer's SDK is fetched separately and retains its upstream license. See [third-party notices](THIRD_PARTY_NOTICES.md).
