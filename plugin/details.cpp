@@ -114,7 +114,7 @@ struct Inspector
     bool overviewLayoutActive = false;
     std::vector<OverviewField> overviewFields;
     Json overviewData;
-    HWND refresh = nullptr, copy = nullptr, copyAll = nullptr, save = nullptr, copySave = nullptr;
+    HWND refresh = nullptr, copySave = nullptr;
     HWND filterLabel = nullptr, filter = nullptr, clearFilter = nullptr;
     HWND pageOptions = nullptr, targetOptions = nullptr, closeButton = nullptr;
     std::set<int> enabledOptions;
@@ -948,14 +948,14 @@ void layout(Inspector &state)
 {
     RECT rect{};
     GetClientRect(state.window, &rect);
-    const int pageMargin = scale(state.window, state.isService ? 12 : 6);
-    const int toolbarMargin = scale(state.window, state.isService ? 4 : 6);
-    const int toolbarGap = scale(state.window, state.isService ? 4 : 6);
+    const int pageMargin = scale(state.window, 6);
+    const int toolbarMargin = scale(state.window, 6);
+    const int toolbarGap = scale(state.window, 6);
     const int buttonHeight = scale(state.window, 21);
     int width = rect.right - rect.left;
     int height = rect.bottom - rect.top;
     const int footerY = height - toolbarMargin - buttonHeight;
-    int buttonsY = state.isService ? toolbarMargin : footerY;
+    const int buttonsY = footerY;
     int x = toolbarMargin;
     HDC dc = GetDC(state.window);
     HGDIOBJ previousFont = SelectObject(dc, state.uiFont ? state.uiFont : font);
@@ -968,23 +968,14 @@ void layout(Inspector &state)
         place(handle, x, buttonsY, buttonWidth, buttonHeight);
         x += buttonWidth + toolbarGap;
     };
-    if (!state.isService)
-        button(state.targetOptions);
+    button(state.targetOptions);
     button(state.refresh);
-    if (state.isService)
-    {
-        button(state.copy);
-        button(state.copyAll);
-        button(state.save);
-        place(state.targetOptions, toolbarMargin, footerY, scale(state.window, 80), buttonHeight);
-    }
-    else
-        button(state.copySave);
+    button(state.copySave);
     SelectObject(dc, previousFont);
     ReleaseDC(state.window, dc);
     place(state.closeButton, width - toolbarMargin - scale(state.window, 80), footerY,
           scale(state.window, 80), buttonHeight);
-    const int contentY = state.isService ? toolbarMargin + buttonHeight + toolbarGap : scale(state.window, 7);
+    const int contentY = scale(state.window, 7);
     RECT body{pageMargin, contentY, width - pageMargin, footerY - toolbarGap};
     // The tab frame never moves when changing pages. Search and status belong
     // inside that frame, like native Threads/Modules/Handles property pages.
@@ -2465,8 +2456,8 @@ void createTooltips(Inspector &state)
     if (!state.tooltips)
         return;
     SendMessageW(state.tooltips, TTM_SETMAXTIPWIDTH, 0, scale(state.window, 380));
-    for (HWND child : {state.refresh, state.copy, state.copyAll, state.save, state.copySave,
-                       state.captureStack, state.clearFilter, state.filter, state.status})
+    for (HWND child :
+         {state.refresh, state.copySave, state.captureStack, state.clearFilter, state.filter, state.status})
     {
         if (!child)
             continue;
@@ -2529,15 +2520,7 @@ void createControls(Inspector &state)
         }
     }
     state.refresh = control(window, WC_BUTTONW, L"&Refresh", BS_PUSHBUTTON | WS_TABSTOP, Refresh);
-    if (state.isService)
-    {
-        state.copy =
-            control(window, WC_BUTTONW, L"&Copy selection", BS_PUSHBUTTON | WS_TABSTOP, CopySelection);
-        state.copyAll = control(window, WC_BUTTONW, L"Copy &all", BS_PUSHBUTTON | WS_TABSTOP, CopyAll);
-        state.save = control(window, WC_BUTTONW, L"&Save…", BS_PUSHBUTTON | WS_TABSTOP, Save);
-    }
-    else
-        state.copySave = control(window, WC_BUTTONW, L"Copy/&Save", BS_PUSHBUTTON | WS_TABSTOP, CopySaveMenu);
+    state.copySave = control(window, WC_BUTTONW, L"Copy/&Save", BS_PUSHBUTTON | WS_TABSTOP, CopySaveMenu);
     state.captureStack =
         control(window, WC_BUTTONW, L"Capture all &stacks…", BS_PUSHBUTTON | WS_TABSTOP, CaptureStack);
     state.targetOptions = control(window, WC_BUTTONW, L"&Options", BS_PUSHBUTTON | WS_TABSTOP, TargetOptions);
