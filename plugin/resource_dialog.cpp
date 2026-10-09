@@ -66,13 +66,16 @@ std::wstring editText(const std::wstring &value)
     return result;
 }
 
-LRESULT CALLBACK pageMessages(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
-                              UINT_PTR, DWORD_PTR owner)
+LRESULT CALLBACK pageMessages(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR,
+                              DWORD_PTR owner)
 {
     switch (message)
     {
-    case WM_COMMAND: case WM_NOTIFY: case WM_CONTEXTMENU:
-    case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT:
+    case WM_COMMAND:
+    case WM_NOTIFY:
+    case WM_CONTEXTMENU:
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
         return SendMessageW(reinterpret_cast<HWND>(owner), message, wparam, lparam);
     case WM_NCDESTROY:
         RemoveWindowSubclass(window, pageMessages, 2);
@@ -371,9 +374,9 @@ void copyResult(ToolWindow &state)
 {
     if (TabCtrl_GetCurSel(state.tabs) == 0)
     {
-        if (const Row *row = state.properties.selected())
+        if (state.properties.selected())
         {
-            copyText(state.window, row->cells[0] + L"\t" + row->cells[1]);
+            copyText(state.window, state.properties.selectedText());
             return;
         }
         copyText(state.window, state.properties.exportText());
@@ -476,7 +479,8 @@ LRESULT CALLBACK toolProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                              WS_TABSTOP | BS_PUSHBUTTON, Run);
         state->copy = control(window, WC_BUTTONW, L"Copy", WS_TABSTOP | BS_PUSHBUTTON, Copy);
         state->save = control(window, WC_BUTTONW, L"Save...", WS_TABSTOP | BS_PUSHBUTTON, Save);
-        state->tabs = control(window, WC_TABCONTROLW, L"", WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, Tabs);
+        state->tabs =
+            control(window, WC_TABCONTROLW, L"", WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, Tabs);
         SetWindowLongPtrW(state->tabs, GWL_EXSTYLE, WS_EX_CONTROLPARENT);
         SetWindowSubclass(state->tabs, pageMessages, 2, reinterpret_cast<DWORD_PTR>(window));
         for (const wchar_t *name : {L"Properties", L"Details"})
@@ -562,10 +566,10 @@ LRESULT CALLBACK toolProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             if (point.x == -1 && point.y == -1)
             {
-                const int selected = ListView_GetNextItem(state->properties.window, -1, LVNI_SELECTED);
+                const int selected = state->properties.selectedIndex();
                 RECT row{};
                 if (selected >= 0)
-                    ListView_GetItemRect(state->properties.window, selected, &row, LVIR_BOUNDS);
+                    state->properties.rowRect(selected, row);
                 point = {row.left + scale(window, 12), row.bottom};
                 ClientToScreen(state->properties.window, &point);
             }
@@ -610,14 +614,6 @@ LRESULT CALLBACK toolProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         const auto hdr = reinterpret_cast<NMHDR *>(lParam);
         if (hdr->hwndFrom == state->tabs && hdr->code == TCN_SELCHANGE)
             layout(*state);
-        if (hdr->hwndFrom == state->properties.window)
-        {
-            if (hdr->code == NM_CUSTOMDRAW)
-                return state->properties.customDraw(reinterpret_cast<NMLVCUSTOMDRAW *>(hdr));
-            if (hdr->code == LVN_ODFINDITEMW)
-                return state->properties.findItem(*reinterpret_cast<NMLVFINDITEMW *>(hdr));
-            state->properties.notify(hdr);
-        }
         return 0;
     }
     case ReplyMessage: {

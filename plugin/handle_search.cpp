@@ -164,14 +164,7 @@ void command(SearchWindow &state, int id)
     }
     else if (id == Copy && selected)
     {
-        std::wstring line;
-        for (const auto &cell : selected->cells)
-        {
-            if (!line.empty())
-                line += L'\t';
-            line += cell;
-        }
-        copyText(state.window, line);
+        copyText(state.window, state.table.selectedText());
     }
     else if (id == CopyAll)
         copyText(state.window, state.table.exportText());
@@ -182,8 +175,8 @@ void contextMenu(SearchWindow &state, LPARAM position)
     if (point.x == -1 && point.y == -1)
     {
         RECT item{};
-        const int index = ListView_GetNextItem(state.table.window, -1, LVNI_SELECTED);
-        if (index >= 0 && ListView_GetItemRect(state.table.window, index, &item, LVIR_BOUNDS))
+        const int index = state.table.selectedIndex();
+        if (index >= 0 && state.table.rowRect(index, item))
             point = {item.left + scale(state.window, 24), item.bottom};
         else
             point = {scale(state.window, 24), scale(state.window, 24)};
@@ -205,8 +198,7 @@ void contextMenu(SearchWindow &state, LPARAM position)
     AppendMenuW(menu, MF_STRING, CopyAll, L"Copy all");
     const HWND owner = state.window;
     const auto identity = reinterpret_cast<LONG_PTR>(&state);
-    const int id =
-        TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, owner, nullptr);
+    const int id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, owner, nullptr);
     DestroyMenu(menu);
     if (id && IsWindow(owner) && GetWindowLongPtrW(owner, GWLP_USERDATA) == identity)
         command(state, id);
@@ -225,6 +217,27 @@ LRESULT CALLBACK queryProc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
         return 0;
     if (message == WM_NCDESTROY)
         RemoveWindowSubclass(window, queryProc, id);
+    return DefSubclassProc(window, message, wparam, lparam);
+}
+LRESULT CALLBACK resultsProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR id,
+                             DWORD_PTR context)
+{
+    if (message == WM_KEYDOWN)
+    {
+        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (wparam == VK_RETURN || wparam == VK_ESCAPE || (ctrl && wparam == 'C'))
+        {
+            int commandId = Copy;
+            if (wparam == VK_RETURN)
+                commandId = OpenProcess;
+            else if (wparam == VK_ESCAPE)
+                commandId = Close;
+            PostMessageW(reinterpret_cast<HWND>(context), WM_COMMAND, commandId, 0);
+            return 0;
+        }
+    }
+    if (message == WM_NCDESTROY)
+        RemoveWindowSubclass(window, resultsProc, id);
     return DefSubclassProc(window, message, wparam, lparam);
 }
 void applyFonts(SearchWindow &state)
@@ -275,6 +288,7 @@ LRESULT CALLBACK searchProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
                              {L"Handle / address", 135},
                              {L"Name", 480}},
                             0);
+        SetWindowSubclass(state->table.window, resultsProc, 1, reinterpret_cast<DWORD_PTR>(window));
         SetWindowLongPtrW(state->table.window, GWL_STYLE,
                           GetWindowLongPtrW(state->table.window, GWL_STYLE) | WS_BORDER);
         applyFonts(*state);
@@ -324,23 +338,8 @@ LRESULT CALLBACK searchProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         auto *header = reinterpret_cast<NMHDR *>(lparam);
         if (header->hwndFrom != state->table.window)
             break;
-        if (header->code == NM_CUSTOMDRAW)
-            return state->table.customDraw(reinterpret_cast<NMLVCUSTOMDRAW *>(header));
-        if (header->code == LVN_ODFINDITEMW)
-            return state->table.findItem(*reinterpret_cast<NMLVFINDITEMW *>(header));
-        state->table.notify(header);
-        if (header->code == NM_DBLCLK)
+        if (header->code == TableDoubleClick)
             command(*state, OpenProcess);
-        if (header->code == LVN_KEYDOWN)
-        {
-            const auto key = reinterpret_cast<NMLVKEYDOWN *>(header)->wVKey;
-            if (key == VK_RETURN)
-                command(*state, OpenProcess);
-            else if (key == 'C' && (GetKeyState(VK_CONTROL) & 0x8000))
-                command(*state, Copy);
-            else if (key == VK_ESCAPE)
-                command(*state, Close);
-        }
         return 0;
     }
     case ReplyMessage: {

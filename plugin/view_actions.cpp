@@ -37,16 +37,18 @@ void goToProcess(View &v, const Json &process)
     SetWindowTextW(v.search, L"");
     selectPage(v, 0);
     v.processes.selectKey(v.pendingSelection);
-    int index = ListView_GetNextItem(v.processes.window, -1, LVNI_SELECTED);
+    int index = v.processes.selectedIndex();
     if (index >= 0)
     {
-        ListView_EnsureVisible(v.processes.window, index, FALSE);
+        v.processes.ensureVisible(index);
         v.pendingSelection.clear();
     }
     SetFocus(v.processes.window);
 }
 void action(View &v, int id)
 {
+    if (id != CopyRow && v.table().selectedIndices().size() != 1)
+        return;
     if (v.page == 0 && v.table().selectedActionable() &&
         openProcessScheduling(v.window, v.selectedDistro, v.table().selectedActionable()->data, id))
         return;
@@ -77,14 +79,7 @@ void action(View &v, int id)
     }
     if (id == CopyRow)
     {
-        std::wstring result;
-        for (auto &c : row.cells)
-        {
-            if (!result.empty())
-                result += L"\t";
-            result += c;
-        }
-        copyText(v.window, result);
+        copyText(v.window, v.table().selectedText());
         return;
     }
     if (id == CopyCommand)
@@ -233,12 +228,11 @@ void menu(View &v, POINT point)
     HMENU popup = CreatePopupMenu();
     AppendMenuW(popup, MF_STRING, Inspect, v.page == 1 ? L"Go to process\tEnter" : L"Inspect…\tEnter");
     SetMenuDefaultItem(popup, Inspect, FALSE);
-    AppendMenuW(popup, MF_STRING, CopyRow, L"Copy row\tCtrl+C");
+    AppendMenuW(popup, MF_STRING, CopyRow, L"Copy\tCtrl+C");
     if (v.page == 0)
     {
         AppendMenuW(popup, MF_STRING, CopyCommand, L"Copy command line");
         AppendMenuW(popup, MF_STRING, OpenExecutable, L"Show executable in Explorer");
-        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
         appendProcessSchedulingMenu(popup, v.table().selectedActionable() != nullptr, v.selectedDistro,
                                     v.table().selected()->data);
         AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);

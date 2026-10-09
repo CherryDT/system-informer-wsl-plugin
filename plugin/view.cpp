@@ -660,31 +660,21 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             switchPage(*v);
             return 0;
         }
-        if (hdr->hwndFrom == v->processes.window && hdr->code == LVN_COLUMNCLICK &&
-            !WslHostIntegerSetting(L"SortChildProcesses"))
-            SendMessageW(v->tree, BM_SETCHECK, BST_UNCHECKED, 0);
-        for (auto table : {&v->processes, &v->connections, &v->services})
+        if (hdr->hwndFrom == v->processes.window && hdr->code == TableSortChanged)
         {
-            if (hdr->hwndFrom == table->window && hdr->code == NM_CUSTOMDRAW)
-                return table->customDraw(reinterpret_cast<NMLVCUSTOMDRAW *>(hdr));
-            if (hdr->hwndFrom == table->window && hdr->code == LVN_ODFINDITEMW)
-                return table->findItem(*reinterpret_cast<NMLVFINDITEMW *>(hdr));
-            if (table->notify(hdr))
-            {
-                if (hdr->hwndFrom == v->processes.window && hdr->code == LVN_COLUMNCLICK &&
-                    SendMessageW(v->tree, BM_GETCHECK, 0, 0) == BST_CHECKED)
-                    render(*v);
-                return 0;
-            }
+            if (!WslHostIntegerSetting(L"SortChildProcesses"))
+                SendMessageW(v->tree, BM_SETCHECK, BST_UNCHECKED, 0);
+            render(*v, SnapshotTag);
+            return 0;
         }
         if (hdr->hwndFrom == v->table().window)
         {
-            if (hdr->code == NM_DBLCLK)
+            if (hdr->code == TableDoubleClick)
             {
                 inspect(*v);
                 return 0;
             }
-            if (hdr->code == LVN_ITEMCHANGED)
+            if (hdr->code == TableSelectionChanged)
             {
                 updateButtons(*v);
                 return 0;
@@ -841,15 +831,14 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                         return row.key == v->newProcess && !row.removed;
                     });
                     if (added != rows.end())
-                        ListView_EnsureVisible(v->processes.window, static_cast<int>(added - rows.begin()),
-                                               FALSE);
+                        v->processes.ensureVisible(static_cast<int>(added - rows.begin()));
                 }
                 if (v->page == 0 && !v->pendingSelection.empty())
                 {
                     v->processes.selectKey(v->pendingSelection);
-                    int index = ListView_GetNextItem(v->processes.window, -1, LVNI_SELECTED);
+                    int index = v->processes.selectedIndex();
                     if (index >= 0)
-                        ListView_EnsureVisible(v->processes.window, index, FALSE);
+                        v->processes.ensureVisible(index);
                     else
                         status(*v, L"The socket owner has exited. Refresh the connections view.");
                     v->pendingSelection.clear();

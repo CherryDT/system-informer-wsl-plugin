@@ -2,7 +2,7 @@
 
 ## Host bridge
 
-`plugin/entry.c` is the only file that includes the System Informer SDK. It registers the WSL tab, forwards tab visibility and shutdown, and provides font/theme access. It also adapts System Informer global refresh and highlighting settings and opens its Options dialog at the WSL category. Keep this layer small: export ordinals and the handful of structures it uses are the compatibility boundary with System Informer. The remaining Windows code uses ordinary Win32 APIs and C++17.
+`plugin/entry.c` and the small `plugin/tree_bridge.c` adapter include the System Informer SDK. It registers the WSL tab, forwards tab visibility and shutdown, and provides font/theme access. It also adapts System Informer global refresh and highlighting settings and opens its Options dialog at the WSL category. Keep this layer small: export ordinals and the handful of structures it uses are the compatibility boundary with System Informer. The TreeNew adapter keeps SDK node/column/callback structures out of C++ and uses the host’s registered control and public messages. The remaining Windows code uses ordinary Win32 APIs and C++17.
 
 ## Windows side
 
@@ -10,6 +10,8 @@
 - `view_state.hpp`: private view state and reply tags.
 - `view_model.cpp`: process identities, CPU/I/O deltas, ancestry and filtering.
 - `view_actions.cpp`: process/service actions and contextual menus.
+- `resource_dialog.cpp`: asynchronous resource properties, hex/string/ELF output, and scheduling input dialogs.
+- `process_rules.cpp`: saved scheduling preferences by distribution/executable, and once-per-observed-identity action tracking.
 - `details.cpp`: independently owned, asynchronous process/service inspectors.
 - `common.cpp`: virtual list controls, semantic row colors, exports, clipboard and shared UI helpers.
 - `graphs.cpp`: CPU and VM-memory sample history, drawing, moving time grid, and hover details.
@@ -20,9 +22,9 @@
 
 The UI never performs a WSL request synchronously. A worker owns all connections and executes requests in order. Replies are posted through mailboxes. A mailbox mutex makes window teardown and posting mutually exclusive; destruction detaches then drains pending replies. Main-view reply tags include an epoch so responses to an old distro selection cannot overwrite the current view. Shutdown cancels the active connection before joining the worker.
 
-A virtual list view owns lightweight rows and renders text on demand. Selection is restored by resource identity rather than row index after refresh/sort. Process identity is the distro/connection context plus Linux PID and start ticks; a change of VM boot ID resets CPU sampling state.
+The shared `Table` owns lightweight rows and supplies text/colors/fonts/tooltips to the host TreeNew control on demand. Its C adapter owns native node storage; C++ retains filtering, exact numeric sorting, lifecycle highlights and persisted column identities. Native fixed columns, headers and PhScrollNew scrollbars replace the previous ListView painting and scroll corrections. Selection is restored by resource identity rather than row index after refresh/sort. Process identity is the distro/connection context plus Linux PID and start ticks; a change of VM boot ID resets CPU sampling state.
 
-Automatic refresh and its interval come from System Informer's main View settings; the WSL view does not maintain a separate pause or interval. F5/View→Refresh requests a fresh discovery and snapshot even when automatic updates are off. Hiding the WSL tab disconnects its collector. The view's Settings button opens System Informer Options at the WSL category.
+Automatic refresh and its interval come from System Informer's main View settings; the WSL view does not maintain a separate pause or interval. F5/View→Refresh requests a fresh discovery and snapshot even when automatic updates are off. Hiding the WSL tab keeps lightweight capture running by default; with background capture disabled, it cancels work and disconnects its collector. The view's Settings button opens System Informer Options at the WSL category.
 
 The WSL Options page stores CPU mode and `UseNodeInspectorWithoutAsking`; its distro picker contains all registered WSL 2 distros, including stopped ones. Path translation recognizes `/mnt/<letter>` only at a path-component boundary and maps it directly to the corresponding Windows drive before checking a per-distro prefix. Thus `/mnt/c` maps to `C:\`, `/mnt/c/Users` to `C:\Users`, while `/mnt/cfoo` uses the normal Linux-path prefix.
 

@@ -664,9 +664,14 @@ BOOL CALLBACK styleInspectorControl(HWND window, LPARAM)
 {
     wchar_t name[32]{};
     GetClassNameW(window, name, static_cast<int>(std::size(name)));
-    if (GetDlgCtrlID(window) != Filter &&
-        (lstrcmpiW(name, WC_EDITW) == 0 || lstrcmpiW(name, WC_LISTVIEWW) == 0))
+    if (GetDlgCtrlID(window) != Filter && lstrcmpiW(name, WC_EDITW) == 0)
         styleControlBorder(window);
+    else if (lstrcmpiW(name, L"PhTreeNew") == 0)
+    {
+        SetWindowLongPtrW(window, GWL_STYLE, GetWindowLongPtrW(window, GWL_STYLE) | WS_BORDER);
+        SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
     return TRUE;
 }
 
@@ -1014,8 +1019,8 @@ void layout(Inspector &state)
         int rowHeight = std::max(buttonHeight, fieldHeight);
         place(state.pageOptions, body.left, body.top + (rowHeight - buttonHeight) / 2,
               scale(state.window, 75), buttonHeight);
-        const int searchWidth =
-            std::min(scale(state.window, 260), static_cast<int>(body.right - body.left) - scale(state.window, 90));
+        const int searchWidth = std::min(scale(state.window, 260),
+                                         static_cast<int>(body.right - body.left) - scale(state.window, 90));
         place(state.filter, body.right - searchWidth, body.top + (rowHeight - fieldHeight) / 2, searchWidth,
               fieldHeight);
         body.top += rowHeight + scale(state.window, 4);
@@ -1214,23 +1219,7 @@ std::wstring selectionText(Inspector &state)
 {
     if (auto *table = activeTable(state))
     {
-        std::wstring result;
-        // Preserve the visible order, including the user's chosen sort order.
-        for (int item = ListView_GetNextItem(table->window, -1, LVNI_SELECTED); item >= 0;
-             item = ListView_GetNextItem(table->window, item, LVNI_SELECTED))
-        {
-            if (static_cast<size_t>(item) >= table->rows.size())
-                continue;
-            if (!result.empty())
-                result += L"\r\n";
-            const auto &cells = table->rows[item].cells;
-            for (size_t column = 0; column < cells.size(); ++column)
-            {
-                if (column)
-                    result += L"\t";
-                result += cells[column];
-            }
-        }
+        const auto result = table->selectedText();
         return result.empty() ? allText(state) : result;
     }
     HWND edit = state.page == 0 ? state.lastOverviewEdit : activeTextControl(state);
@@ -1680,7 +1669,10 @@ void command(Inspector &state, int id)
 {
     const HWND owner = state.window;
     const auto identity = reinterpret_cast<LONG_PTR>(&state);
-    try { commandImpl(state, id); }
+    try
+    {
+        commandImpl(state, id);
+    }
     catch (const std::exception &error)
     {
         if (IsWindow(owner) && GetWindowLongPtrW(owner, GWLP_USERDATA) == identity)
@@ -1696,9 +1688,9 @@ void contextMenu(Inspector &state, HWND source, LPARAM position)
     POINT point{static_cast<short>(LOWORD(position)), static_cast<short>(HIWORD(position))};
     if (point.x == -1 && point.y == -1)
     {
-        int selected = ListView_GetNextItem(table->window, -1, LVNI_SELECTED);
+        int selected = table->selectedIndex();
         RECT row{};
-        if (selected >= 0 && ListView_GetItemRect(table->window, selected, &row, LVIR_BOUNDS))
+        if (selected >= 0 && table->rowRect(selected, row))
             point = {row.left + scale(state.window, 30), row.bottom};
         else
             point = {scale(state.window, 20), scale(state.window, 40)};
@@ -2473,22 +2465,14 @@ void migrateModuleLayout(Table &table, HWND owner)
     {
         order[i] = static_cast<int>(i);
         if (i >= 3)
-            ListView_SetColumnWidth(table.window, static_cast<int>(i), scale(owner, table.columns[i].width));
+            table.setColumnWidth(static_cast<int>(i), scale(owner, table.columns[i].width));
     }
-    ListView_SetColumnOrderArray(table.window, static_cast<int>(order.size()), order.data());
+    table.setColumnOrder(order);
     if (table.sortColumn >= 3)
     {
         table.sortColumn = -1;
         table.descending = false;
-        HWND header = ListView_GetHeader(table.window);
-        for (size_t i = 0; i < table.columns.size(); ++i)
-        {
-            HDITEMW item{};
-            item.mask = HDI_FORMAT;
-            Header_GetItem(header, static_cast<int>(i), &item);
-            item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
-            Header_SetItem(header, static_cast<int>(i), &item);
-        }
+        table.setSortIndicator();
     }
     try
     {
@@ -2743,14 +2727,9 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
         {
             if (hdr->hwndFrom != table.window)
                 continue;
-            if (hdr->code == NM_CUSTOMDRAW)
-                return table.customDraw(reinterpret_cast<NMLVCUSTOMDRAW *>(hdr));
-            if (hdr->code == LVN_ODFINDITEMW)
-                return table.findItem(*reinterpret_cast<NMLVFINDITEMW *>(hdr));
-            table.notify(hdr);
-            if (hdr->code == NM_DBLCLK && state->page != ConnectionsPage)
+            if (hdr->code == TableDoubleClick && state->page != ConnectionsPage)
                 command(*state, state->page == MemoryPage ? ReadMemory : ResourceProperties);
-            if (hdr->code == LVN_ITEMCHANGED)
+            if (hdr->code == TableSelectionChanged)
                 updateActions(*state);
             break;
         }

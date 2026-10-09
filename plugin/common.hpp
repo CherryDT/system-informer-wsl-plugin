@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include "../vendor/json.hpp"
+#include "tree_bridge.h"
 #include <atomic>
 #include <commctrl.h>
 #include <functional>
@@ -30,6 +31,9 @@ extern HFONT font;
 constexpr UINT ReplyMessage = WM_APP + 51;
 constexpr UINT ColumnsChangedMessage = WM_APP + 83;
 constexpr UINT SortResetMessage = WM_APP + 84;
+constexpr UINT TableSelectionChanged = NM_FIRST - 400;
+constexpr UINT TableSortChanged = NM_FIRST - 401;
+constexpr UINT TableDoubleClick = NM_FIRST - 402;
 struct Reply
 {
     Json data;
@@ -115,22 +119,21 @@ class Table
     std::vector<int> visibleColumns() const;
     void centerSelection();
     void showHeaderMenu(POINT point);
-    void trackHover(POINT point);
-    void clearHover();
     void invalidateRows(int first, int last) const;
-    void trackHeaderHover(POINT point, HWND header);
-    void clearHeaderHover();
-    LRESULT drawHeader(NMCUSTOMDRAW *draw) const;
-    // The fixed column uses a separate native header, as TreeNew does. Rows
-    // still belong to one ListView, so selection and keyboard navigation stay native.
-    HWND fixedHeader = nullptr;
-    HWND cellTooltip = nullptr;
-    void updateColumnGeometry();
-    LRESULT fixedHeaderNotify(NMHDR *notification);
-    void updateCellTooltip(POINT point);
-    void provideCellTooltip(NMTTDISPINFOW *tip);
-    void drawFixedDivider(HDC dc) const;
     void releaseDrawingResources();
+    int selectedIndex() const;
+    std::vector<int> selectedIndices() const;
+    void ensureVisible(int index);
+    bool rowRect(int index, RECT &rect) const;
+    int columnWidth(int column) const;
+    void setColumnWidth(int column, int width);
+    void setColumnOrder(const std::vector<int> &order);
+    void setSortIndicator();
+    void resetSort();
+    // Called only by the SDK adapter and the window's lifecycle subclass.
+    void treeEvent(int event, int value, int extra, POINT point);
+    void applyFont();
+    void detachTree();
     void setAncestryOrder(bool enabled, bool showSort = false);
     // Always pass the complete snapshot. Filtering must not look like removal.
     // The predicate is retained for expiry redraws; capture local values by value.
@@ -140,37 +143,33 @@ class Table
     void expireHighlights();
     void sort(int column);
     void sortRows(std::vector<Row> &items) const;
-    bool notify(NMHDR *hdr);
-    int findItem(const NMLVFINDITEMW &request) const;
-    LRESULT customDraw(NMLVCUSTOMDRAW *draw) const;
+
     const Row *selected() const;
     const Row *selectedActionable() const;
     void selectKey(const std::string &key);
+    std::wstring selectedText() const;
     std::wstring exportText() const;
 
   private:
     std::wstring settingsPrefix;
     bool ancestryOrder = false;
     bool ancestrySortIndicator = false;
-    int hotRow = -1;
-    int hotHeaderColumn = -1;
     int defaultSortColumn = -1;
     bool defaultSortDescending = false;
     std::vector<int> hiddenWidths;
+    std::vector<int> columnOrder;
     mutable HFONT boldFont = nullptr;
     mutable HFONT boldSourceFont = nullptr;
-    struct VisibleColumn
-    {
-        int index;
-        RECT bounds;
-    };
-    std::vector<VisibleColumn> drawingColumns;
-    int fixedColumn = -1;
-    int fixedWidth = 0;
-    bool updatingGeometry = false;
-    int tooltipRow = -1;
-    int tooltipColumn = -1;
+    WSL_TREE *tree = nullptr;
     std::wstring tooltipText;
+    bool presenting = false;
+    int headerMenuColumn = -1;
+    void applyColumns();
+    void captureColumnOrder();
+    void sendNotification(UINT code);
+    void rowColors(int index, COLORREF &background, COLORREF &foreground) const;
+    HFONT rowFont(int index) const;
+    int findItem(int start, PCWSTR prefix, size_t length) const;
     bool initialized = false;
     std::vector<Row> source;
     std::function<bool(const Row &)> filter;
