@@ -934,6 +934,7 @@ LRESULT CALLBACK toolProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         EnableWindow(state->save, FALSE);
         WslApplyTheme(window);
         applyFonts(*state);
+        SetWindowSubclass(window, shortcuts, 9, reinterpret_cast<DWORD_PTR>(window));
         EnumChildWindows(window, installShortcuts, reinterpret_cast<LPARAM>(window));
         layout(*state);
         updateInputs(*state);

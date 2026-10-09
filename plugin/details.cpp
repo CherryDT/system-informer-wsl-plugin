@@ -2651,6 +2651,9 @@ void createControls(Inspector &state)
     EnumChildWindows(window, installShortcuts, reinterpret_cast<LPARAM>(window));
     WslApplyTheme(window);
     SetWindowSubclass(window, inspectorColorsProc, 3, 0);
+    // The frame can own focus after clicking its background or dismissing a
+    // popup. It needs the same Escape/shortcut handling as its child controls.
+    SetWindowSubclass(window, shortcutProc, 1, reinterpret_cast<DWORD_PTR>(window));
     EnumChildWindows(window, styleInspectorControl, 0);
     if (state.filter)
         WslCreateSearch(state.pageWindow, state.filter, L"Search this view (Ctrl+K)", filterChanged, &state);
