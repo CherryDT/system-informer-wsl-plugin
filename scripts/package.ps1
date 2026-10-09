@@ -28,6 +28,7 @@ try {
                         'setup-files.ps1', 'setup-worker.ps1')) {
         Copy-PackageFile "$Root/scripts/$File" $File
     }
+    Copy-PackageFile "$Root/docs/images/wsl-tools.png" 'docs/images/wsl-tools.png'
     Copy-PackageFile "$Root/vendor/json.LICENSE.MIT" 'licenses/nlohmann-json.LICENSE.MIT'
     Copy-PackageFile "$Root/vendor/json.LICENSE.MIT" 'vendor/json.LICENSE.MIT'
     Copy-PackageFile "$Root/.deps/sdk/LICENSE.txt" 'licenses/SystemInformer.LICENSE.txt'

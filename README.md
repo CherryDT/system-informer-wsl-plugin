@@ -2,6 +2,8 @@
 
 A native System Informer plugin for inspecting and controlling WSL 2 from a dedicated **WSL** tab. Written in C++ with small C adapters for the System Informer SDK and a self-contained Linux observer.
 
+![WSL Tools process list, Threads tab, and thread properties](docs/images/wsl-tools.png)
+
 ## What it does
 
 - **Processes:** sortable current and average CPU, resident memory, storage I/O rates, user, state, threads, parent PID and command line; optional Linux scheduling, identity, memory and I/O columns; process tree; CPU history; live filtering.
