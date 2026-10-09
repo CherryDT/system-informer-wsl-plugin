@@ -948,9 +948,9 @@ void layout(Inspector &state)
 {
     RECT rect{};
     GetClientRect(state.window, &rect);
-    const int pageMargin = scale(state.window, 12);
-    const int toolbarMargin = scale(state.window, 4);
-    const int toolbarGap = scale(state.window, 4);
+    const int pageMargin = scale(state.window, state.isService ? 12 : 6);
+    const int toolbarMargin = scale(state.window, state.isService ? 4 : 6);
+    const int toolbarGap = scale(state.window, state.isService ? 4 : 6);
     const int buttonHeight = scale(state.window, 21);
     int width = rect.right - rect.left;
     int height = rect.bottom - rect.top;
@@ -984,7 +984,7 @@ void layout(Inspector &state)
     ReleaseDC(state.window, dc);
     place(state.closeButton, width - toolbarMargin - scale(state.window, 80), footerY,
           scale(state.window, 80), buttonHeight);
-    const int contentY = state.isService ? toolbarMargin + buttonHeight + toolbarGap : toolbarMargin;
+    const int contentY = state.isService ? toolbarMargin + buttonHeight + toolbarGap : scale(state.window, 7);
     RECT body{pageMargin, contentY, width - pageMargin, footerY - toolbarGap};
     // The tab frame never moves when changing pages. Search and status belong
     // inside that frame, like native Threads/Modules/Handles property pages.
