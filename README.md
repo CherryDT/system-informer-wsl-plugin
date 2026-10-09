@@ -50,6 +50,8 @@ The SDK is pinned to System Informer revision `bfc8145f2744a415319ccaaa8f1e32dd2
 
 ## Using the views
 
+_Note: The descriptions below are very detailed. They were AI-generated and should explain every feature in enough detail to understand even subtle details in the behavior and implementation if needed._
+
 The inner views are **Processes · Services · Network**. The top strip holds the distro picker, **Settings**, **Export view**, **Find handles**, and the active view's option (**Show process tree**, **Show inactive services**, or **Listening / bound ports only**). Search uses the normal System Informer toolbar when available; otherwise a local filter appears in the view. The Settings button opens System Informer **Options → WSL**, where you can change CPU display mode, background capture, optional 32-bit detection, the Node Inspector preference, the two interop-plumbing filters, and a distro's Explorer prefix. Select a row and press Enter, double-click it, or use its context menu to inspect or act on it; there is no separate bottom Inspect/Actions row.
 
 Process inspector tabs are **General · Threads · Modules · Memory · Environment · Handles · Network · Stacks**, then a runtime-specific **JS Stacks**, **Python Stacks**, or **Java Stacks** tab when the executable is recognized, followed by **Details**. Service inspectors have **General · Journal · Details**. Grid pages place the integrated search field beside **Options**; match-case, regular-expression and clear controls use System Informer's search behavior. The current filter is applied to the grid, and follows you when changing grid pages. The Options menu above a grid holds page-specific filters and commands; the bottom Options menu acts on the inspected process or service.
