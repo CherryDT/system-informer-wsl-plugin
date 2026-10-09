@@ -229,11 +229,22 @@ begin
     Result := Result + NewLine + NewLine + 'Enable third-party plugins in System Informer.';
 end;
 
-procedure ReportWorkerFailure(Action: String);
+function RunSetupPhase(Mode, Phase, Target, SettingsPath: String): Boolean;
+var Silent: Boolean;
 begin
-  SuppressibleMsgBox(Action + ' did not finish.' + #13#10#13#10 + WorkDiagnostics +
-    '' + #13#10#13#10 + 'Completed changes have been kept. Run setup or uninstall again to retry.',
-    mbError, MB_OK, IDOK);
+  Result := False;
+  if IsUninstaller then Silent := UninstallSilent else Silent := WizardSilent;
+  repeat
+    if RunSetupWorker(Mode, Phase, Target, SettingsPath) then begin
+      Result := True;
+      exit;
+    end;
+    { Retry only the failed phase. Earlier work and the user's choices remain
+      intact. An explicit cancellation or unattended run must not prompt again. }
+    if (WorkResult = 2) or Silent then exit;
+  until SuppressibleMsgBox(Trim(WorkDiagnostics) + #13#10#13#10 +
+    'Correct the problem, then click Retry to continue. Cancel stops setup; completed changes are kept.',
+    mbError, MB_RETRYCANCEL, IDCANCEL) <> IDRETRY;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -241,12 +252,11 @@ begin
   if CurStep = ssPostInstall then begin
     { Inno has committed its repair payload and uninstall record. External
       updates cannot be rolled back, so retain both if any phase fails. }
-    InstallFailed := not RunSetupWorker('Install', 'Windows', TargetDirectory, '');
+    InstallFailed := not RunSetupPhase('Install', 'Windows', TargetDirectory, '');
     if not InstallFailed and PluginPage.Values[0] then
-      InstallFailed := not RunSetupWorker('Install', 'PluginSettings', TargetDirectory, PluginSettingsPath);
+      InstallFailed := not RunSetupPhase('Install', 'PluginSettings', TargetDirectory, PluginSettingsPath);
     if not InstallFailed and CompanionBox.Checked then
-      InstallFailed := not RunSetupWorker('Install', 'Companions', TargetDirectory, '');
-    if InstallFailed then ReportWorkerFailure('Installation');
+      InstallFailed := not RunSetupPhase('Install', 'Companions', TargetDirectory, '');
   end;
 end;
 
@@ -324,12 +334,10 @@ begin
     Companions := ConfirmCompanionRemoval;
     { Abort before Inno removes its own files/registration on failure. This
       allows a failed or cancelled companion removal to be retried. }
-    if not RunSetupWorker('Uninstall', 'Windows', TargetDirectory, '') then begin
-      ReportWorkerFailure('Uninstall');
+    if not RunSetupPhase('Uninstall', 'Windows', TargetDirectory, '') then begin
       Abort;
     end;
-    if Companions and not RunSetupWorker('Uninstall', 'Companions', TargetDirectory, '') then begin
-      ReportWorkerFailure('Companion removal');
+    if Companions and not RunSetupPhase('Uninstall', 'Companions', TargetDirectory, '') then begin
       Abort;
     end;
   end;
