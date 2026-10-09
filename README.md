@@ -25,6 +25,9 @@ The observer runs as **Linux root by default**. Windows administrator privileges
 
 ## Install
 
+> [!TIP]
+> **TL;DR:** Close System Informer, run `WslTools-0.1.0-setup-x64.exe`, and accept the offered loading options. Its driver doesn’t trust this plugin yet, hence **Allow untrusted plugins**. Both options can optionally be reset during uninstallation.
+
 To install or update, close System Informer and run **`WslTools-0.1.0-setup-x64.exe`**. The installer detects the System Informer folder and lets you browse to another location. Its companion checkbox starts checked and applies to all registered WSL 2 distributions, including stopped ones. Stopped distros are temporarily started for companion installation, then stopped again; already-running distros stay running.
 
 The installer registers WSL Tools in Windows **Installed apps** for your Windows user. It keeps its support files and uninstaller under `%LOCALAPPDATA%\Programs\WslTools` and copies the plugin into the selected System Informer folder. Run setup as your normal Windows user: only the isolated Windows file-copy helper requests administrator permission when the target folder needs it. WSL operations remain in the original Windows user's context and run as Linux root. System Informer's executable and saved WSL Tools settings are preserved.
