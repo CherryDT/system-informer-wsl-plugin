@@ -23,7 +23,7 @@ function Copy-PackageFile([string] $Source, [string] $Relative) {
 }
 try {
     foreach ($File in @('WslTools.dll', 'WslTools.pdb', 'wsl-observer')) { Copy-PackageFile "$Dist/$File" $File }
-    foreach ($File in @('README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) { Copy-PackageFile "$Root/$File" $File }
+    foreach ($File in @('README.md', 'CHANGELOG.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) { Copy-PackageFile "$Root/$File" $File }
     foreach ($File in @('install.ps1', 'uninstall.ps1', 'setup-common.ps1',
                         'setup-files.ps1', 'setup-worker.ps1', 'setup-settings.ps1')) {
         Copy-PackageFile "$Root/scripts/$File" $File
@@ -47,7 +47,7 @@ try {
         Set-Content "$Package/SHA256SUMS.txt" -Encoding ascii
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::CreateFromDirectory($Package, $TemporaryArchive)
-    $Archive = Join-Path $Dist 'WslTools-0.1.0-windows-x64.zip'
+    $Archive = Join-Path $Dist 'WslTools-0.1.1-windows-x64.zip'
     [IO.File]::Copy($TemporaryArchive, $Archive, $true)
     Write-Host "Packaged $Archive"
     if (-not $SkipInstaller) {

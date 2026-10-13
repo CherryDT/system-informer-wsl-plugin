@@ -35,6 +35,11 @@ public:
         "The WSL component is not installed in this distribution. Choose Install and retry to install it.") {}
 };
 
+class DistroStopped : public std::runtime_error {
+public:
+    DistroStopped() : std::runtime_error("This WSL2 distribution is no longer running.") {}
+};
+
 class Client {
 public:
     Client(std::wstring distro, std::wstring helperPath);
@@ -43,7 +48,7 @@ public:
     Client& operator=(const Client&) = delete;
 
     // Call from one worker thread. Failed clients are terminal: create a new
-    // client only after the user explicitly reconnects or discovery sees it again.
+    // client for a coordinator retry, explicit reconnect, or rediscovered distro.
     Json request(const Json& payload,
         std::chrono::milliseconds timeout = std::chrono::seconds(20));
 

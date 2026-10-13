@@ -160,6 +160,11 @@ void run()
                                                                : client->request(job.request, timeout);
             }
         }
+        catch (const DistroStopped &error)
+        {
+            reply->distroStopped = true;
+            reply->error = error.what();
+        }
         catch (const ComponentMissing &error)
         {
             reply->componentMissing = true;
@@ -169,8 +174,8 @@ void run()
         {
             reply->error = error.what();
             // A valid remote error leaves the connection usable. A transport
-            // failure leaves Client terminal until an explicit disconnect;
-            // neither case should silently launch a replacement root helper.
+            // failure leaves Client terminal until the capture coordinator or
+            // user requests a reconnect. Never replay the failed operation here.
         }
         {
             std::lock_guard<std::mutex> lock(queueMutex);

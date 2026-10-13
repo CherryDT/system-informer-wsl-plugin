@@ -14,7 +14,7 @@ replaced with U+FFFD when serializing a response. Stdout is protocol-only.
 
 ```json
 {"id":1,"op":"hello"}
-{"id":1,"ok":true,"data":{"protocol":1,"uid":0,"cpus":16,"clock_ticks":100,"boot_id":"…","systemd":true,"helper_version":"0.1.0"}}
+{"id":1,"ok":true,"data":{"protocol":1,"uid":0,"cpus":16,"clock_ticks":100,"boot_id":"…","systemd":true,"helper_version":"0.1.1"}}
 {"id":2,"op":"details","pid":123,"start_ticks":4567}
 {"id":2,"ok":false,"error":"Process exited or its /proc entry is inaccessible"}
 ```

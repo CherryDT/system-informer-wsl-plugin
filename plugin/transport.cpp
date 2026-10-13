@@ -154,7 +154,7 @@ struct Process {
         drainErrors();
         if (cancellation && WaitForSingleObject(cancellation, 0) == WAIT_OBJECT_0)
             throw std::runtime_error("WSL operation cancelled.");
-        if (Clock::now() >= deadline) throw failure("WSL operation timed out. Reconnect the distribution to retry.");
+        if (Clock::now() >= deadline) throw failure("WSL operation timed out.");
     }
 
     void write(const char* bytes, std::size_t length, HANDLE cancellation, Clock::time_point deadline) {
@@ -209,7 +209,7 @@ struct Process {
                 continue;
             }
             if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0)
-                throw failure("The WSL helper exited. Reconnect the distribution to retry.");
+                throw failure("The WSL helper exited.");
             if (cancellation) WaitForSingleObject(cancellation, 10);
             else Sleep(10);
         }
@@ -571,7 +571,7 @@ struct Client::Impl {
             throw std::runtime_error("WSL connection cancelled.");
         if (std::none_of(running.begin(), running.end(), [&](const Distro& item) {
             return CompareStringOrdinal(item.name.c_str(), -1, distro.c_str(), -1, TRUE) == CSTR_EQUAL;
-        })) throw std::runtime_error("This WSL2 distribution is no longer running.");
+        })) throw DistroStopped();
         const auto helper = readHelper(helperPath);
         const auto digest = sha256(helper);
         const auto deadline = Clock::now() + std::chrono::seconds(30);
@@ -616,7 +616,7 @@ Json Client::installComponent() {
 
 Json Client::request(const Json& payload, std::chrono::milliseconds timeout) {
     if (impl_->componentMissing) throw ComponentMissing();
-    if (impl_->failed) throw std::runtime_error("The WSL connection is closed. Reconnect to try again.");
+    if (impl_->failed) throw std::runtime_error("The WSL connection is closed.");
     if (!payload.is_object() || !payload.contains("op") || !payload["op"].is_string())
         throw std::invalid_argument("A WSL request must contain a string op field.");
     if (!impl_->process) {

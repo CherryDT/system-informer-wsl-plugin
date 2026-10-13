@@ -16,6 +16,7 @@ namespace
 constexpr wchar_t CaptureClass[] = L"WslTools.Capture";
 constexpr UINT SettingsMessage = WM_APP + 94;
 constexpr DWORD DiscoveryInterval = 15000;
+constexpr ULONGLONG RetryDelay = 5000;
 
 struct Distribution
 {
@@ -85,6 +86,17 @@ void reconcilePolicy(Coordinator &c)
     for (auto &[name, entry] : c.distributions)
     {
         auto &model = *entry.model;
+        if (model.failed && model.pending && (!automatic || !eligible(c, name)))
+        {
+            // A retry cancelled by capture policy is not another failed
+            // attempt. Ignore its eventual reply and preserve the retry budget.
+            cancelSnapshot(c, entry);
+            if (model.retryAttempts)
+                --model.retryAttempts;
+            model.retryAt = now + RetryDelay;
+            disconnect(name);
+            change(c, model);
+        }
         const bool suspended =
             !model.running || model.failed || model.componentMissing || !eligible(c, name) || !automatic;
         if (suspended != model.suspended)
@@ -101,8 +113,7 @@ void reconcilePolicy(Coordinator &c)
             {
                 resetCaptureBaseline(model);
                 entry.lastRequest = 0;
-                // A transport failure still needs explicit Refresh. Pausing
-                // capture must not create an automatic restart loop.
+                // The retry deadline/count are independent of pause state.
             }
             change(c, model);
         }
@@ -158,8 +169,16 @@ void tick(Coordinator &c)
     for (auto &[name, entry] : c.distributions)
     {
         const auto &model = *entry.model;
-        if (!model.running || !eligible(c, name) || model.pending || model.failed || model.componentMissing)
+        if (!model.running || !eligible(c, name) || model.pending || model.componentMissing)
             continue;
+        if (model.failed)
+        {
+            // Failure is latched while waiting and reconnecting. UI activation
+            // and metadata changes cannot bypass the delay or retry limit.
+            if (c.automatic && model.retryAt && now >= model.retryAt)
+                due.emplace_back(name, &entry);
+            continue;
+        }
         if (entry.force || (c.automatic && (!entry.lastRequest || now - entry.lastRequest >= interval)))
             due.emplace_back(name, &entry);
     }
@@ -176,10 +195,21 @@ void tick(Coordinator &c)
         if (c.requests.size() >= MaximumPendingSnapshots)
             break;
         auto &entry = *item;
+        auto &model = *entry.model;
+        if (model.failed)
+        {
+            model.retryAt = 0;
+            ++model.retryAttempts;
+            // Fresh clients verify that the distro is running before launching
+            // a helper. Only monitoring snapshots are retried, never actions.
+            disconnect(name);
+        }
         entry.force = false;
         entry.lastRequest = now;
         entry.pendingTag = c.nextTag++;
         entry.model->pending = true;
+        if (model.failed)
+            change(c, model);
         auto request = requestFor(c, name);
         request["_automatic_capture"] = c.automatic;
         c.requests.emplace(entry.pendingTag, PendingSnapshot{name, c.automatic});
@@ -202,6 +232,8 @@ void discovered(Coordinator &c, const Json &data, bool manual)
         if (!seen.count(name) && entry.model->running)
         {
             entry.model->running = false;
+            entry.model->retryAt = 0;
+            entry.model->retryAttempts = 0;
             cancelSnapshot(c, entry);
             entry.model->error = L"This distribution is no longer running.";
             change(c, *entry.model);
@@ -217,6 +249,8 @@ void discovered(Coordinator &c, const Json &data, bool manual)
             entry.model->failed = false;
             entry.model->componentMissing = false;
             entry.model->error.clear();
+            entry.model->retryAt = 0;
+            entry.model->retryAttempts = 0;
             entry.model->defaultUid = distroDefaultUid(name);
             resetCaptureBaseline(*entry.model);
             entry.lastRequest = 0;
@@ -288,6 +322,13 @@ LRESULT CALLBACK captureProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             model.failed = true;
             model.componentMissing = reply->componentMissing;
             model.error = wide(reply->error);
+            if (reply->distroStopped)
+            {
+                model.running = false;
+                model.retryAttempts = 0;
+                c->running.erase(std::remove(c->running.begin(), c->running.end(), request.distro),
+                                 c->running.end());
+            }
             resetCaptureBaseline(model);
         }
         else
@@ -298,6 +339,7 @@ LRESULT CALLBACK captureProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                                       std::max(1ul, WslHostIntegerSetting(L"SampleCount")));
                 model.error.clear();
                 model.failed = model.componentMissing = false;
+                model.retryAttempts = 0;
             }
             catch (const std::exception &error)
             {
@@ -306,6 +348,10 @@ LRESULT CALLBACK captureProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 resetCaptureBaseline(model);
             }
         }
+        model.retryAt = model.failed && model.running && !model.componentMissing &&
+                                model.retryAttempts < MaximumCaptureRetries
+                            ? GetTickCount64() + RetryDelay
+                            : 0;
         change(*c, model);
         tick(*c);
         return 0;
@@ -435,6 +481,8 @@ void refreshCapture(const std::wstring &distro, bool reconnect)
         disconnect(distro);
         entry.model->failed = entry.model->componentMissing = false;
         entry.model->error.clear();
+        entry.model->retryAt = 0;
+        entry.model->retryAttempts = 0;
         resetCaptureBaseline(*entry.model);
         change(c, *entry.model);
     }
@@ -461,6 +509,8 @@ void refreshCaptures(bool reconnect)
             disconnect(name);
             entry.model->failed = entry.model->componentMissing = false;
             entry.model->error.clear();
+            entry.model->retryAt = 0;
+            entry.model->retryAttempts = 0;
             resetCaptureBaseline(*entry.model);
             change(c, *entry.model);
         }

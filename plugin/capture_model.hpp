@@ -8,6 +8,8 @@
 
 namespace wsl
 {
+constexpr unsigned MaximumCaptureRetries = 10;
+
 struct ProcessSample
 {
     uint64_t ticks = 0, read = 0, written = 0;
@@ -64,6 +66,8 @@ struct CaptureModel
     ULONGLONG lastGraphTick = 0;
     bool running = true, pending = false, failed = false, componentMissing = false, suspended = false;
     std::wstring error;
+    unsigned retryAttempts = 0;
+    ULONGLONG retryAt = 0;
     uint64_t revision = 0;
 };
 

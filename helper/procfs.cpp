@@ -589,7 +589,7 @@ Json hello() {
             {"cpus", sysconf(_SC_NPROCESSORS_ONLN)}, {"clock_ticks", sysconf(_SC_CLK_TCK)},
             {"systemd", access("/run/systemd/system", F_OK) == 0},
             {"gdb", access("/usr/bin/gdb", X_OK) == 0 || access("/bin/gdb", X_OK) == 0},
-            {"helper_version", "0.1.0"}};
+            {"helper_version", "0.1.1"}};
 }
 Json snapshot(const Json& request) {
     Json processes = Json::array();

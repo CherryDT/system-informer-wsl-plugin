@@ -39,7 +39,7 @@ try {
     $CompilerArguments = @("/DPackageDir=$PackageDirectory", "/O$Stage", $Script)
     & $InnoCompiler @CompilerArguments
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed (exit code $LASTEXITCODE)." }
-    $InstallerName = 'WslTools-0.1.0-setup-x64.exe'
+    $InstallerName = 'WslTools-0.1.1-setup-x64.exe'
     $Installer = Join-Path $Stage $InstallerName
     if (-not [IO.File]::Exists($Installer)) { throw "Inno Setup did not produce $InstallerName." }
     [IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null

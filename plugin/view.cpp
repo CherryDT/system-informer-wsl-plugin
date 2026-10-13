@@ -246,7 +246,29 @@ void updateStatus(View &v)
     }
     if (v.capture->failed)
     {
-        status(v, L"Disconnected: " + v.capture->error + L" · Use View > Refresh (F5) to reconnect.");
+        std::wstring recovery;
+        if (v.capture->retryAt || v.capture->pending)
+        {
+            if (!WslHostRefreshAutomatically())
+                recovery = L"Automatic retry paused. Use View > Refresh (F5) to reconnect.";
+            else if (v.capture->pending)
+                recovery = L"Reconnecting (attempt " + std::to_wstring(v.capture->retryAttempts) + L"/" +
+                           std::to_wstring(MaximumCaptureRetries) + L")…";
+            else
+            {
+                const auto now = GetTickCount64();
+                const auto seconds = v.capture->retryAt > now ? (v.capture->retryAt - now + 999) / 1000 : 0;
+                recovery = L"Retrying in " + std::to_wstring(seconds) + L" s (attempt " +
+                           std::to_wstring(v.capture->retryAttempts + 1) + L"/" +
+                           std::to_wstring(MaximumCaptureRetries) + L").";
+            }
+        }
+        else
+            recovery =
+                v.capture->retryAttempts >= MaximumCaptureRetries
+                    ? L"Automatic reconnect failed after 10 attempts. Use View > Refresh (F5) to retry."
+                    : L"Use View > Refresh (F5) to reconnect.";
+        status(v, L"Disconnected: " + v.capture->error + L" · " + recovery);
         return;
     }
     if (!WslHostRefreshAutomatically())
