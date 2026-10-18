@@ -12,15 +12,19 @@ std::string processKey(const Json &process)
 }
 } // namespace
 
-void updateCaptureSnapshot(CaptureModel &v, const Json &data, bool accumulateCpu, size_t historyCapacity)
+void updateCaptureSnapshot(CaptureModel &v, const Json &data, bool accumulateCpu, size_t historyCapacity,
+                           DWORD minimumInterval)
 {
     uint64_t now = data.value("monotonic_ms", 0ull);
     auto boot = data.value("boot_id", "");
-    if (v.bootId != boot || now <= v.previousTime)
+    const auto latestTime = v.snapshot.is_object() ? v.snapshot.value("monotonic_ms", 0ull) : 0;
+    if (v.bootId != boot || now < latestTime)
     {
-        v.previous.clear();
+        resetCaptureBaseline(v);
+        v.cpu.clear();
+        v.readRate.clear();
+        v.writeRate.clear();
         v.cpuHistory.clear();
-        v.previousTime = 0;
         v.graphSamples.clear();
         v.graphSequence = 0;
         // Process identities are meaningful only within this guest boot.
@@ -28,51 +32,72 @@ void updateCaptureSnapshot(CaptureModel &v, const Json &data, bool accumulateCpu
         v.snapshot = Json();
         v.bootId = boot;
     }
-    // Store raw Linux CPU percentages (100% = one vCPU). The display setting
-    // only scales rendered rows; history always measures total guest capacity.
+    // Focus and metadata requests can arrive between regular samples. Keep the
+    // last meaningful rates and their baseline until a full interval has elapsed;
+    // otherwise a few CPU ticks spent collecting data dominate the tiny window.
+    minimumInterval = std::max<DWORD>(1, minimumInterval);
+    const bool rateSample = v.previousTime && now - v.previousTime >= minimumInterval;
+    const bool replaceBaseline = !v.previousTime || rateSample;
     double elapsed = v.previousTime ? (now - v.previousTime) / 1000.0 : 0;
     double hz = data.value("clock_ticks", 100.0), total = 0;
     GraphSample graph;
     GetSystemTimeAsFileTime(&graph.timestamp);
     graph.interval = elapsed;
     historyCapacity = std::max<size_t>(1, historyCapacity);
-    std::map<std::string, ProcessSample> samples;
+    std::set<std::string> identities;
     v.newProcess.clear();
-    v.cpu.clear();
-    v.readRate.clear();
-    v.writeRate.clear();
     for (const auto &p : data.at("processes"))
     {
         auto key = processKey(p);
-        ProcessSample sample{p.value("cpu_ticks", 0ull), p.value("read_bytes", 0ull),
-                             p.value("write_bytes", 0ull),
-                             p.contains("read_bytes") && p.contains("write_bytes")};
-        double usage = 0, read = 0, written = 0;
+        identities.insert(key);
+        ProcessSample sample{p.value("cpu_ticks", 0ull)};
         auto previous = v.previous.find(key);
-        if (v.previousTime && previous == v.previous.end())
+        if (v.previousTime && previous == v.previous.end() && !v.cpu.count(key))
             v.newProcess = key;
-        if (elapsed > 0 && hz > 0 && previous != v.previous.end())
+        auto &usage = v.cpu[key];
+        if (rateSample && hz > 0 && previous != v.previous.end())
         {
-            auto &old = previous->second;
-            if (sample.ticks >= old.ticks)
+            if (sample.ticks >= previous->second.ticks)
             {
-                usage = 100.0 * (sample.ticks - old.ticks) / hz / elapsed;
-                // A baseline-only reading and manual refreshes while capture is
-                // paused are not CPU history samples. Neither adds a false zero.
+                // Store raw Linux percentages (100% = one vCPU); display scaling
+                // must not change the samples retained for CPU (average).
+                usage = 100.0 * (sample.ticks - previous->second.ticks) / hz / elapsed;
                 if (accumulateCpu)
                     v.cpuHistory[key].append(usage, historyCapacity);
             }
             else
+            {
+                usage = 0;
                 v.cpuHistory.erase(key); // Counter reset: start a fresh history.
-            if (sample.hasIo && old.hasIo && sample.read >= old.read)
-                read = (sample.read - old.read) / elapsed;
-            if (sample.hasIo && old.hasIo && sample.written >= old.written)
-                written = (sample.written - old.written) / elapsed;
+            }
         }
-        samples[key] = sample;
-        v.cpu[key] = usage;
-        v.readRate[key] = read;
-        v.writeRate[key] = written;
+        if (replaceBaseline)
+            v.previous[key] = sample;
+
+        // I/O counters are cumulative. Cheap background snapshots can omit
+        // them without invalidating the last observed counters and timestamp.
+        // Actual capture pauses reset this baseline along with the CPU baseline.
+        if (p.contains("read_bytes") && p.contains("write_bytes"))
+        {
+            IoSample io{p.value("read_bytes", 0ull), p.value("write_bytes", 0ull), now};
+            auto old = v.previousIo.find(key);
+            if (old == v.previousIo.end())
+                v.previousIo[key] = io;
+            else if (now - old->second.time >= minimumInterval)
+            {
+                double seconds = (now - old->second.time) / 1000.0;
+                v.readRate[key] = io.read >= old->second.read ? (io.read - old->second.read) / seconds : 0;
+                v.writeRate[key] =
+                    io.written >= old->second.written ? (io.written - old->second.written) / seconds : 0;
+                old->second = io;
+            }
+        }
+        else if (p.contains("io_accessible") && !p.value("io_accessible", true))
+        {
+            v.previousIo.erase(key);
+            v.readRate.erase(key);
+            v.writeRate.erase(key);
+        }
         total += usage;
         if (usage > graph.topCpu)
         {
@@ -87,14 +112,23 @@ void updateCaptureSnapshot(CaptureModel &v, const Json &data, bool accumulateCpu
             graph.largestRssPid = p.value("pid", 0);
         }
     }
-    // Do not retain histories for exited processes, or transfer one to a reused PID.
-    for (auto it = v.cpuHistory.begin(); it != v.cpuHistory.end();)
-        if (samples.count(it->first))
-            ++it;
-        else
-            it = v.cpuHistory.erase(it);
-    v.previous = std::move(samples);
-    v.previousTime = now;
+    // Prune even on metadata-only refreshes. Exited processes must not retain
+    // samples, and a reused PID must never inherit the prior process's rates.
+    auto prune = [&](auto &values) {
+        for (auto it = values.begin(); it != values.end();)
+            if (identities.count(it->first))
+                ++it;
+            else
+                it = values.erase(it);
+    };
+    prune(v.previous);
+    prune(v.previousIo);
+    prune(v.cpu);
+    prune(v.cpuHistory);
+    prune(v.readRate);
+    prune(v.writeRate);
+    if (replaceBaseline)
+        v.previousTime = now;
     // Cheap background samples omit expensive fields. Retain the last known
     // values only for the same PID/start-time identity; PID reuse never inherits
     // another process's command line, credentials or highlighting metadata.
@@ -143,7 +177,7 @@ void updateCaptureSnapshot(CaptureModel &v, const Json &data, bool accumulateCpu
         }
     }
     double cpus = std::max(1.0, data.value("cpus", 1.0));
-    if (elapsed > 0)
+    if (rateSample)
     {
         v.lastGraphTick = GetTickCount64();
         graph.cpu = total / cpus;
@@ -165,6 +199,7 @@ void updateCaptureSnapshot(CaptureModel &v, const Json &data, bool accumulateCpu
 void resetCaptureBaseline(CaptureModel &model)
 {
     model.previous.clear();
+    model.previousIo.clear();
     model.previousTime = 0;
     model.newProcess.clear();
 }

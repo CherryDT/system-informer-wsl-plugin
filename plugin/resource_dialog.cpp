@@ -207,6 +207,22 @@ bool showingProperties(const ToolWindow &state)
     return state.view == ResourceView::PropertiesOnly || (state.tabs && TabCtrl_GetCurSel(state.tabs) == 0);
 }
 
+// Move focus before disabling a command/input. Otherwise keyboard messages
+// (including Escape) have no recipient until the user clicks again, even when
+// the host processes this modeless window through IsDialogMessage.
+void preserveFocusWhileLoading(ToolWindow &state)
+{
+    const HWND focus = GetFocus();
+    if (!focus || (focus != state.window && !IsChild(state.window, focus)))
+        return;
+    if (focus == state.close || focus == state.details || focus == state.tabs ||
+        focus == state.properties.window ||
+        (state.properties.window && IsChild(state.properties.window, focus)))
+        return;
+    const HWND result = showingProperties(state) ? state.properties.window : state.details;
+    SetFocus(result && IsWindowVisible(result) ? result : state.close);
+}
+
 void setStatus(ToolWindow &state, const std::wstring &value)
 {
     state.statusText = value;
@@ -297,10 +313,13 @@ void layout(ToolWindow &state)
             place(child, content.left, content.top, content.right - content.left,
                   content.bottom - content.top);
     const bool properties = showingProperties(state);
+    const HWND previousFocus = GetFocus();
     if (state.properties.window)
         ShowWindow(state.properties.window, properties ? SW_SHOW : SW_HIDE);
     if (state.details)
         ShowWindow(state.details, properties ? SW_HIDE : SW_SHOW);
+    if (previousFocus && IsChild(state.window, previousFocus) && !IsWindowVisible(previousFocus))
+        SetFocus(properties ? state.properties.window : state.details);
 }
 
 void applyFonts(ToolWindow &state)
@@ -406,6 +425,7 @@ void loadAffinity(ToolWindow &state, const Reply &reply)
 
 void requestAffinity(ToolWindow &state)
 {
+    preserveFocusWhileLoading(state);
     state.loadingAffinity = state.busy = true;
     Json request = state.request;
     request["action"] = "settings";
@@ -498,6 +518,7 @@ void begin(ToolWindow &state)
     state.submittedInputs = request.value("inputs", Json::object());
     state.submittedSaveScheduling = saveSchedulingChoice;
     state.submittedHadSavedScheduling = state.schedulingSaved;
+    preserveFocusWhileLoading(state);
     state.busy = true;
     state.hasResult = state.hasBinary = false;
     state.output.clear();
@@ -743,6 +764,7 @@ void selectModulePage(ToolWindow &state)
         return;
     }
 
+    preserveFocusWhileLoading(state);
     state.hasResult = state.hasBinary = false;
     state.output.clear();
     state.binary.clear();
@@ -838,6 +860,11 @@ LRESULT CALLBACK shortcuts(HWND window, UINT message, WPARAM wParam, LPARAM lPar
                            DWORD_PTR context)
 {
     HWND owner = reinterpret_cast<HWND>(context);
+    // Keep our existing Enter and Tab actions; let the dialog manager route
+    // cancellation and the controls handle their other keys normally.
+    if (message == WM_GETDLGCODE && lParam && reinterpret_cast<const MSG *>(lParam)->message == WM_KEYDOWN &&
+        (wParam == VK_RETURN || wParam == VK_TAB))
+        return DefSubclassProc(window, message, wParam, lParam) | DLGC_WANTMESSAGE;
     if (message == WM_KEYDOWN)
     {
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -1230,6 +1257,7 @@ LRESULT CALLBACK toolProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
+        WslUnregisterDialog(window);
         if (state->mutation && state->busy && !state->loadingAffinity)
         {
             // A syscall already in flight may finish after Cancel closes the
@@ -1281,6 +1309,7 @@ void showTool(HWND owner, std::unique_ptr<ToolWindow> state)
         errorBox(owner, L"Could not create the resource tool window.");
         return;
     }
+    WslRegisterDialog(window);
     WslPositionDialog(window, owner);
     ShowWindow(window, SW_SHOW);
     auto opened = reinterpret_cast<ToolWindow *>(GetWindowLongPtrW(window, GWLP_USERDATA));

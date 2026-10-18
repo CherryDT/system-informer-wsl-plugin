@@ -37,6 +37,9 @@ extern "C"
     void WslOpenHostOptions(HWND owner);
     void WslHostViewSettingsChanged(void);
     void WslPositionDialog(HWND window, HWND owner);
+    /* UI-thread modeless windows participate in the host's IsDialogMessage loop. */
+    void WslRegisterDialog(HWND window);
+    void WslUnregisterDialog(HWND window);
     typedef void(CALLBACK *WSL_SEARCH_CALLBACK)(ULONG_PTR match, void *context);
     void WslCreateSearch(HWND parent, HWND edit, PCWSTR banner, WSL_SEARCH_CALLBACK callback, void *context);
     BOOL WslSearchMatches(ULONG_PTR match, PCWSTR text);

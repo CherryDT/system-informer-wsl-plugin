@@ -55,6 +55,10 @@ void layout(SearchWindow &state)
 }
 void setBusy(SearchWindow &state, bool busy)
 {
+    // Disabling the focused button leaves this modeless window without a
+    // keyboard recipient. Keep Escape and typing usable during transitions.
+    if (GetFocus() == (busy ? state.search : state.cancel))
+        SetFocus(state.query);
     state.busy = busy;
     EnableWindow(state.search, !busy);
     EnableWindow(state.cancel, busy);
@@ -206,8 +210,9 @@ void contextMenu(SearchWindow &state, LPARAM position)
 LRESULT CALLBACK queryProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR id,
                            DWORD_PTR context)
 {
-    if (message == WM_GETDLGCODE)
-        return DLGC_WANTALLKEYS;
+    if (message == WM_GETDLGCODE && lparam && wparam == VK_RETURN &&
+        reinterpret_cast<const MSG *>(lparam)->message == WM_KEYDOWN)
+        return DefSubclassProc(window, message, wparam, lparam) | DLGC_WANTMESSAGE;
     if (message == WM_KEYDOWN && (wparam == VK_RETURN || wparam == VK_ESCAPE))
     {
         PostMessageW(reinterpret_cast<HWND>(context), WM_COMMAND, wparam == VK_RETURN ? Search : IDCANCEL, 0);
@@ -222,6 +227,10 @@ LRESULT CALLBACK queryProc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
 LRESULT CALLBACK resultsProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR id,
                              DWORD_PTR context)
 {
+    // Enter opens the selected process instead of invoking a default button.
+    if (message == WM_GETDLGCODE && lparam && wparam == VK_RETURN &&
+        reinterpret_cast<const MSG *>(lparam)->message == WM_KEYDOWN)
+        return DefSubclassProc(window, message, wparam, lparam) | DLGC_WANTMESSAGE;
     if (message == WM_KEYDOWN)
     {
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -379,6 +388,7 @@ LRESULT CALLBACK searchProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
+        WslUnregisterDialog(window);
         state->mailbox->detach();
         drainReplies(window);
         state->table.saveLayout();
@@ -417,6 +427,7 @@ void openHandleSearch(HWND owner, const std::wstring &distro)
         errorBox(owner, L"Could not create the WSL handle search window.");
         return;
     }
+    WslRegisterDialog(window);
     WslPositionDialog(window, owner);
     ShowWindow(window, SW_SHOW);
     SetFocus(GetDlgItem(window, Query));

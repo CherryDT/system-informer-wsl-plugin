@@ -829,11 +829,17 @@ void layout(Inspector &state);
 
 void updateActions(Inspector &state)
 {
-    EnableWindow(state.refresh, !state.loading);
     bool stackAction = !state.isService && (state.page == StacksPage || isRuntimePage(state.page));
-    ShowWindow(state.captureStack, stackAction ? SW_SHOW : SW_HIDE);
     bool removedThread =
         state.page == 4 && state.tables[3].selected() && !state.tables[3].selectedActionable();
+    const HWND focus = GetFocus();
+    // Keep a keyboard recipient when a command becomes disabled or hidden;
+    // IsDialogMessage still needs a focused window to receive keyboard input.
+    if ((focus == state.refresh && state.loading) ||
+        (focus == state.captureStack && (!stackAction || state.loading || removedThread)))
+        SetFocus(state.tabs);
+    EnableWindow(state.refresh, !state.loading);
+    ShowWindow(state.captureStack, stackAction ? SW_SHOW : SW_HIDE);
     EnableWindow(state.captureStack, !state.loading && !removedThread);
     std::wstring captureLabel = isRuntimePage(state.page)
                                     ? std::wstring(L"Capture ") + runtimeLabel(state.page) + L" &stacks…"
@@ -906,6 +912,7 @@ void ensureConnections(Inspector &state)
 
 void showPage(Inspector &state)
 {
+    const HWND previousFocus = GetFocus();
     ShowWindow(state.overview, state.page == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(state.raw, state.page == RawPage ? SW_SHOW : SW_HIDE);
     if (state.journal)
@@ -926,6 +933,8 @@ void showPage(Inspector &state)
         ShowWindow(state.pageOptions, visibility);
         EnableWindow(state.filter, activeTable(state) != nullptr);
     }
+    if (previousFocus && IsChild(state.window, previousFocus) && !IsWindowVisible(previousFocus))
+        SetFocus(state.tabs);
     ensureConnections(state);
     updateActions(state);
     layout(state);
@@ -2283,6 +2292,11 @@ LRESULT CALLBACK shortcutProc(HWND window, UINT message, WPARAM wParam, LPARAM l
                               DWORD_PTR reference)
 {
     HWND inspector = reinterpret_cast<HWND>(reference);
+    // Preserve grid Enter actions and our Ctrl+Tab/page navigation when the
+    // host processes this modeless window with IsDialogMessage.
+    if (message == WM_GETDLGCODE && lParam && reinterpret_cast<const MSG *>(lParam)->message == WM_KEYDOWN &&
+        (wParam == VK_RETURN || wParam == VK_TAB))
+        return DefSubclassProc(window, message, wParam, lParam) | DLGC_WANTMESSAGE;
     if (message == WM_KEYDOWN)
     {
         int id = 0;
@@ -2423,7 +2437,11 @@ void syncRuntimePages(Inspector &state)
         if (!state.scriptStacksForced && state.runtime != RuntimeNames[i])
         {
             if (pane.window)
+            {
+                if (GetFocus() == pane.window)
+                    SetFocus(state.tabs);
                 DestroyWindow(pane.window);
+            }
             pane = {};
             continue;
         }
@@ -2835,6 +2853,7 @@ LRESULT CALLBACK inspectorProc(HWND window, UINT message, WPARAM wParam, LPARAM 
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
+        WslUnregisterDialog(window);
         if (state->tooltips)
             DestroyWindow(state->tooltips);
         for (auto &table : state->tables)
@@ -2901,6 +2920,7 @@ void openInspector(HWND owner, std::unique_ptr<Inspector> state)
         errorBox(owner, L"Could not create the WSL inspector window.");
         return;
     }
+    WslRegisterDialog(window);
     WslPositionDialog(window, owner);
     ShowWindow(window, SW_SHOW);
     SetFocus(raw->overviewFields.empty() ? raw->tabs : raw->overviewFields.front().value);

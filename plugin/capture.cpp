@@ -22,7 +22,7 @@ struct Distribution
 {
     std::shared_ptr<CaptureModel> model = std::make_shared<CaptureModel>();
     uintptr_t pendingTag = 0;
-    ULONGLONG lastRequest = 0;
+    ULONGLONG lastRequest = 0, lastRateSample = 0;
     bool force = false;
 };
 struct PendingSnapshot
@@ -112,7 +112,7 @@ void reconcilePolicy(Coordinator &c)
             else
             {
                 resetCaptureBaseline(model);
-                entry.lastRequest = 0;
+                entry.lastRequest = entry.lastRateSample = 0;
                 // The retry deadline/count are independent of pause state.
             }
             change(c, model);
@@ -179,7 +179,9 @@ void tick(Coordinator &c)
                 due.emplace_back(name, &entry);
             continue;
         }
-        if (entry.force || (c.automatic && (!entry.lastRequest || now - entry.lastRequest >= interval)))
+        if (entry.force ||
+            (c.automatic && (!entry.lastRateSample || now - entry.lastRateSample >= interval) &&
+             (!entry.lastRequest || now - entry.lastRequest >= std::min<DWORD>(250, interval))))
             due.emplace_back(name, &entry);
     }
     // Leave queue space for interactive commands. Oldest/never sampled distros
@@ -253,7 +255,7 @@ void discovered(Coordinator &c, const Json &data, bool manual)
             entry.model->retryAttempts = 0;
             entry.model->defaultUid = distroDefaultUid(name);
             resetCaptureBaseline(*entry.model);
-            entry.lastRequest = 0;
+            entry.lastRequest = entry.lastRateSample = 0;
             change(c, *entry.model);
         }
     }
@@ -335,8 +337,18 @@ LRESULT CALLBACK captureProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         {
             try
             {
+                const auto previousRateTime = model.previousTime;
                 updateCaptureSnapshot(model, reply->data, request.accumulate,
-                                      std::max(1ul, WslHostIntegerSetting(L"SampleCount")));
+                                      std::max(1ul, WslHostIntegerSetting(L"SampleCount")),
+                                      WslHostRefreshInterval());
+                // Metadata-only refreshes must not postpone the next rate
+                // sample, or repeated focus changes could starve the history.
+                if (model.previousTime != previousRateTime)
+                    entry.lastRateSample = GetTickCount64();
+                // A successful retry has established its fresh baseline. Do
+                // not discard it again when leaving the suspended state.
+                if (c->automatic && model.running && eligible(*c, request.distro))
+                    model.suspended = false;
                 model.error.clear();
                 model.failed = model.componentMissing = false;
                 model.retryAttempts = 0;
@@ -447,7 +459,10 @@ void setCaptureView(HWND window, const std::wstring &distro, bool shown, Json re
         else
             c.forceDiscovery = true;
     }
-    tick(c);
+    // Defer until the current UI event finishes. Activation also requests a
+    // refresh, so both intents become one capture rather than adjacent polls.
+    if (changed)
+        PostMessageW(c.window, SettingsMessage, 0, 0);
 }
 void detachCaptureView(HWND window)
 {

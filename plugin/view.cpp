@@ -358,11 +358,12 @@ void captureChanged(View &v)
         return;
     const bool first = v.renderedRevision == UINT64_MAX;
     v.renderedRevision = v.capture->revision;
-    const bool newSnapshot = v.capture->snapshot.is_object() && v.capture->previousTime > 0 &&
-                             v.renderedSnapshotTime != v.capture->previousTime;
+    const auto snapshotTime =
+        v.capture->snapshot.is_object() ? v.capture->snapshot.value("monotonic_ms", uint64_t{0}) : 0;
+    const bool newSnapshot = snapshotTime > 0 && v.renderedSnapshotTime != snapshotTime;
     const bool renderSnapshot = v.capture->snapshot.is_object() && (first || newSnapshot);
-    v.renderedSnapshotTime = v.capture->previousTime;
-    if (!v.renderedSnapshotTime)
+    v.renderedSnapshotTime = snapshotTime;
+    if (!v.capture->previousTime)
     {
         v.refreshAfterPending = false;
         v.collectServices = false;

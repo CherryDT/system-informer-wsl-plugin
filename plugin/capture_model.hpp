@@ -12,8 +12,11 @@ constexpr unsigned MaximumCaptureRetries = 10;
 
 struct ProcessSample
 {
-    uint64_t ticks = 0, read = 0, written = 0;
-    bool hasIo = false;
+    uint64_t ticks = 0;
+};
+struct IoSample
+{
+    uint64_t read = 0, written = 0, time = 0;
 };
 // Raw per-vCPU percentages, independent of the current display scale. Keeping
 // the sum makes each update constant-time once the history window is full.
@@ -54,10 +57,14 @@ struct CaptureModel
 {
     Json snapshot;
     std::map<std::string, ProcessSample> previous;
+    // I/O counters are optional in background captures, so their baseline must
+    // not borrow the timestamp of a CPU-only snapshot.
+    std::map<std::string, IoSample> previousIo;
     std::map<std::string, double> cpu, readRate, writeRate;
     std::map<std::string, CpuHistory> cpuHistory;
     std::deque<GraphSample> graphSamples;
     uint64_t graphSequence = 0;
+    // Timestamp of the CPU baseline, not the latest metadata snapshot.
     uint64_t previousTime = 0;
     std::string bootId;
     std::optional<uint32_t> defaultUid;
@@ -73,7 +80,8 @@ struct CaptureModel
 
 // Status flags and revision belong to the coordinator; these helpers only
 // maintain sample data, interval baselines and history.
-void updateCaptureSnapshot(CaptureModel &model, const Json &data, bool accumulateCpu, size_t historyCapacity);
+void updateCaptureSnapshot(CaptureModel &model, const Json &data, bool accumulateCpu, size_t historyCapacity,
+                           DWORD minimumInterval);
 void resetCaptureBaseline(CaptureModel &model);
 void suspendCaptureModel(CaptureModel &model, ULONGLONG now);
 void advanceCaptureGap(CaptureModel &model, ULONGLONG now, DWORD interval);

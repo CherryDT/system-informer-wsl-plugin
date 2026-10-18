@@ -74,6 +74,16 @@ BOOL WslHostSetStringSetting(WSL_STRING_SETTING setting, PCWSTR value, SIZE_T le
     return TRUE;
 }
 
+void WslRegisterDialog(HWND window)
+{
+    PhRegisterDialog(window);
+}
+
+void WslUnregisterDialog(HWND window)
+{
+    PhUnregisterDialog(window);
+}
+
 void WslOpenHostOptions(HWND owner)
 {
     UNREFERENCED_PARAMETER(owner);

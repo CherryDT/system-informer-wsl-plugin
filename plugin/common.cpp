@@ -507,6 +507,10 @@ void fillColumnChoices(HWND dialog, ColumnChoices &choices)
     };
     fill(AvailableColumns, choices.available);
     fill(VisibleColumns, choices.visible);
+    const HWND focus = GetFocus();
+    if ((focus == GetDlgItem(dialog, ShowColumn) && choices.available.empty()) ||
+        (focus == GetDlgItem(dialog, HideColumn) && choices.visible.size() <= 1))
+        SetFocus(GetDlgItem(dialog, VisibleColumns));
     EnableWindow(GetDlgItem(dialog, ShowColumn), !choices.available.empty());
     EnableWindow(GetDlgItem(dialog, HideColumn), choices.visible.size() > 1);
 }

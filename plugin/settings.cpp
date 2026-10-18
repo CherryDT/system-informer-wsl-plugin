@@ -307,6 +307,8 @@ bool applyPrefix(HWND window, OptionsState &state)
     try
     {
         setDistroPrefix(state.distros[state.selected], optionText(window, IDC_WSL_PREFIX));
+        if (GetFocus() == GetDlgItem(window, IDC_WSL_APPLY_PREFIX))
+            SetFocus(GetDlgItem(window, IDC_WSL_PREFIX));
         EnableWindow(GetDlgItem(window, IDC_WSL_APPLY_PREFIX), FALSE);
         optionsStatus(window, L"Explorer path prefix saved.");
         return true;

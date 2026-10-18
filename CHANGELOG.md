@@ -7,6 +7,8 @@
 - Move exported symbols, imported symbols, and declared dependencies into tabs in module properties, loaded on demand.
 - Immediately refresh when returning to the WSL tab, unless automatic refresh is disabled.
 - Shorten the README and move detailed usage and build documentation into linked guides.
+- Prevent rapid focus refreshes from replacing meaningful CPU/I/O rates with short-interval readings or distorting CPU averages and graph history.
+- Keep Escape working across plugin dialogs, including during asynchronous loading.
 
 ## 0.1.1 - 2026-10-13
 
