@@ -589,7 +589,7 @@ Json hello() {
             {"cpus", sysconf(_SC_NPROCESSORS_ONLN)}, {"clock_ticks", sysconf(_SC_CLK_TCK)},
             {"systemd", access("/run/systemd/system", F_OK) == 0},
             {"gdb", access("/usr/bin/gdb", X_OK) == 0 || access("/bin/gdb", X_OK) == 0},
-            {"helper_version", "0.1.1"}};
+            {"helper_version", "0.1.2"}};
 }
 Json snapshot(const Json& request) {
     Json processes = Json::array();
@@ -827,7 +827,18 @@ Json process_details(const Json& request) {
     summary += "\nEnvironment colors compare exact values with /etc/environment and the account's USER, LOGNAME, HOME and SHELL. "
         "They describe matching baselines, not a proven inheritance history. Other variables are process-specific.\n";
     summary += "\nHandle inheritance means close-on-exec is not set; Linux descriptors are normally inherited across fork regardless.\n";
-    auto overview = process_json(process_stat(identity.pid), local_user_names());
+    const auto current = process_stat(identity.pid);
+    auto overview = process_json(current, local_user_names());
+    // Resolve the parent only when inspecting, not on every process-list poll.
+    // Keep the PID usable even if the parent exits while these files are read.
+    overview["parent_name"] = "";
+    if (current.ppid > 0) {
+        try {
+            const auto parent = process_stat(current.ppid);
+            if (process_stat(identity.pid).ppid == current.ppid)
+                overview["parent_name"] = parent.name;
+        } catch (const std::exception&) { }
+    }
     const auto status = read_text(proc_path(identity.pid, "status"));
     overview["cwd"] = read_link(proc_path(identity.pid, "cwd"));
     overview["cgroup"] = read_text(proc_path(identity.pid, "cgroup"), 16 * 1024);

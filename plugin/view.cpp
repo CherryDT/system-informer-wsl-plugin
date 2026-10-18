@@ -424,6 +424,20 @@ void manualRefresh(View &v)
     updateCaptureState(v);
     refreshCaptures(true);
 }
+// Activating a view requests current data, but must not override the host's
+// pause setting. An explicit return to a disconnected view can reconnect now.
+void refreshOnActivation(View &v)
+{
+    if (!WslHostRefreshAutomatically())
+        return;
+    v.refreshServiceMetadata = true;
+    v.refreshAfterPending = v.pending;
+    if (v.selectedDistro.empty())
+        refreshCaptures();
+    else
+        refreshCapture(v.selectedDistro, v.capture->failed && !v.capture->componentMissing);
+}
+
 LRESULT CALLBACK childKeys(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR, DWORD_PTR data)
 {
     auto v = reinterpret_cast<View *>(data);
@@ -658,11 +672,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         {
             v->foreground = foreground;
             if (foreground)
-            {
-                v->refreshServiceMetadata = true;
-                v->refreshAfterPending = v->pending;
-                refresh(*v);
-            }
+                refreshOnActivation(*v);
         }
         if (v->cpuPercentOfTotal != (readSetting(L"CpuPercentOfTotal", 1) != 0))
             render(*v);
@@ -963,11 +973,11 @@ extern "C" void WslSetActive(BOOL active)
     auto &v = *mainView;
     v.active = active != FALSE;
     updateCaptureState(v);
+    v.foreground = contentVisible(v);
     if (v.active)
     {
-        v.refreshServiceMetadata = true;
         render(v);
-        refresh(v);
+        refreshOnActivation(v);
     }
 }
 extern "C" void WslShutdown(void)

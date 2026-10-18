@@ -173,8 +173,8 @@ void tick(Coordinator &c)
             continue;
         if (model.failed)
         {
-            // Failure is latched while waiting and reconnecting. UI activation
-            // and metadata changes cannot bypass the delay or retry limit.
+            // Failure is latched while waiting and reconnecting. Ordinary
+            // metadata updates cannot bypass the delay or retry limit.
             if (c.automatic && model.retryAt && now >= model.retryAt)
                 due.emplace_back(name, &entry);
             continue;
@@ -440,7 +440,7 @@ void setCaptureView(HWND window, const std::wstring &distro, bool shown, Json re
     c.visible = shown;
     c.visibleRequest = std::move(request);
     reconcilePolicy(c);
-    if (changed && visible(c))
+    if (changed && c.automatic && visible(c))
     {
         if (auto found = c.distributions.find(distro); found != c.distributions.end())
             found->second.force = true;

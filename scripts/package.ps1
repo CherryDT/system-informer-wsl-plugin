@@ -47,7 +47,7 @@ try {
         Set-Content "$Package/SHA256SUMS.txt" -Encoding ascii
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::CreateFromDirectory($Package, $TemporaryArchive)
-    $Archive = Join-Path $Dist 'WslTools-0.1.1-windows-x64.zip'
+    $Archive = Join-Path $Dist 'WslTools-0.1.2-windows-x64.zip'
     [IO.File]::Copy($TemporaryArchive, $Archive, $true)
     Write-Host "Packaged $Archive"
     if (-not $SkipInstaller) {

@@ -12,9 +12,11 @@ messages. Requests are handled sequentially. The maximum request length is 1 MiB
 an oversized line is drained and rejected. Nesting is limited to 32 levels. Invalid UTF-8 in Linux names is
 replaced with U+FFFD when serializing a response. Stdout is protocol-only.
 
+The example uses `*` for `helper_version` (using the current version number instead of `*` of course).
+
 ```json
 {"id":1,"op":"hello"}
-{"id":1,"ok":true,"data":{"protocol":1,"uid":0,"cpus":16,"clock_ticks":100,"boot_id":"…","systemd":true,"helper_version":"0.1.1"}}
+{"id":1,"ok":true,"data":{"protocol":1,"uid":0,"cpus":16,"clock_ticks":100,"boot_id":"…","systemd":true,"helper_version":"*"}}
 {"id":2,"op":"details","pid":123,"start_ticks":4567}
 {"id":2,"ok":false,"error":"Process exited or its /proc entry is inaccessible"}
 ```

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(WslTools VERSION 0.1.1 LANGUAGES C CXX RC)
+project(WslTools VERSION 0.1.2 LANGUAGES C CXX RC)
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "Build the plugin with the Visual Studio x64 toolchain; use scripts/build-windows.ps1.")
 endif()

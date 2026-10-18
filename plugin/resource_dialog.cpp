@@ -2,6 +2,7 @@
 #include "host_bridge.h"
 #include "process_rules.hpp"
 #include <algorithm>
+#include <array>
 #include <commdlg.h>
 #include <stdexcept>
 #include <set>
@@ -29,6 +30,12 @@ enum ControlId
     CpuBase = 800,
     InputBase = 720
 };
+struct ModulePage
+{
+    Json response;
+    std::string error;
+    bool loaded = false;
+};
 struct ToolWindow
 {
     HWND window = nullptr, run = nullptr, copy = nullptr, save = nullptr, tabs = nullptr;
@@ -51,6 +58,10 @@ struct ToolWindow
     bool cached = false;
     std::vector<unsigned char> binary;
     bool mutation = false, busy = false, hasResult = false, hasBinary = false;
+    // Properties and Details share the first result. Each other module tab is
+    // loaded on demand; only one request runs at a time for this window.
+    std::array<ModulePage, 4> modulePages;
+    size_t pendingModulePage = 0;
     uintptr_t generation = 0;
     std::shared_ptr<Mailbox> mailbox = std::make_shared<Mailbox>();
 };
@@ -405,8 +416,16 @@ void requestAffinity(ToolWindow &state)
     submit(state.distro, std::move(request), state.mailbox, ++state.generation);
 }
 
+void selectModulePage(ToolWindow &state);
+void refreshModulePage(ToolWindow &state);
+
 void begin(ToolWindow &state)
 {
+    if (state.view == ResourceView::ModuleProperties)
+    {
+        refreshModulePage(state);
+        return;
+    }
     if (state.busy || state.cached)
         return;
     Json request = state.request;
@@ -527,8 +546,14 @@ void saveResult(ToolWindow &state)
     if (!state.hasBinary)
     {
         const auto name = safeFilename(state.suggestedFilename, L"wsl-resource.txt");
-        const auto properties = state.properties.window ? state.properties.exportText() + L"\r\n" : L"";
-        saveText(state.window, properties + state.output, name.c_str());
+        if (state.view == ResourceView::ModuleProperties)
+            saveText(state.window, showingProperties(state) ? state.properties.exportText() : state.output,
+                     name.c_str());
+        else
+        {
+            const auto properties = state.properties.window ? state.properties.exportText() + L"\r\n" : L"";
+            saveText(state.window, properties + state.output, name.c_str());
+        }
         return;
     }
     wchar_t path[32768]{};
@@ -606,25 +631,13 @@ void finishMutation(ToolWindow &state, const Reply &reply)
     DestroyWindow(state.window);
 }
 
-void loadReply(ToolWindow &state, const Reply &reply)
+// Render a result independently of the request lifecycle. A cached module tab
+// may be selected while another tab's request is still completing.
+void renderReply(ToolWindow &state, const Reply &reply)
 {
-    if (reply.tag != state.generation)
-        return;
-    if (state.loadingAffinity)
-    {
-        loadAffinity(state, reply);
-        return;
-    }
-    state.busy = false;
-    EnableWindow(state.run, TRUE);
-    updateInputs(state);
-    if (state.saveScheduling)
-        EnableWindow(state.saveScheduling, TRUE);
-    if (state.mutation)
-    {
-        finishMutation(state, reply);
-        return;
-    }
+    state.binary.clear();
+    state.hasBinary = false;
+    state.suggestedFilename.clear();
     try
     {
         if (!reply.error.empty())
@@ -640,7 +653,8 @@ void loadReply(ToolWindow &state, const Reply &reply)
                                        : text(field, "value");
                 rows.push_back({{text(field, "name"), value}, field, std::to_string(rows.size())});
             }
-        if (state.properties.window)
+        if (state.properties.window &&
+            (state.view != ResourceView::ModuleProperties || TabCtrl_GetCurSel(state.tabs) <= 1))
             state.properties.replace(std::move(rows));
         state.output = text(reply.data, "text");
         state.suggestedFilename = text(reply.data, "suggested_filename");
@@ -680,7 +694,7 @@ void loadReply(ToolWindow &state, const Reply &reply)
                                                       : L"Ready.");
         if (truncated)
             state.output += L"\r\n\r\nPartial result: the collection limit was reached.";
-        if (state.tabs && state.properties.rows.empty())
+        if (state.tabs && state.view != ResourceView::ModuleProperties && state.properties.rows.empty())
             TabCtrl_SetCurSel(state.tabs, 1);
     }
     catch (const std::exception &error)
@@ -690,7 +704,9 @@ void loadReply(ToolWindow &state, const Reply &reply)
         state.output = L"Could not complete the operation: " + wide(error.what());
         state.hasResult = true; // Diagnostics remain copyable and saveable.
         setStatus(state, L"The operation failed.");
-        if (state.tabs)
+        if (state.view == ResourceView::ModuleProperties && showingProperties(state))
+            state.properties.replace({{{L"Error", state.output}, Json::object(), "error"}});
+        else if (state.tabs && state.view != ResourceView::ModuleProperties)
             TabCtrl_SetCurSel(state.tabs, 1);
         else if (!state.details)
         {
@@ -705,6 +721,96 @@ void loadReply(ToolWindow &state, const Reply &reply)
     EnableWindow(state.copy, state.hasResult);
     EnableWindow(state.save, state.hasResult);
     layout(state);
+}
+
+size_t selectedModulePage(const ToolWindow &state)
+{
+    const int tab = TabCtrl_GetCurSel(state.tabs);
+    return tab <= 1 ? 0 : static_cast<size_t>(tab - 1);
+}
+
+void selectModulePage(ToolWindow &state)
+{
+    const size_t selected = selectedModulePage(state);
+    auto &page = state.modulePages[selected];
+    EnableWindow(state.run, !state.busy);
+    if (page.loaded)
+    {
+        Reply reply;
+        reply.data = page.response;
+        reply.error = page.error;
+        renderReply(state, reply);
+        return;
+    }
+
+    state.hasResult = state.hasBinary = false;
+    state.output.clear();
+    state.binary.clear();
+    if (selected == 0)
+        state.properties.clear();
+    SetWindowTextW(state.details, L"Loading...");
+    setStatus(state, L"Loading...");
+    EnableWindow(state.copy, FALSE);
+    EnableWindow(state.save, FALSE);
+    layout(state);
+    if (state.busy)
+        return; // On completion, load only the tab the user still wants.
+
+    Json request = state.request;
+    request.erase("inputs");
+    if (selected == 0)
+        request["action"] = "properties";
+    else if (selected == 3)
+        request["action"] = "dependencies";
+    else
+    {
+        request["action"] = "symbols";
+        request["inputs"]["symbols"] = selected == 1 ? "exports" : "imports";
+    }
+    state.pendingModulePage = selected;
+    state.busy = true;
+    EnableWindow(state.run, FALSE);
+    submit(state.distro, std::move(request), state.mailbox, ++state.generation);
+}
+
+void refreshModulePage(ToolWindow &state)
+{
+    if (state.busy)
+        return;
+    state.modulePages[selectedModulePage(state)] = {};
+    selectModulePage(state);
+}
+
+void loadReply(ToolWindow &state, const Reply &reply)
+{
+    if (reply.tag != state.generation)
+        return;
+    if (state.loadingAffinity)
+    {
+        loadAffinity(state, reply);
+        return;
+    }
+    state.busy = false;
+    EnableWindow(state.run, TRUE);
+    updateInputs(state);
+    if (state.saveScheduling)
+        EnableWindow(state.saveScheduling, TRUE);
+    if (state.mutation)
+    {
+        finishMutation(state, reply);
+        return;
+    }
+    if (state.view == ResourceView::ModuleProperties)
+    {
+        // Cache errors too: switching tabs must not repeatedly retry a missing
+        // tool. Refresh explicitly retries the selected result.
+        state.modulePages[state.pendingModulePage] = {reply.data, reply.error, true};
+        const size_t selected = selectedModulePage(state);
+        if (selected == state.pendingModulePage || !state.modulePages[selected].loaded)
+            selectModulePage(state);
+        return; // A late result must not reset another cached tab's text selection.
+    }
+    renderReply(state, reply);
 }
 
 void copyResult(ToolWindow &state)
@@ -885,13 +991,18 @@ LRESULT CALLBACK toolProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         {
             state->copy = control(window, WC_BUTTONW, L"Copy", WS_TABSTOP | BS_PUSHBUTTON, Copy);
             state->save = control(window, WC_BUTTONW, L"Save...", WS_TABSTOP | BS_PUSHBUTTON, Save);
-            if (state->view == ResourceView::Both || state->view == ResourceView::DetailsFirst)
+            if (state->view == ResourceView::Both || state->view == ResourceView::DetailsFirst ||
+                state->view == ResourceView::ModuleProperties)
             {
                 state->tabs = control(window, WC_TABCONTROLW, L"",
                                       WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, Tabs);
                 SetWindowLongPtrW(state->tabs, GWL_EXSTYLE, WS_EX_CONTROLPARENT);
                 SetWindowSubclass(state->tabs, pageMessages, 2, reinterpret_cast<DWORD_PTR>(window));
-                for (const wchar_t *name : {L"Properties", L"Details"})
+                std::vector<const wchar_t *> names{L"Properties", L"Details"};
+                if (state->view == ResourceView::ModuleProperties)
+                    names.insert(names.end(),
+                                 {L"Exported symbols", L"Imported symbols", L"Declared dependencies"});
+                for (const wchar_t *name : names)
                 {
                     TCITEMW item{};
                     item.mask = TCIF_TEXT;
@@ -1099,7 +1210,12 @@ LRESULT CALLBACK toolProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case WM_NOTIFY: {
         const auto hdr = reinterpret_cast<NMHDR *>(lParam);
         if (state->tabs && hdr->hwndFrom == state->tabs && hdr->code == TCN_SELCHANGE)
-            layout(*state);
+        {
+            if (state->view == ResourceView::ModuleProperties)
+                selectModulePage(*state);
+            else
+                layout(*state);
+        }
         else if (state->tooltips && hdr->hwndFrom == state->tooltips && hdr->code == TTN_GETDISPINFOW)
             reinterpret_cast<NMTTDISPINFOW *>(lParam)->lpszText = state->statusText.data();
         return 0;

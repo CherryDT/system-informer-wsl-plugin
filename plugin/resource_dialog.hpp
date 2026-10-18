@@ -16,7 +16,8 @@ enum class ResourceView
     PropertiesOnly,
     DetailsOnly,
     Both,
-    DetailsFirst
+    DetailsFirst,
+    ModuleProperties
 };
 
 // Each tool owns its asynchronous mailbox, so closing it never waits for WSL.

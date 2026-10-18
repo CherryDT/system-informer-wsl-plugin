@@ -1,7 +1,7 @@
 #include <windows.h>
 1 VERSIONINFO
- FILEVERSION 0,1,1,0
- PRODUCTVERSION 0,1,1,0
+ FILEVERSION 0,1,2,0
+ PRODUCTVERSION 0,1,2,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0
  FILEOS VOS_NT_WINDOWS32
@@ -13,12 +13,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "David Trapp / Trapp Innovations\0"
             VALUE "FileDescription", "WSL Tools for System Informer\0"
-            VALUE "FileVersion", "0.1.1\0"
+            VALUE "FileVersion", "0.1.2\0"
             VALUE "InternalName", "WslTools\0"
             VALUE "LegalCopyright", "Copyright (c) 2026 David Trapp / Trapp Innovations. MIT License.\0"
             VALUE "OriginalFilename", "WslTools.dll\0"
             VALUE "ProductName", "WSL Tools\0"
-            VALUE "ProductVersion", "0.1.1\0"
+            VALUE "ProductVersion", "0.1.2\0"
         END
     END
     BLOCK "VarFileInfo"

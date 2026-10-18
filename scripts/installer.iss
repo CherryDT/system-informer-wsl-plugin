@@ -4,7 +4,7 @@
   #error PackageDir must name the prepared release payload.
 #endif
 #define ProductName "WSL Tools for System Informer"
-#define ProductVersion "0.1.1"
+#define ProductVersion "0.1.2"
 
 [Setup]
 AppId={{1CD91F79-08A2-40C8-B7B1-7C73D98530D4}

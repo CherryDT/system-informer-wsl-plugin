@@ -89,9 +89,6 @@ enum ControlId
     ResourceProperties = 400,
     ReadMemory,
     MemoryStrings,
-    ModuleExports,
-    ModuleImports,
-    ModuleDependencies,
     GoToMemory,
     GoToModule,
     GoToSocket,
@@ -443,6 +440,15 @@ std::wstring overviewValue(const Inspector &state, const OverviewField &field)
             return L"Systemd default";
         return L"Not available";
     }
+    if (!state.isService && key == "ppid")
+    {
+        if (value == L"0")
+            return L"(none)";
+        auto name = cell(state.overviewData, "parent_name");
+        if (name.empty())
+            name = L"Unknown";
+        return editText(name) + L" (" + value + L")";
+    }
     if (!state.isService && key == "start_ticks")
         return formatStartTime(state.overviewData.at("start_ticks").get<uint64_t>(), state.clock);
     if (!state.isService && key == "service_unit")
@@ -518,7 +524,7 @@ void createOverviewFields(Inspector &state)
         state.overviewData = state.process.is_object() ? state.process : Json::object();
         state.overviewFields = {{"name", L"Name"},
                                 {"pid", L"Process ID"},
-                                {"ppid", L"Parent process ID"},
+                                {"ppid", L"Parent process"},
                                 {"user", L"User"},
                                 {"uid", L"User ID"},
                                 {"state", L"State"},
@@ -1436,6 +1442,7 @@ void resourceAction(Inspector &state, int id)
         const auto path = cell(row, "path");
         const auto slash = path.find_last_of(L'/');
         title = L"Module " + (slash == std::wstring::npos ? path : path.substr(slash + 1));
+        view = ResourceView::ModuleProperties;
     }
     else if (state.page == 1)
         title = L"FD " + cell(row, "fd");
@@ -1455,20 +1462,9 @@ void resourceAction(Inspector &state, int id)
     case MemoryStrings:
         request["action"] = "strings";
         title = L"Find strings in memory";
+        view = ResourceView::DetailsFirst;
         inputs = {{L"Minimum characters", "minimum_length", L"4"},
                   {L"Maximum bytes (up to 16 MB)", "maximum_bytes", L"1048576"}};
-        break;
-    case ModuleExports:
-    case ModuleImports:
-        request["action"] = "symbols";
-        request["inputs"]["symbols"] = id == ModuleExports ? "exports" : "imports";
-        title = id == ModuleExports ? L"Exported ELF symbols" : L"Imported ELF symbols";
-        view = ResourceView::DetailsOnly;
-        break;
-    case ModuleDependencies:
-        request["action"] = "dependencies";
-        title = L"Declared ELF dependencies";
-        view = ResourceView::DetailsOnly;
         break;
     case KernelStack:
         request["action"] = "kernel_stack";
@@ -1530,9 +1526,6 @@ void appendResourceActions(Inspector &state, HMENU menu)
     }
     if (state.page == 2)
     {
-        add(ModuleExports, L"Exported symbols…");
-        add(ModuleImports, L"Imported symbols…");
-        add(ModuleDependencies, L"Declared dependencies…");
         add(GoToMemory, L"Go to memory region");
         add(CopyIdentifier, L"Copy base address");
     }
