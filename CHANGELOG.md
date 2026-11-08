@@ -2,10 +2,7 @@
 
 ## 0.2.0 - 2026-11-08
 
-- Add paired WSLg system-distro targets using the `:system` suffix, with the same process, thread, memory, module, environment, handle, network, signal, scheduling and stack inspectors where supported.
-- Stage and verify a temporary observer for WSLg at connection time; it removes itself on startup. Normal distros retain their persistent installed companion.
-- Keep WSLg path opening separate from normal distro Explorer overrides; services are reported unavailable when systemd is absent.
-- Exclude nested user-distro processes from the WSLg view, CPU accounting, handle searches and network ownership; reject out-of-scope process inspection and actions.
+- Add paired WSLg system-distro targets, showing only processes not already listed in the main distro.
 - Keep an open distro dropdown stable during background refresh and target-list updates.
 
 ## 0.1.2 - 2026-10-18
