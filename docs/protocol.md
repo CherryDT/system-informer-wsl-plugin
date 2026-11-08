@@ -7,6 +7,9 @@ service is needed.
 
 For a paired `:system` target, the plugin uploads the same verified helper to a private temporary directory
 and starts it in ephemeral mode; the helper unlinks itself and removes that directory immediately after startup.
+Ephemeral mode also restricts enumeration and explicit process requests to the observer's own PID namespace;
+`hello.process_scope` is `current_pid_namespace` (normal mode reports `visible`). WSLg socket rows require
+an owner in that namespace; unowned shared-network sockets are omitted.
 This temporary mode does not use the normal `/usr/local/lib/system-informer-wsl` installation path.
 
 Every message is one UTF-8 JSON object followed by a newline (NDJSON). The helper

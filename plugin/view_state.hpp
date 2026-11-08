@@ -62,7 +62,11 @@ struct View
     std::shared_ptr<CaptureModel> capture = std::make_shared<CaptureModel>();
     Json sockets, units;
     std::wstring selectedDistro;
+    // Keep the visible inventory stable for the entire native dropdown session.
     std::vector<std::wstring> distroNames;
+    bool distroDropdownOpen = false;
+    int distroHeight = 0;
+    UINT distroDpi = 96;
     uint64_t renderedRevision = UINT64_MAX;
     uint64_t renderedSnapshotTime = 0;
     std::string pendingSelection;

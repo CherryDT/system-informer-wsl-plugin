@@ -22,6 +22,8 @@
 
 namespace observer {
 namespace {
+std::string scoped_pid_namespace;
+
 std::string proc_path(int pid, const char* leaf) {
     return "/proc/" + std::to_string(pid) + "/" + leaf;
 }
@@ -489,6 +491,20 @@ std::string read_link(const std::string& path) {
         buffer.resize(buffer.size() * 2);
     }
 }
+void restrict_to_current_pid_namespace() {
+    auto name = read_link("/proc/self/ns/pid");
+    if (name.empty()) throw std::runtime_error("Cannot establish the WSLg PID namespace");
+    scoped_pid_namespace = std::move(name);
+}
+bool process_scope_restricted() { return !scoped_pid_namespace.empty(); }
+
+namespace {
+bool process_in_scope(int pid) {
+    return scoped_pid_namespace.empty() ||
+        read_link(proc_path(pid, "ns/pid")) == scoped_pid_namespace;
+}
+}
+
 std::vector<int> process_ids() {
     DIR* directory = opendir("/proc");
     if (!directory) throw std::runtime_error("Cannot read /proc");
@@ -496,7 +512,10 @@ std::vector<int> process_ids() {
     while (const auto* entry = readdir(directory)) {
         const std::string name(entry->d_name);
         if (!name.empty() && name.find_first_not_of("0123456789") == std::string::npos) {
-            try { ids.push_back(std::stoi(name)); } catch (...) { }
+            try {
+                const int pid = std::stoi(name);
+                if (process_in_scope(pid)) ids.push_back(pid);
+            } catch (...) { }
         }
     }
     closedir(directory);
@@ -504,6 +523,8 @@ std::vector<int> process_ids() {
     return ids;
 }
 ProcessStat process_stat(int pid) {
+    if (!process_in_scope(pid))
+        throw std::runtime_error("Process is outside the selected WSLg PID namespace or has exited");
     const auto text = read_text(proc_path(pid, "stat"), 16384);
     // comm can contain spaces, newlines, and parentheses. The final ')' ends it;
     // splitting the entire line on whitespace silently corrupts later fields.
@@ -589,7 +610,8 @@ Json hello() {
             {"cpus", sysconf(_SC_NPROCESSORS_ONLN)}, {"clock_ticks", sysconf(_SC_CLK_TCK)},
             {"systemd", access("/run/systemd/system", F_OK) == 0},
             {"gdb", access("/usr/bin/gdb", X_OK) == 0 || access("/bin/gdb", X_OK) == 0},
-            {"helper_version", "0.2.0"}};
+            {"helper_version", "0.2.0"},
+            {"process_scope", process_scope_restricted() ? "current_pid_namespace" : "visible"}};
 }
 Json snapshot(const Json& request) {
     Json processes = Json::array();

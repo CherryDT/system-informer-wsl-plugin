@@ -36,6 +36,10 @@ struct CommandResult {
 bool append_with_budget(Json& array, Json item, size_t& bytes_left);
 std::string read_text(const std::string& path, size_t limit = 1024 * 1024);
 std::string read_link(const std::string& path);
+// WSLg's outer /proc also exposes nested user distros. Scope its observer to
+// the current PID namespace, including validation of explicitly requested PIDs.
+void restrict_to_current_pid_namespace();
+bool process_scope_restricted();
 std::vector<int> process_ids();
 ProcessStat process_stat(int pid);
 ProcessIdentity request_identity(const Json& request);

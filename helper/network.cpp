@@ -208,7 +208,7 @@ Json connections(const Json& request) {
                     {"state", socket_state(std::stoul(fields[3], nullptr, 16), udp)}, {"inode", inode}};
                 const auto found = owners.find(inode);
                 if (found == owners.end()) {
-                    if (!filtered) {
+                    if (!filtered && !process_scope_restricted()) {
                         item["pid"] = 0; item["start_ticks"] = 0; item["process"] = "";
                         append(std::move(item));
                     }
@@ -240,7 +240,7 @@ Json connections(const Json& request) {
                 {"state", (flag_value & 0x10000) ? "LISTEN" : state_value == 3 ? "CONNECTED" : "UNCONNECTED"}};
             const auto found = owners.find(inode);
             if (found == owners.end()) {
-                if (!filtered) {
+                if (!filtered && !process_scope_restricted()) {
                     item["pid"] = 0; item["start_ticks"] = 0; item["process"] = "";
                     append(std::move(item));
                 }
@@ -255,6 +255,8 @@ Json connections(const Json& request) {
     if (filtered) require_identity(identity);
     return {{"identities_only", identities_only}, {"connections", result}, {"connections_truncated", truncated}, {"inaccessible_processes", inaccessible},
             {"tables_read", tables_read}, {"network_namespace", read_link("/proc/self/ns/net")},
-            {"coverage", "Current network namespace only. PID 0 means no visible owner (including TIME_WAIT sockets)."}};
+            {"coverage", process_scope_restricted()
+                ? "WSLg-owned sockets in the current network namespace only; unowned and user-distro sockets are omitted."
+                : "Current network namespace only. PID 0 means no visible owner (including TIME_WAIT sockets)."}};
 }
 } // namespace observer

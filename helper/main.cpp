@@ -68,8 +68,12 @@ observer::Json dispatch(const observer::Json& request) {
 int main(int argc, char** argv) {
     using observer::Json;
     try {
-        if (argc == 2 && std::string(argv[1]) == "--ephemeral")
+        if (argc == 2 && std::string(argv[1]) == "--ephemeral") {
+            // The temporary observer is launched inside WSLg. Its /proc can
+            // also see the paired user distro, which is a separate target.
+            observer::restrict_to_current_pid_namespace();
             remove_ephemeral_executable();
+        }
         else if (argc != 1)
             throw std::runtime_error("Unknown observer argument");
     } catch (const std::exception& error) {

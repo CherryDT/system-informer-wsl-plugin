@@ -158,6 +158,12 @@ namespace
 View *mainView = nullptr;
 std::atomic<HWND> mainViewWindow{};
 const wchar_t *viewClass = L"WslTools.View";
+constexpr UINT DistroDropdownClosedMessage = WM_APP + 95;
+
+bool distroDropdownOpen(const View &v)
+{
+    return v.distroDropdownOpen || SendMessageW(v.distro, CB_GETDROPPEDSTATE, 0, 0);
+}
 
 void layout(View &v)
 {
@@ -176,13 +182,27 @@ void layout(View &v)
         return textSize.cx + GetSystemMetricsForDpi(SM_CXMENUCHECK, GetDpiForWindow(check)) + s(6);
     };
     const int optionWidth = checkWidth(v.page == 0 ? v.tree : v.page == 1 ? v.listeners : v.inactiveServices);
-    const int combo = std::max(s(110), std::min(s(300), width - s(350) - optionWidth - gap));
-    place(v.distro, 0, 0, combo, s(300));
-    // A dropdown's requested height includes its popup. Measure the collapsed
-    // control so adjacent buttons have exactly the same visual height.
-    RECT comboRect{};
-    GetWindowRect(v.distro, &comboRect);
-    const int line = std::max(s(20), static_cast<int>(comboRect.bottom - comboRect.top));
+    int combo = std::max(s(110), std::min(s(300), width - s(350) - optionWidth - gap));
+    const UINT dpi = GetDpiForWindow(v.distro);
+    if (!distroDropdownOpen(v))
+    {
+        place(v.distro, 0, 0, combo, s(300));
+        // GetWindowRect can include the expanded list while the popup is open.
+        // Only a collapsed measurement may determine the surrounding row height.
+        RECT comboRect{};
+        GetWindowRect(v.distro, &comboRect);
+        v.distroHeight = static_cast<int>(comboRect.bottom - comboRect.top);
+        v.distroDpi = dpi;
+    }
+    else
+    {
+        // Repositioning an open combo can dismiss its popup. Leave it alone
+        // until close-up, including when the surrounding view is resized.
+        RECT comboRect{};
+        GetWindowRect(v.distro, &comboRect);
+        combo = static_cast<int>(comboRect.right - comboRect.left);
+    }
+    const int line = std::max(s(20), MulDiv(v.distroHeight, dpi, v.distroDpi));
     place(v.settings, combo + gap, 0, s(88), line);
     place(v.exportButton, combo + s(88) + 2 * gap, 0, s(114), line);
     place(v.findHandles, combo + s(202) + 3 * gap, 0, s(118), line);
@@ -332,7 +352,9 @@ void refreshUiData(View &v)
 void captureChanged(View &v)
 {
     const auto names = captureDistros();
-    if (names != v.distroNames)
+    // CB_RESETCONTENT closes a native dropdown and invalidates its item indexes.
+    // Continue rendering snapshots, but defer inventory changes until close-up.
+    if (names != v.distroNames && !distroDropdownOpen(v))
     {
         v.distroNames = names;
         SendMessageW(v.distro, CB_RESETCONTENT, 0, 0);
@@ -684,7 +706,22 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
     }
     case WM_COMMAND: {
         int id = LOWORD(wparam);
-        if (id == DistroCombo && HIWORD(wparam) == CBN_SELCHANGE)
+        if (id == DistroCombo && HIWORD(wparam) == CBN_DROPDOWN)
+        {
+            v->distroDropdownOpen = true;
+            return 0;
+        }
+        if (id == DistroCombo && HIWORD(wparam) == CBN_CLOSEUP)
+        {
+            // Selection/cancellation notifications may still follow close-up.
+            // Rebuild only after the combo has finished its native message cycle.
+            PostMessageW(window, DistroDropdownClosedMessage, 0, 0);
+            return 0;
+        }
+        // Arrow-key browsing inside the popup is provisional. Commit on OK;
+        // Escape can then cancel without leaving the label and active target apart.
+        if (id == DistroCombo &&
+            (HIWORD(wparam) == CBN_SELENDOK || (HIWORD(wparam) == CBN_SELCHANGE && !distroDropdownOpen(*v))))
         {
             const auto selected = SendMessageW(v->distro, CB_GETCURSEL, 0, 0);
             if (selected == CB_ERR || static_cast<size_t>(selected) >= v->distroNames.size())
@@ -808,6 +845,14 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
     }
     case WSL_VIEW_SETTINGS_CHANGED:
         WslHostViewSettingsChanged();
+        return 0;
+    case DistroDropdownClosedMessage:
+        if (!SendMessageW(v->distro, CB_GETDROPPEDSTATE, 0, 0))
+        {
+            v->distroDropdownOpen = false;
+            captureChanged(*v);
+            layout(*v); // Apply any resize or DPI change deferred while open.
+        }
         return 0;
     case CaptureChangedMessage:
         captureChanged(*v);

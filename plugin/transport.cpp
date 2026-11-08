@@ -664,6 +664,8 @@ struct Client::Impl {
             const auto hello = exchange(Json{{"op", "hello"}}, deadline);
             if (hello.value("protocol", 0) != 1)
                 throw std::runtime_error("Unsupported WSL helper protocol. Reinstall matching plugin and helper files.");
+            if (isSystemTarget(distro) && hello.value("process_scope", "") != "current_pid_namespace")
+                throw std::runtime_error("The WSLg observer did not enable PID namespace filtering.");
             return hello;
         } catch (const std::exception& error) {
             if (isSystemTarget(distro))
