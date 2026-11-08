@@ -1,3 +1,4 @@
+#include "transport.hpp"
 #include "target_actions.hpp"
 #include "resource_dialog.hpp"
 #include "process_rules.hpp"
@@ -173,7 +174,7 @@ bool openProcessScheduling(HWND owner, const std::wstring &distro, const Json &p
         break;
     }
     title += L" — all current threads — " + text(target, "name") + L" (" + text(target, "pid") + L" @ " +
-             distribution + L")";
+             targetDisplayName(distribution) + L")";
     if (IsWindow(owner))
         openResourceTool(owner, distribution, std::move(request), title, std::move(inputs), true);
     return true;
@@ -202,8 +203,8 @@ TargetOptionsResult targetOptions(HWND owner, HWND anchor, const std::wstring &d
     HMENU menu = CreatePopupMenu();
     if (!menu)
         return {};
-    AppendMenuW(menu, MF_STRING | (availablePath(path) ? 0 : MF_GRAYED), OpenLocation,
-                isService ? L"Show unit file in Explorer" : L"Show executable in Explorer");
+    AppendMenuW(menu, MF_STRING | (!isSystemTarget(distribution) && availablePath(path) ? 0 : MF_GRAYED),
+                OpenLocation, isService ? L"Show unit file in Explorer" : L"Show executable in Explorer");
     AppendMenuW(menu, MF_STRING | (commandLine.empty() ? MF_GRAYED : 0), CopyCommand, L"Copy command line");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     const UINT actionFlags = MF_STRING | (canChange ? 0 : MF_GRAYED);
@@ -237,7 +238,7 @@ TargetOptionsResult targetOptions(HWND owner, HWND anchor, const std::wstring &d
         return {};
     if (command == ForceScriptStacks && !isService && !scriptStacksForced)
         return {std::nullopt, true};
-    if (command == OpenLocation && availablePath(path))
+    if (command == OpenLocation && !isSystemTarget(distribution) && availablePath(path))
         openLinuxPath(owner, distribution, path);
     else if (command == CopyCommand && !commandLine.empty())
         copyText(owner, commandLine);
@@ -247,7 +248,7 @@ TargetOptionsResult targetOptions(HWND owner, HWND anchor, const std::wstring &d
              command < FirstService + std::size(Services))
     {
         const auto &action = Services[command - FirstService];
-        auto prompt = wide(action.verb) + L" " + wide(unit) + L" in " + distribution +
+        auto prompt = wide(action.verb) + L" " + wide(unit) + L" in " + targetDisplayName(distribution) +
                       L"?\r\n\r\nThis changes a system service as Linux root.";
         if (MessageBoxW(owner, prompt.c_str(), L"Confirm service action",
                         MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) == IDYES &&
@@ -259,7 +260,7 @@ TargetOptionsResult targetOptions(HWND owner, HWND anchor, const std::wstring &d
         const auto &action = Signals[command - FirstSignal];
         const int signal = action.number;
         auto prompt = std::wstring(action.confirmation) + L" to " + text(target, "name") + L" (PID " +
-                      text(target, "pid") + L") in " + distribution + L"?\r\n\r\n";
+                      text(target, "pid") + L") in " + targetDisplayName(distribution) + L"?\r\n\r\n";
         prompt += L"This action runs as Linux root.";
         if (signal == 2 || signal == 9 || signal == 15)
             prompt += L" Termination may lose unsaved work.";
@@ -269,6 +270,8 @@ TargetOptionsResult targetOptions(HWND owner, HWND anchor, const std::wstring &d
         else if (signal == 19)
             prompt += L" The process will pause until it is resumed.";
         const auto basename = path.substr(path.find_last_of(L'/') + 1);
+        if (isSystemTarget(distribution) && (signal == 2 || signal == 9 || signal == 15 || signal == 19))
+            prompt += L"\r\n\r\nStopping WSLg infrastructure can interrupt Linux GUI applications and audio.";
         if ((signal == 2 || signal == 9 || signal == 15 || signal == 19) &&
             (basename == L"wsl-observer" || text(target, "name") == L"wsl-observer"))
             prompt += L"\r\n\r\nThis is the WSL inspection component. Stopping it disconnects WSL "

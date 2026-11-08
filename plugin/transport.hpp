@@ -22,12 +22,22 @@ struct Distro {
     std::wstring name;
 };
 
+// Synthetic targets keep their full name as the connection/settings identity.
+// Only the launch boundary strips the reserved :system suffix.
+bool isSystemTarget(const std::wstring& target);
+std::wstring targetDistro(const std::wstring& target);
+std::wstring targetDisplayName(const std::wstring& target);
+
 // Reads registered WSL2 names without starting any distribution.
 std::vector<std::wstring> registeredWsl2Distros();
 std::optional<uint32_t> distroDefaultUid(const std::wstring& distro);
 
 // Lists already-running WSL2 distributions. Discovery never launches a distro.
 std::vector<Distro> runningDistros(const std::function<bool()>& cancelled = {});
+
+// Adds paired WSLg targets for running user distros, without launching probes.
+// Availability of the system endpoint is checked when a connection is opened.
+std::vector<Distro> runningTargets(const std::function<bool()>& cancelled = {});
 
 class ComponentMissing : public std::runtime_error {
 public:

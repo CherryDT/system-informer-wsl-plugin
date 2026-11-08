@@ -189,6 +189,8 @@ std::wstring distroPrefix(const std::wstring &distro)
 }
 void setDistroPrefix(const std::wstring &distro, const std::wstring &prefix)
 {
+    if (isSystemTarget(distro))
+        throw std::runtime_error("Explorer path overrides are not available for WSLg system targets.");
     if (!validPrefix(prefix))
         throw std::runtime_error("Use an absolute drive path or a UNC path containing a server and share.");
     std::lock_guard<std::mutex> lock(settingsMutex);
@@ -203,6 +205,12 @@ void setDistroPrefix(const std::wstring &distro, const std::wstring &prefix)
 }
 std::wstring windowsPath(const std::wstring &distro, const std::wstring &linuxPath)
 {
+    // WSLg has a separate mount namespace. Neither its parent's UNC root nor
+    // that distro's /mnt drive mappings identify files in the system target.
+    if (isSystemTarget(distro))
+        throw std::runtime_error(
+            "WSLg system files cannot be opened directly in Explorer. Copy the Linux path instead; "
+            "the parent distribution's Explorer path mapping does not apply.");
     if (linuxPath.empty() || linuxPath.front() != L'/')
         throw std::runtime_error("This descriptor is not a filesystem path.");
     auto path = linuxPath;
@@ -283,7 +291,9 @@ void optionsStatus(HWND window, const std::wstring &message)
 void loadPrefix(HWND window, OptionsState &state)
 {
     state.loading = true;
-    const bool available = state.selected >= 0 && static_cast<size_t>(state.selected) < state.distros.size();
+    const bool selected = state.selected >= 0 && static_cast<size_t>(state.selected) < state.distros.size();
+    const bool systemTarget = selected && isSystemTarget(state.distros[state.selected]);
+    const bool available = selected && !systemTarget;
     std::wstring prefix;
     try
     {
@@ -297,6 +307,11 @@ void loadPrefix(HWND window, OptionsState &state)
     SetDlgItemTextW(window, IDC_WSL_PREFIX, prefix.c_str());
     EnableWindow(GetDlgItem(window, IDC_WSL_PREFIX), available);
     EnableWindow(GetDlgItem(window, IDC_WSL_APPLY_PREFIX), FALSE);
+    SetDlgItemTextW(window, IDC_WSL_PREFIX_HINT,
+                    systemTarget ? L"WSLg system files do not have an Explorer path mapping."
+                                 : L"Example: U:\\ maps /home/user to U:\\home\\user.");
+    if (systemTarget)
+        optionsStatus(window, L"Explorer path overrides apply to user distributions only.");
     state.loading = false;
 }
 
@@ -384,11 +399,16 @@ INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             // Registration discovery only reads HKCU. Opening Options must not
             // start a stopped distro or launch a Linux process.
             state->distros = registeredWsl2Distros();
+            // Keep a selected system target visible without offering an invalid
+            // override for its parent's filesystem. No WSL process is launched.
+            if (isSystemTarget(preferredOptionsDistro))
+                state->distros.push_back(preferredOptionsDistro);
             std::sort(state->distros.begin(), state->distros.end());
             for (size_t i = 0; i < state->distros.size(); ++i)
             {
+                const auto label = targetDisplayName(state->distros[i]);
                 SendDlgItemMessageW(window, IDC_WSL_DISTRO, CB_ADDSTRING, 0,
-                                    reinterpret_cast<LPARAM>(state->distros[i].c_str()));
+                                    reinterpret_cast<LPARAM>(label.c_str()));
                 if (state->distros[i] == preferredOptionsDistro)
                     state->selected = static_cast<int>(i);
             }
@@ -459,7 +479,8 @@ INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             }
             if (id == IDC_WSL_PREFIX && event == EN_CHANGE)
             {
-                EnableWindow(GetDlgItem(window, IDC_WSL_APPLY_PREFIX), state->selected >= 0);
+                EnableWindow(GetDlgItem(window, IDC_WSL_APPLY_PREFIX),
+                             state->selected >= 0 && !isSystemTarget(state->distros[state->selected]));
                 optionsStatus(window, L"Choose Apply prefix to save this path.");
                 return TRUE;
             }
@@ -477,8 +498,8 @@ INT_PTR CALLBACK optionsProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                     return TRUE;
                 }
                 state->selected = next;
-                loadPrefix(window, *state);
                 optionsStatus(window, L"");
+                loadPrefix(window, *state);
                 return TRUE;
             }
         }

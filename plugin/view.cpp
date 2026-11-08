@@ -194,7 +194,7 @@ void layout(View &v)
     const int footerY = height - s(2) - footerHeight;
     place(v.status, s(2), footerY, width - s(4), footerHeight);
 
-    const bool content = !v.capture->componentMissing;
+    const bool content = !v.capture->componentMissing || isSystemTarget(v.selectedDistro);
     for (HWND child : {v.graph, v.memoryGraph, v.tabs, v.exportButton, v.findHandles})
         ShowWindow(child, content ? SW_SHOW : SW_HIDE);
     ShowWindow(v.processes.window, content && v.page == 0 ? SW_SHOW : SW_HIDE);
@@ -241,7 +241,9 @@ void updateStatus(View &v)
     }
     if (v.capture->componentMissing)
     {
-        status(v, L"Component not installed in " + v.selectedDistro + L".");
+        status(v, isSystemTarget(v.selectedDistro)
+                      ? L"Could not prepare the temporary WSLg observer. Use View > Refresh (F5) to retry."
+                      : L"Component not installed in " + targetDisplayName(v.selectedDistro) + L".");
         return;
     }
     if (v.capture->failed)
@@ -337,7 +339,8 @@ void captureChanged(View &v)
         int selected = -1;
         for (size_t i = 0; i < names.size(); ++i)
         {
-            SendMessageW(v.distro, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(names[i].c_str()));
+            const auto label = targetDisplayName(names[i]);
+            SendMessageW(v.distro, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
             if (names[i] == v.selectedDistro)
                 selected = static_cast<int>(i);
         }
@@ -683,7 +686,10 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         int id = LOWORD(wparam);
         if (id == DistroCombo && HIWORD(wparam) == CBN_SELCHANGE)
         {
-            auto chosen = windowText(v->distro);
+            const auto selected = SendMessageW(v->distro, CB_GETCURSEL, 0, 0);
+            if (selected == CB_ERR || static_cast<size_t>(selected) >= v->distroNames.size())
+                return 0;
+            const auto chosen = v->distroNames[static_cast<size_t>(selected)];
             if (chosen != v->selectedDistro)
             {
                 clearDistro(*v);
@@ -702,7 +708,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         switch (id)
         {
         case InstallButton:
-            if (v->capture->componentMissing && !v->pending)
+            if (v->capture->componentMissing && !isSystemTarget(v->selectedDistro) && !v->pending)
             {
                 queue(*v, {{"op", "install_component"}}, InstallTag);
                 EnableWindow(v->installButton, FALSE);
@@ -821,7 +827,8 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                 if (tag == InstallTag)
                     errorBox(window, L"Could not install the WSL component.\r\n\r\n" + wide(reply->error));
                 status(*v, tag == InstallTag ? L"Installation failed: " + wide(reply->error)
-                                             : L"Component not installed in " + v->selectedDistro + L".");
+                                             : L"Component not installed in " +
+                                                   targetDisplayName(v->selectedDistro) + L".");
                 return 0;
             }
             if (tag == ActionTag || tag == ExecutableTag || tag == ServiceProcessTag)
@@ -894,7 +901,11 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
                 render(*v, ServicesTag);
                 if (!v->units.value("available", true))
                 {
-                    status(*v, text(v->units, "message", L"systemd is unavailable in this distribution."));
+                    status(*v,
+                           isSystemTarget(v->selectedDistro)
+                               ? L"systemd is not running in WSLg. Use Processes to inspect its GUI and "
+                                 L"audio components."
+                               : text(v->units, "message", L"systemd is unavailable in this distribution."));
                     return 0;
                 }
             }
@@ -992,7 +1003,7 @@ extern "C" void WslFocusContent(BOOL select)
     using namespace wsl::ui;
     if (!mainView)
         return;
-    if (mainView->capture->componentMissing)
+    if (mainView->capture->componentMissing && !wsl::isSystemTarget(mainView->selectedDistro))
     {
         SetFocus(mainView->installButton);
         return;

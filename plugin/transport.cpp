@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <limits>
+#include <iterator>
 #include <stdexcept>
 #include <utility>
 
@@ -436,6 +437,49 @@ exec "$target"
 )SH";
 }
 
+// The system distro is disposable. Stream a private, verified copy into /run;
+// the observer removes its own executable on startup, before handling requests.
+// The shell trap handles incomplete uploads and failed launches.
+std::string temporaryBootstrap(std::size_t size, const std::string& digest) {
+    return "expected=" + digest + "; count=" + std::to_string(size) + R"SH(
+set -eu
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+fail() { printf '%s\n' "$1" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || fail 'The WSLg observer must run as root.'
+for parent in / /run; do
+    [ ! -L "$parent" ] && [ -d "$parent" ] || fail 'Unsafe WSLg temporary directory.'
+    [ "$(stat -c %u -- "$parent")" = 0 ] || fail 'WSLg temporary directory is not owned by root.'
+    mode=$(stat -c %a -- "$parent")
+    [ "$((0$mode & 022))" -eq 0 ] || fail 'WSLg temporary directory is writable by another account.'
+done
+dir=$(mktemp -d /run/system-informer-wsl.XXXXXX)
+target=$dir/wsl-observer
+cleanup() { rm -f -- "$target"; rmdir -- "$dir" 2>/dev/null || :; }
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+printf '{"bootstrap":"upload"}\n'
+head -c "$count" > "$target"
+[ "$(wc -c < "$target")" -eq "$count" ] || fail 'The WSLg observer upload was incomplete.'
+actual=$(sha256sum -- "$target")
+actual=${actual%% *}
+[ "$actual" = "$expected" ] || fail 'The WSLg observer upload failed SHA256 verification.'
+chmod 700 -- "$target"
+printf '{"bootstrap":"ready"}\n'
+"$target" --ephemeral
+)SH";
+}
+
+std::vector<std::wstring> targetArguments(const std::wstring& target, const std::string& script) {
+    std::vector<std::wstring> arguments{L"--distribution", targetDistro(target)};
+    if (isSystemTarget(target)) arguments.push_back(L"--system");
+    arguments.insert(arguments.end(), {L"--user", L"root", L"--exec", L"/bin/sh", L"-c", wide(script)});
+    return arguments;
+}
+
 } // namespace
 
 std::string utf8(const std::wstring& value) {
@@ -480,11 +524,26 @@ std::wstring quoteArg(const std::wstring& value) {
     return result;
 }
 
+bool isSystemTarget(const std::wstring& target) {
+    constexpr wchar_t suffix[] = L":system";
+    constexpr size_t length = std::size(suffix) - 1;
+    return target.size() > length && target.compare(target.size() - length, length, suffix) == 0;
+}
+
+std::wstring targetDistro(const std::wstring& target) {
+    return isSystemTarget(target) ? target.substr(0, target.size() - 7) : target;
+}
+
+std::wstring targetDisplayName(const std::wstring& target) {
+    return isSystemTarget(target) ? targetDistro(target) + L" (WSLg)" : target;
+}
+
 std::vector<std::wstring> registeredWsl2Distros() {
     return enumerateRegisteredWsl2Distros();
 }
 
 std::optional<uint32_t> distroDefaultUid(const std::wstring& distro) {
+    if (isSystemTarget(distro)) return std::nullopt;
     HKEY root = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Lxss",
                      0, KEY_READ, &root) != ERROR_SUCCESS) return std::nullopt;
@@ -528,6 +587,17 @@ std::vector<Distro> runningDistros(const std::function<bool()>& cancelled) {
     return result;
 }
 
+std::vector<Distro> runningTargets(const std::function<bool()>& cancelled) {
+    const auto distros = runningDistros(cancelled);
+    std::vector<Distro> targets;
+    targets.reserve(distros.size() * 2);
+    for (const auto& distro : distros) {
+        targets.push_back(distro);
+        targets.push_back({distro.name + L":system"});
+    }
+    return targets;
+}
+
 struct Client::Impl {
     std::wstring distro;
     std::wstring helperPath;
@@ -569,29 +639,39 @@ struct Client::Impl {
         });
         if (WaitForSingleObject(cancellation.get(), 0) == WAIT_OBJECT_0)
             throw std::runtime_error("WSL connection cancelled.");
+        const auto userDistro = targetDistro(distro);
         if (std::none_of(running.begin(), running.end(), [&](const Distro& item) {
-            return CompareStringOrdinal(item.name.c_str(), -1, distro.c_str(), -1, TRUE) == CSTR_EQUAL;
+            return CompareStringOrdinal(item.name.c_str(), -1, userDistro.c_str(), -1, TRUE) == CSTR_EQUAL;
         })) throw DistroStopped();
         const auto helper = readHelper(helperPath);
         const auto digest = sha256(helper);
         const auto deadline = Clock::now() + std::chrono::seconds(30);
-        const auto script = componentBootstrap(helper.size(), digest, allowInstall);
+        const auto script = isSystemTarget(distro) ? temporaryBootstrap(helper.size(), digest)
+                                                  : componentBootstrap(helper.size(), digest, allowInstall);
         if (WaitForSingleObject(cancellation.get(), 0) == WAIT_OBJECT_0)
             throw std::runtime_error("WSL connection cancelled.");
-        process = launch({L"--distribution", distro, L"--user", L"root", L"--exec", L"/bin/sh", L"-c", wide(script)});
-        auto bootstrap = Json::parse(process->readLine(cancellation.get(), deadline));
-        auto state = bootstrap.value("bootstrap", "");
-        if (state == "missing") throw ComponentMissing();
-        if (state == "upload") {
-            process->write(helper.data(), helper.size(), cancellation.get(), deadline);
-            bootstrap = Json::parse(process->readLine(cancellation.get(), deadline));
-            state = bootstrap.value("bootstrap", "");
+        try {
+            process = launch(targetArguments(distro, script));
+            auto bootstrap = Json::parse(process->readLine(cancellation.get(), deadline));
+            auto state = bootstrap.value("bootstrap", "");
+            if (state == "missing") throw ComponentMissing();
+            if (state == "upload") {
+                process->write(helper.data(), helper.size(), cancellation.get(), deadline);
+                bootstrap = Json::parse(process->readLine(cancellation.get(), deadline));
+                state = bootstrap.value("bootstrap", "");
+            }
+            if (state != "ready") throw std::runtime_error("Unexpected WSL component installation response.");
+            const auto hello = exchange(Json{{"op", "hello"}}, deadline);
+            if (hello.value("protocol", 0) != 1)
+                throw std::runtime_error("Unsupported WSL helper protocol. Reinstall matching plugin and helper files.");
+            return hello;
+        } catch (const std::exception& error) {
+            if (isSystemTarget(distro))
+                throw std::runtime_error("Could not connect to " + utf8(targetDisplayName(distro)) +
+                    ". WSLg must be enabled and WSL must support --system. If Windows reports access "
+                    "denied, run System Informer as administrator. " + error.what());
+            throw;
         }
-        if (state != "ready") throw std::runtime_error("Unexpected WSL component installation response.");
-        const auto hello = exchange(Json{{"op", "hello"}}, deadline);
-        if (hello.value("protocol", 0) != 1)
-            throw std::runtime_error("Unsupported WSL helper protocol. Reinstall matching plugin and helper files.");
-        return hello;
     }
 };
 

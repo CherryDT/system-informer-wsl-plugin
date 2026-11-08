@@ -4,8 +4,32 @@
 
 #include <iostream>
 #include <stdexcept>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace {
+// Only the connection bootstrap creates this root-private staging directory.
+// Unlink after exec so normal EOF, cancellation and crashes leave no installed
+// observer behind. Linux keeps the running executable available through /proc.
+void remove_ephemeral_executable() {
+    const auto executable = observer::read_link("/proc/self/exe");
+    const std::string prefix = "/run/system-informer-wsl.";
+    const auto slash = executable.find_last_of('/');
+    if (executable.rfind(prefix, 0) != 0 || slash == std::string::npos ||
+        executable.substr(slash + 1) != "wsl-observer" ||
+        executable.find('/', prefix.size()) != slash)
+        throw std::runtime_error("Unexpected temporary observer path");
+    const auto directory = executable.substr(0, slash);
+    struct stat file{}, parent{};
+    if (geteuid() != 0 || lstat(directory.c_str(), &parent) != 0 ||
+        !S_ISDIR(parent.st_mode) || parent.st_uid != 0 || (parent.st_mode & 0777) != 0700 ||
+        lstat(executable.c_str(), &file) != 0 || !S_ISREG(file.st_mode) ||
+        file.st_uid != 0 || file.st_nlink != 1 || (file.st_mode & 0777) != 0700)
+        throw std::runtime_error("Unsafe temporary observer file");
+    if (unlink(executable.c_str()) != 0 || rmdir(directory.c_str()) != 0)
+        throw std::runtime_error("Could not remove the temporary observer upload");
+}
+
 void check_nesting(const std::string& line) {
     unsigned depth = 0;
     bool in_string = false, escaped = false;
@@ -41,8 +65,17 @@ observer::Json dispatch(const observer::Json& request) {
     throw std::runtime_error("Unknown operation: " + operation);
 }
 }
-int main() {
+int main(int argc, char** argv) {
     using observer::Json;
+    try {
+        if (argc == 2 && std::string(argv[1]) == "--ephemeral")
+            remove_ephemeral_executable();
+        else if (argc != 1)
+            throw std::runtime_error("Unknown observer argument");
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
     std::ios::sync_with_stdio(false);
     constexpr size_t maximum_request = 1024 * 1024;
     std::string line;

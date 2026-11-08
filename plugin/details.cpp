@@ -1,3 +1,4 @@
+#include "transport.hpp"
 #include "common.hpp"
 #include "settings.hpp"
 #include "host_bridge.h"
@@ -857,7 +858,7 @@ void updateActions(Inspector &state)
         message = state.pending == Operation::Stacks ? L"Capturing stacks with GDB…"
                   : state.pending == Operation::RuntimeStacks
                       ? std::wstring(L"Capturing ") + runtimeLabel(state.page) + L" stacks…"
-                      : L"Loading from " + state.distro + L"…";
+                      : L"Loading from " + targetDisplayName(state.distro) + L"…";
     else if (state.loading && networkPage && !state.connectionsAttempted)
         message = L"Connections will load after the current request finishes…";
     if (message.empty() && activeTable(state))
@@ -1310,7 +1311,7 @@ void showStatistics(Inspector &state)
         report["text"] = "This collection is incomplete. Counts cover only the collected objects.";
     const auto summary = cell(report, "text");
     report.erase("text");
-    openResourceReport(state.window, L"Statistics — " + state.distro, std::move(report),
+    openResourceReport(state.window, L"Statistics — " + targetDisplayName(state.distro), std::move(report),
                        ResourceView::PropertiesOnly, summary);
 }
 
@@ -1376,7 +1377,7 @@ void resourceAction(Inspector &state, int id)
                 begin = end + 1;
             } while (part <= 1024);
         }
-        openResourceReport(state.window, name + L" — " + state.distro, std::move(report));
+        openResourceReport(state.window, name + L" — " + targetDisplayName(state.distro), std::move(report));
         return;
     }
     if (id == CopyIdentifier)
@@ -1509,7 +1510,7 @@ void resourceAction(Inspector &state, int id)
         break;
     }
     title += L" — " + cell(state.process, "name") + L" (" + cell(state.process, "pid") + L" @ " +
-             state.distro + L")";
+             targetDisplayName(state.distro) + L")";
     openResourceTool(state.window, state.distro, std::move(request), title, std::move(inputs), mutation,
                      view);
 }
@@ -1562,8 +1563,10 @@ void appendResourceActions(Inspector &state, HMENU menu)
     }
     if (state.page == 1 || state.page == 2 || state.page == MemoryPage)
     {
-        AppendMenuW(menu, flags | (canOpen(selectedPath(state, true)) ? 0 : MF_GRAYED), OpenLocation,
-                    L"Open file location\tCtrl+Enter");
+        AppendMenuW(menu,
+                    flags |
+                        (!isSystemTarget(state.distro) && canOpen(selectedPath(state, true)) ? 0 : MF_GRAYED),
+                    OpenLocation, L"Open file location\tCtrl+Enter");
         add(CopyPath, L"Copy path\tCtrl+Shift+C");
     }
     if (state.page != ConnectionsPage)
@@ -2907,9 +2910,9 @@ void openInspector(HWND owner, std::unique_ptr<Inspector> state)
     }
     std::wstring title = state->isService ? wide(state->service) : cell(state->process, "name");
     if (state->isService)
-        title += L" — " + state->distro + L" service";
+        title += L" — " + targetDisplayName(state->distro) + L" service";
     else
-        title += L" (" + cell(state->process, "pid") + L" @ " + state->distro + L")";
+        title += L" (" + cell(state->process, "pid") + L" @ " + targetDisplayName(state->distro) + L")";
     // WM_NCDESTROY owns the state as soon as WM_NCCREATE has accepted it.
     Inspector *raw = state.get();
     HWND window = CreateWindowExW(WS_EX_CONTROLPARENT, InspectorClass, title.c_str(),

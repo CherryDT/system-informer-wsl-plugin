@@ -1,3 +1,4 @@
+#include "transport.hpp"
 #include "common.hpp"
 #include "host_bridge.h"
 
@@ -163,7 +164,8 @@ void command(SearchWindow &state, int id)
     else if (id == OpenLocation && actionable)
     {
         auto path = text(actionable->data, "path");
-        if (!path.empty() && path.front() == L'/' && path.find(L" (deleted)") == std::wstring::npos)
+        if (!isSystemTarget(state.distro) && !path.empty() && path.front() == L'/' &&
+            path.find(L" (deleted)") == std::wstring::npos)
             openLinuxPath(state.window, state.distro, path);
     }
     else if (id == Copy && selected)
@@ -192,10 +194,10 @@ void contextMenu(SearchWindow &state, LPARAM position)
     AppendMenuW(menu, MF_STRING | (row ? 0 : MF_GRAYED), OpenProcess, L"Process properties");
     SetMenuDefaultItem(menu, OpenProcess, FALSE);
     AppendMenuW(menu,
-                MF_STRING |
-                    (!path.empty() && path.front() == L'/' && path.find(L" (deleted)") == std::wstring::npos
-                         ? 0
-                         : MF_GRAYED),
+                MF_STRING | (!isSystemTarget(state.distro) && !path.empty() && path.front() == L'/' &&
+                                     path.find(L" (deleted)") == std::wstring::npos
+                                 ? 0
+                                 : MF_GRAYED),
                 OpenLocation, L"Open file location");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (state.table.selected() ? 0 : MF_GRAYED), Copy, L"Copy\tCtrl+C");
@@ -418,7 +420,7 @@ void openHandleSearch(HWND owner, const std::wstring &distro)
     }
     auto state = std::make_unique<SearchWindow>();
     state->distro = distro;
-    const auto title = L"Find handles or mapped files (" + distro + L")";
+    const auto title = L"Find handles or mapped files (" + targetDisplayName(distro) + L")";
     HWND window = CreateWindowExW(WS_EX_CONTROLPARENT, SearchClass, title.c_str(),
                                   WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                                   scale(owner, 1000), scale(owner, 560), owner, nullptr, instance, &state);

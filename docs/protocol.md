@@ -1,10 +1,13 @@
 # WSL observer protocol, version 1
 
-`wsl-observer` is a persistent Linux process. The Windows plugin launches one
-helper in the selected distribution and communicates through redirected stdin
-and stdout. It runs as root by default for complete process inspection; it never
-executes shell expressions. Closing stdin ends the helper. No TCP listener or
-Windows service is needed.
+`wsl-observer` is a persistent Linux process for normal distro targets. The Windows plugin launches one
+helper and communicates through redirected stdin and stdout. It runs as root by default for complete process
+inspection; it never executes shell expressions. Closing stdin ends the helper. No TCP listener or Windows
+service is needed.
+
+For a paired `:system` target, the plugin uploads the same verified helper to a private temporary directory
+and starts it in ephemeral mode; the helper unlinks itself and removes that directory immediately after startup.
+This temporary mode does not use the normal `/usr/local/lib/system-informer-wsl` installation path.
 
 Every message is one UTF-8 JSON object followed by a newline (NDJSON). The helper
 sends exactly one response for each complete input line and never emits unsolicited

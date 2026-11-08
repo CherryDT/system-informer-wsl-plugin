@@ -1,3 +1,4 @@
+#include "transport.hpp"
 #include "target_actions.hpp"
 #include "controller.hpp"
 #include "view_state.hpp"
@@ -101,6 +102,11 @@ void action(View &v, int id)
     }
     if (id == OpenExecutable)
     {
+        if (isSystemTarget(v.selectedDistro))
+        {
+            openLinuxPath(v.window, v.selectedDistro, text(row.data, "exe"));
+            return;
+        }
         v.pendingExecutable = row.key;
         queue(v,
               {{"op", "snapshot"},
@@ -157,7 +163,7 @@ void action(View &v, int id)
             return;
         }
         auto prompt = label + L" to " + text(row.data, "name") + L" (PID " + text(row.data, "pid") +
-                      L") in " + v.selectedDistro + L"?\r\n\r\n";
+                      L") in " + targetDisplayName(v.selectedDistro) + L"?\r\n\r\n";
         prompt += L"This action runs as Linux root.";
         if (signal == 2 || signal == 9 || signal == 15)
             prompt += L" Termination may lose unsaved work.";
@@ -168,6 +174,8 @@ void action(View &v, int id)
             prompt += L" The process will pause until it is resumed.";
         const auto executable = text(row.data, "exe");
         const auto basename = executable.substr(executable.find_last_of(L'/') + 1);
+        if (isSystemTarget(v.selectedDistro) && (signal == 2 || signal == 9 || signal == 15 || signal == 19))
+            prompt += L"\r\n\r\nStopping WSLg infrastructure can interrupt Linux GUI applications and audio.";
         if ((signal == 2 || signal == 9 || signal == 15 || signal == 19) &&
             (basename == L"wsl-observer" || text(row.data, "name") == L"wsl-observer"))
             prompt += L"\r\n\r\nThis is the WSL inspection component. Stopping it disconnects WSL "
@@ -212,7 +220,7 @@ void action(View &v, int id)
         // A bare template is inspectable, but actions need an explicit instance.
         if (name.size() >= 9 && name.compare(name.size() - 9, 9, "@.service") == 0)
             return;
-        auto prompt = wide(verb) + L" " + wide(name) + L" in " + v.selectedDistro +
+        auto prompt = wide(verb) + L" " + wide(name) + L" in " + targetDisplayName(v.selectedDistro) +
                       L"?\r\n\r\nThis changes a system service as Linux root.";
         if (MessageBoxW(v.window, prompt.c_str(), L"Confirm service action",
                         MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES)
@@ -232,7 +240,8 @@ void menu(View &v, POINT point)
     if (v.page == 0)
     {
         AppendMenuW(popup, MF_STRING, CopyCommand, L"Copy command line");
-        AppendMenuW(popup, MF_STRING, OpenExecutable, L"Show executable in Explorer");
+        AppendMenuW(popup, MF_STRING | (isSystemTarget(v.selectedDistro) ? MF_GRAYED : 0), OpenExecutable,
+                    L"Show executable in Explorer");
         appendProcessSchedulingMenu(popup, v.table().selectedActionable() != nullptr, v.selectedDistro,
                                     v.table().selected()->data);
         AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);

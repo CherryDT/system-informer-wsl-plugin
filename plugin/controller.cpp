@@ -124,7 +124,7 @@ void run()
             if (operation == "discover")
             {
                 reply->data = Json::array();
-                for (const auto &distro : runningDistros([automatic] {
+                for (const auto &distro : runningTargets([automatic] {
                          return cancellationRequested.load() || discoveryPaused.load() ||
                                 (automatic && !automaticCapture.load());
                      }))

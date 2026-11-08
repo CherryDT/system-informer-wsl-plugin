@@ -18,8 +18,9 @@ Inspect and control WSL 2 from a native **WSL** tab in System Informer.
 - **Services:** inspect systemd units and journals; start, stop, restart, and change startup behavior.
 - **Controls:** send signals, adjust niceness, CPU affinity and I/O priority, and save scheduling rules per executable.
 - **Find handles:** search open files and mapped modules across a distro, then open the process or file location.
+- **WSLg system processes:** inspect the separate WSLg infrastructure paired with a running distro. Its observer is temporary; ordinary application processes remain in the user distro.
 
-Uses System Informer's fonts, colors, search, refresh controls, and saved column layouts. Background capture fills histories from startup for already-running WSL2 distros. The companion runs as **Linux root**. Monitoring attaches to running distros and leaves `vmmemWSL` CPU accounting unchanged.
+Uses System Informer's fonts, colors, search, refresh controls, and saved column layouts. Background capture fills histories from startup for already-running WSL2 distros, including their available WSLg system targets. The companion runs as **Linux root**. Monitoring attaches to running distros and leaves `vmmemWSL` CPU accounting unchanged.
 
 ## Install
 
@@ -27,10 +28,10 @@ Uses System Informer's fonts, colors, search, refresh controls, and saved column
 > **TL;DR:** Close System Informer, run `WslTools-*-setup-x64.exe` (using the current version number instead of `*` of course), and accept the offered loading options. **Allow untrusted plugins** is needed because KPH does not trust this plugin. Both loading options can optionally be reset during uninstallation.
 
 1. Run the installer as your normal Windows user and select your System Informer folder. Windows may request elevation to copy files there.
-2. Leave **Install companion in all WSL2 distributions** checked to install the Linux helper. Stopped distros are temporarily started and stopped again afterward.
-3. Restart System Informer, open **WSL**, and select a running distro. If its companion is missing, use **Install and retry**. Installed companions update automatically when needed.
+2. Leave **Install companion in all WSL2 distributions** checked to install the Linux helper in normal distros. WSLg uses a temporary observer and is not part of companion installation.
+3. Restart System Informer, open **WSL**, and select a running distro. If its companion is missing, use **Install and retry**. Installed companions update automatically when needed. The picker also offers a paired **(WSLg)** target; the connection reports if the system endpoint is unavailable or disabled.
 
-Requires **x64 Windows and x86-64 WSL2**; WSL1 is not supported. Systemd is needed only for service features. The plugin has been exercised with System Informer **4.0.26255.346**; it does not impose an exact-version restriction. [Compatibility details](docs/user-guide.md#compatibility).
+Requires **x64 Windows and x86-64 WSL2**; WSL1 is not supported. Systemd is needed only for service features; the WSLg system distro normally does not run it. The plugin has been exercised with System Informer **4.0.26255.346**; it does not impose an exact-version restriction. [Compatibility details](docs/user-guide.md#compatibility).
 
 **Portable/manual install:** use `WslTools-*-windows-x64.zip`. See the [manual installation instructions](docs/user-guide.md#install).
 
